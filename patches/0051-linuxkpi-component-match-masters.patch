@@ -1,0 +1,302 @@
+From a5774e0de74c53fb27a05db5e32fa67c2679817d Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 5 Sep 2026 19:19:50 -0500
+Subject: [PATCH] linuxkpi: match-based component masters
+
+Third tranche toward the full vc4 KMS port
+(nextbsd-kernel-extensions#51).
+
+The component framework from #183 binds every registered component to
+whichever master asks. That is right for a driver with one component --
+firmware KMS -- and wrong for full vc4, which has several masters and
+expects each to bind only the components it named.
+
+Adds Linux's match-based form:
+
+- component_match_add() builds a list of (predicate, data) entries. The
+  component each selects is resolved at bind time rather than here, because
+  components may register after the master builds its list.
+
+- component_master_add_with_match() registers a master and binds it when
+  every entry in its match list is present.
+
+- component_master_del() unbinds and frees the match list.
+
+- component_compare_dev(), the common predicate.
+
+Two details that matter for correctness rather than compilation:
+
+An incomplete match list means "not yet", not "failed".
+component_master_add_with_match() returns 0 whether or not the master bound,
+as Linux does -- reporting a failure would make a driver tear down a master
+that is merely early.
+
+component_add() now retries any waiting master. That is what makes probe
+order irrelevant: master first or component first both end up bound. Without
+it the framework would only work when components happened to probe first.
+
+Note this does not yet make vc4's masters bind, because vc4 builds its match
+list with platform_find_device_by_driver(), which cannot be implemented until
+LinuxKPI has a real platform bus -- platform_driver_register() is still a
+TODO stub returning -ENXIO. This is the half that can be built now.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
+---
+ .../linuxkpi/common/include/linux/component.h |  35 ++++
+ .../linuxkpi/common/src/linux_component.c     | 184 ++++++++++++++++++
+ 2 files changed, 219 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/component.h b/sys/compat/linuxkpi/common/include/linux/component.h
+index dae4d98bc55..396219ad4e4 100644
+--- a/sys/compat/linuxkpi/common/include/linux/component.h
++++ b/sys/compat/linuxkpi/common/include/linux/component.h
+@@ -36,4 +36,39 @@ void	component_del(struct device *dev, const struct component_ops *ops);
+ int	component_bind_all(struct device *master, void *master_data);
+ void	component_unbind_all(struct device *master, void *master_data);
+ 
++/*
++ * Match-based masters (nextbsd-kernel-extensions#51).
++ *
++ * The simple form above binds every registered component to whichever master
++ * asks. That is right for a driver with one component -- firmware KMS -- and
++ * wrong for full vc4, which has several masters and expects each to bind only
++ * the components it named.
++ *
++ * A master therefore builds a match list, and binds when every entry in it is
++ * present. `struct component_match` is opaque to callers, exactly as in Linux.
++ */
++struct component_match;
++
++struct component_master_ops {
++	int	(*bind)(struct device *master);
++	void	(*unbind)(struct device *master);
++};
++
++/*
++ * Add one entry. `compare` decides whether a registered component's device is
++ * the one wanted; `data` is passed to it. Linux's helper for the common case
++ * is component_compare_dev, comparing the device pointer itself.
++ *
++ * Allocates the match structure on first call, so `*match` may start NULL.
++ */
++void	component_match_add(struct device *master, struct component_match **match,
++	    int (*compare)(struct device *, void *), void *data);
++
++int	component_compare_dev(struct device *dev, void *data);
++
++int	component_master_add_with_match(struct device *master,
++	    const struct component_master_ops *ops, struct component_match *match);
++void	component_master_del(struct device *master,
++	    const struct component_master_ops *ops);
++
+ #endif	/* _LINUXKPI_LINUX_COMPONENT_H_ */
+diff --git a/sys/compat/linuxkpi/common/src/linux_component.c b/sys/compat/linuxkpi/common/src/linux_component.c
+index 6051a2675b0..6e800549742 100644
+--- a/sys/compat/linuxkpi/common/src/linux_component.c
++++ b/sys/compat/linuxkpi/common/src/linux_component.c
+@@ -32,6 +32,9 @@ static TAILQ_HEAD(lkpi_component_head, lkpi_component) lkpi_components =
+ static struct mtx lkpi_component_mtx;
+ MTX_SYSINIT(lkpi_component, &lkpi_component_mtx, "lkpi component", MTX_DEF);
+ 
++/* Defined with the match code below; called when a component appears. */
++static void lkpi_try_bind_masters(void);
++
+ int
+ component_add(struct device *dev, const struct component_ops *ops)
+ {
+@@ -49,6 +52,13 @@ component_add(struct device *dev, const struct component_ops *ops)
+ 	mtx_lock(&lkpi_component_mtx);
+ 	TAILQ_INSERT_TAIL(&lkpi_components, c, link);
+ 	mtx_unlock(&lkpi_component_mtx);
++
++	/*
++	 * A master may already be waiting on exactly this component (#51).
++	 * Retrying here is what makes probe order irrelevant -- master first or
++	 * component first both end up bound.
++	 */
++	lkpi_try_bind_masters();
+ 	return (0);
+ }
+ 
+@@ -113,3 +123,177 @@ component_unbind_all(struct device *master, void *master_data)
+ 		c->bound = false;
+ 	}
+ }
++
++/* ---- match-based masters (nextbsd-kernel-extensions#51) ---------------- */
++
++/*
++ * One entry in a master's match list: a predicate and its argument. The
++ * component it selects is resolved at bind time, not here, because components
++ * may register after the master builds its list.
++ */
++struct lkpi_match_entry {
++	TAILQ_ENTRY(lkpi_match_entry)	link;
++	int			      (*compare)(struct device *, void *);
++	void			       *data;
++};
++
++struct component_match {
++	TAILQ_HEAD(, lkpi_match_entry)	entries;
++	unsigned int			count;
++};
++
++/* A registered master, waiting for its components to appear. */
++struct lkpi_master {
++	TAILQ_ENTRY(lkpi_master)	   link;
++	struct device			  *dev;
++	const struct component_master_ops *ops;
++	struct component_match		  *match;
++	bool				   bound;
++};
++
++static TAILQ_HEAD(, lkpi_master) lkpi_masters =
++    TAILQ_HEAD_INITIALIZER(lkpi_masters);
++
++int
++component_compare_dev(struct device *dev, void *data)
++{
++
++	return (dev == (struct device *)data);
++}
++
++void
++component_match_add(struct device *master __unused,
++    struct component_match **match, int (*compare)(struct device *, void *),
++    void *data)
++{
++	struct lkpi_match_entry *e;
++
++	if (match == NULL || compare == NULL)
++		return;
++	if (*match == NULL) {
++		*match = malloc(sizeof(**match), M_DEVBUF, M_NOWAIT | M_ZERO);
++		if (*match == NULL)
++			return;
++		TAILQ_INIT(&(*match)->entries);
++	}
++	e = malloc(sizeof(*e), M_DEVBUF, M_NOWAIT | M_ZERO);
++	if (e == NULL)
++		return;
++	e->compare = compare;
++	e->data = data;
++	TAILQ_INSERT_TAIL(&(*match)->entries, e, link);
++	(*match)->count++;
++}
++
++/*
++ * Can every entry in `match` be satisfied by a registered component?
++ *
++ * Linux defers a master until its whole match list is present, which is what
++ * makes probe order irrelevant. Same here: an incomplete list means "not
++ * yet", not "failed".
++ */
++static bool
++lkpi_match_complete(struct component_match *match)
++{
++	struct lkpi_match_entry *e;
++	struct lkpi_component *c;
++	bool found;
++
++	if (match == NULL)
++		return (true);		/* no constraints: bind immediately */
++
++	TAILQ_FOREACH(e, &match->entries, link) {
++		found = false;
++		TAILQ_FOREACH(c, &lkpi_components, link) {
++			if (e->compare(c->dev, e->data)) {
++				found = true;
++				break;
++			}
++		}
++		if (!found)
++			return (false);
++	}
++	return (true);
++}
++
++/*
++ * Try to bring up any master whose match list is now complete. Called after a
++ * master registers and after a component appears, so either order works.
++ */
++static void
++lkpi_try_bind_masters(void)
++{
++	struct lkpi_master *m;
++	int error;
++
++	TAILQ_FOREACH(m, &lkpi_masters, link) {
++		if (m->bound || m->ops->bind == NULL)
++			continue;
++		if (!lkpi_match_complete(m->match))
++			continue;
++		error = m->ops->bind(m->dev);
++		if (error != 0) {
++			printf("lkpi component: master bind failed: %d\n",
++			    error);
++			continue;
++		}
++		m->bound = true;
++	}
++}
++
++int
++component_master_add_with_match(struct device *master,
++    const struct component_master_ops *ops, struct component_match *match)
++{
++	struct lkpi_master *m;
++
++	if (master == NULL || ops == NULL)
++		return (-EINVAL);
++
++	m = malloc(sizeof(*m), M_DEVBUF, M_NOWAIT | M_ZERO);
++	if (m == NULL)
++		return (-ENOMEM);
++	m->dev = master;
++	m->ops = ops;
++	m->match = match;
++
++	mtx_lock(&lkpi_component_mtx);
++	TAILQ_INSERT_TAIL(&lkpi_masters, m, link);
++	mtx_unlock(&lkpi_component_mtx);
++
++	/*
++	 * Linux returns 0 whether or not the master bound -- an incomplete
++	 * match list is "wait", not an error. Reporting a bind failure here
++	 * would make a driver tear down a master that is merely early.
++	 */
++	lkpi_try_bind_masters();
++	return (0);
++}
++
++void
++component_master_del(struct device *master, const struct component_master_ops *ops)
++{
++	struct lkpi_master *m, *tmp;
++	struct lkpi_match_entry *e, *etmp;
++
++	mtx_lock(&lkpi_component_mtx);
++	TAILQ_FOREACH_SAFE(m, &lkpi_masters, link, tmp) {
++		if (m->dev != master || m->ops != ops)
++			continue;
++		TAILQ_REMOVE(&lkpi_masters, m, link);
++		mtx_unlock(&lkpi_component_mtx);
++
++		if (m->bound && m->ops->unbind != NULL)
++			m->ops->unbind(m->dev);
++		if (m->match != NULL) {
++			TAILQ_FOREACH_SAFE(e, &m->match->entries, link, etmp) {
++				TAILQ_REMOVE(&m->match->entries, e, link);
++				free(e, M_DEVBUF);
++			}
++			free(m->match, M_DEVBUF);
++		}
++		free(m, M_DEVBUF);
++		return;
++	}
++	mtx_unlock(&lkpi_component_mtx);
++}
+-- 
+2.50.1 (Apple Git-155)
+

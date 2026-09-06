@@ -47,3 +47,6 @@
 0047-rp1_clk-peripheral-clock-gates-for-rp1.patch
 0048-rp1_gpio-implement-fdt-pinctrl-for-the-rp1-pin-mux.patch
 0049-rp1_pwm-driver-for-the-rp1-pwm-blocks.patch
+0050-linuxkpi-of-lookup-platform-arrays-pm-runtime.patch
+0051-linuxkpi-component-match-masters.patch
+0052-linuxkpi-platform_driver-remove_new.patch
