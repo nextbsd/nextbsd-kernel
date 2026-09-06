@@ -50,3 +50,4 @@
 0050-linuxkpi-of-lookup-platform-arrays-pm-runtime.patch
 0051-linuxkpi-component-match-masters.patch
 0052-linuxkpi-platform_driver-remove_new.patch
+0053-linuxkpi-rman-out-of-platform-device-h.patch
