@@ -1,0 +1,359 @@
+From d86fb61507cc4f055aa05e0a98fdee0e76175a70 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 5 Sep 2026 19:16:46 -0500
+Subject: [PATCH] linuxkpi: OF node lookup, platform driver arrays and
+ pm_runtime for full KMS
+
+Second tranche toward the full vc4 KMS port
+(nextbsd-kernel-extensions#51), measured by a compile probe of it.
+
+of.h / linux_of.c:
+- of_find_compatible_node() and of_find_matching_node_and_match(), walking
+  the live tree depth-first. Written out rather than reusing an ofw_bus_
+  helper because none enumerate the whole tree -- they search one parent's
+  children. Both consume the caller's reference as Linux does, so the
+  idiomatic while-loop does not leak.
+- of_device_is_available(), of_device_is_compatible(),
+  of_device_get_match_data().
+- of_dma_configure(), which succeeds without acting. Honest on a SoC with no
+  IOMMU and no DMA offset, which BCM2712 is; a platform with either would be
+  handed wrong addresses and needs real dma-ranges parsing. Said so at the
+  definition rather than left to be discovered.
+
+platform_device.h:
+- platform_register_drivers()/platform_unregister_drivers(), unwinding
+  exactly what succeeded rather than the whole array on failure.
+- devm_platform_ioremap_resource(). "devm" does NOT auto-release, because
+  LinuxKPI devres does not track bus resources.
+
+pm_runtime.h:
+- pm_runtime_resume_and_get(), pm_runtime_status_suspended(). Correct rather
+  than stubbed: no runtime PM exists here, so nothing is ever suspended.
+
+platform_find_device_by_driver() is deliberately left UNIMPLEMENTED. vc4_drv.c
+uses it to enumerate every device bound to a component driver, and there is
+nothing to enumerate -- platform_driver_register() is a TODO stub returning
+-ENXIO, so no platform driver is ever bound and no device_t -> struct device
+registry exists. Returning NULL would compile and then silently build an empty
+component match list, failing later and further away. Left as a compile error
+with the reason in the header.
+
+That stub is the real scope of #51: the compile surface is 22 functions, but
+underneath it the platform bus vc4's component model assumes does not exist.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
+---
+ sys/compat/linuxkpi/common/include/linux/of.h |  27 +++
+ .../common/include/linux/platform_device.h    |  65 +++++++
+ .../common/include/linux/pm_runtime.h         |   6 +
+ sys/compat/linuxkpi/common/src/linux_of.c     | 167 ++++++++++++++++++
+ 4 files changed, 265 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/of.h b/sys/compat/linuxkpi/common/include/linux/of.h
+index b6024807f86..95efb415ed9 100644
+--- a/sys/compat/linuxkpi/common/include/linux/of.h
++++ b/sys/compat/linuxkpi/common/include/linux/of.h
+@@ -59,4 +59,31 @@ struct device_node *of_parse_phandle(const struct device_node *np,
+ struct device_node *of_node_get(struct device_node *np);
+ void of_node_put(struct device_node *np);
+ 
++/*
++ * Node lookup and property queries for the full vc4 KMS pipeline (#51).
++ * These walk the live OF tree rather than a driver's own node, which is what a
++ * display driver needs to find the HVS and HDMI controllers from a CRTC.
++ *
++ * Each returns a node the caller owns and must release with of_node_put().
++ */
++struct device_node *of_find_compatible_node(struct device_node *from,
++    const char *type, const char *compat);
++struct device_node *of_find_matching_node_and_match(struct device_node *from,
++    const struct of_device_id *matches, const struct of_device_id **match);
++const void *of_device_get_match_data(const struct device *dev);
++bool	of_device_is_available(const struct device_node *np);
++bool	of_device_is_compatible(const struct device_node *np, const char *compat);
++
++/*
++ * of_dma_configure() sets a device's DMA parameters from its device-tree node.
++ * LinuxKPI derives no DMA tag from the tree and linux_dma_priv_init() already
++ * establishes the masks a DRM driver needs, so this succeeds without acting.
++ *
++ * Honest on a SoC where the GPU sees the same physical addresses the CPU does
++ * -- BCM2712 has no IOMMU and no DMA offset. A platform with either would be
++ * given wrong addresses by this and needs real dma-ranges parsing.
++ */
++int	of_dma_configure(struct device *dev, struct device_node *np,
++	    bool force_dma);
++
+ #endif
+diff --git a/sys/compat/linuxkpi/common/include/linux/platform_device.h b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+index 11b92cf4839..ad69bbf4005 100644
+--- a/sys/compat/linuxkpi/common/include/linux/platform_device.h
++++ b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+@@ -133,6 +133,71 @@ platform_get_irq_byname(struct platform_device *pdev, const char *name)
+ 	return ((int)pdev->dev.irq);
+ }
+ 
++/*
++ * Map a platform device's Nth memory resource (#51).
++ *
++ * "devm" does NOT auto-release here: LinuxKPI devres does not track bus
++ * resources, so a driver that maps and never unmaps leaks the mapping for the
++ * module's lifetime. Fine for a display driver mapping registers at attach,
++ * which is every vc4 caller -- stated so the next caller knows.
++ */
++static __inline void *
++devm_platform_ioremap_resource(struct platform_device *pdev, unsigned int index)
++{
++	struct resource *res;
++	int rid = (int)index;
++
++	if (pdev == NULL || pdev->dev.bsddev == NULL)
++		return (ERR_PTR(-ENODEV));
++	res = bus_alloc_resource_any(pdev->dev.bsddev, SYS_RES_MEMORY, &rid,
++	    RF_ACTIVE | RF_SHAREABLE);
++	if (res == NULL)
++		return (ERR_PTR(-ENOMEM));
++	return ((void *)rman_get_bushandle(res));
++}
++
++/*
++ * platform_find_device_by_driver() is deliberately NOT implemented (#51).
++ *
++ * vc4_drv.c uses it to enumerate every device bound to a component driver.
++ * There is nothing to enumerate: platform_driver_register() below is a stub
++ * returning -ENXIO, so no platform driver is ever bound and no
++ * device_t -> struct device registry exists. Returning NULL would compile and
++ * then silently build an empty component match list, failing later and further
++ * away. Left as a compile error until the platform bus underneath is real.
++ */
++
++static __inline int platform_driver_register(struct platform_driver *pdrv);
++static __inline void platform_driver_unregister(struct platform_driver *pdrv);
++
++/*
++ * Register/unregister an array of platform drivers as one unit (#51). A
++ * failure part-way unwinds exactly what succeeded, not the whole array.
++ */
++static __inline void
++platform_unregister_drivers(struct platform_driver *const *drivers, unsigned int count)
++{
++
++	while (count--)
++		platform_driver_unregister(drivers[count]);
++}
++
++static __inline int
++platform_register_drivers(struct platform_driver *const *drivers, unsigned int count)
++{
++	unsigned int i;
++	int error;
++
++	for (i = 0; i < count; i++) {
++		error = platform_driver_register(drivers[i]);
++		if (error != 0) {
++			platform_unregister_drivers(drivers, i);
++			return (error);
++		}
++	}
++	return (0);
++}
++
+ static __inline int
+ platform_driver_register(struct platform_driver *pdrv)
+ {
+diff --git a/sys/compat/linuxkpi/common/include/linux/pm_runtime.h b/sys/compat/linuxkpi/common/include/linux/pm_runtime.h
+index aeb0e3d08e0..a8bc5cac4ca 100644
+--- a/sys/compat/linuxkpi/common/include/linux/pm_runtime.h
++++ b/sys/compat/linuxkpi/common/include/linux/pm_runtime.h
+@@ -23,6 +23,12 @@
+  * it so a real implementation can tell the two apart later.
+  */
+ #define pm_runtime_put_sync_suspend(x) (void)(x)
++/*
++ * LinuxKPI implements no runtime PM, so nothing is ever suspended. These are
++ * the correct answers rather than stubs hiding a gap (#51).
++ */
++#define pm_runtime_resume_and_get(x) ((void)(x), 0)
++#define pm_runtime_status_suspended(x) ((void)(x), false)
+ #define pm_runtime_enable(x) (void)(x)
+ #define pm_runtime_disable(x) (void)(x)
+ #define pm_runtime_autosuspend(x) (void)(x)
+diff --git a/sys/compat/linuxkpi/common/src/linux_of.c b/sys/compat/linuxkpi/common/src/linux_of.c
+index 95cd3332f45..fdc7bab8d00 100644
+--- a/sys/compat/linuxkpi/common/src/linux_of.c
++++ b/sys/compat/linuxkpi/common/src/linux_of.c
+@@ -109,3 +109,170 @@ of_node_put(struct device_node *np)
+ 
+ 	free(np, M_DEVBUF);
+ }
++
++#ifdef FDT
++/*
++ * Next node in depth-first order: child, else next sibling, else walk back up
++ * until a parent has one. Returns 0 at the end of the tree.
++ *
++ * Written out rather than reusing an ofw_bus_ helper because none of them
++ * enumerate the whole tree -- they search one parent's children.
++ */
++static phandle_t
++of_next_node(phandle_t node)
++{
++	phandle_t n;
++
++	if (node == 0)
++		return (OF_peer(0));		/* start: the root */
++	if ((n = OF_child(node)) != 0)
++		return (n);
++	while (node != 0) {
++		if ((n = OF_peer(node)) != 0)
++			return (n);
++		node = OF_parent(node);
++	}
++	return (0);
++}
++#endif
++
++/*
++ * Next node after `from` whose compatible list contains `compat` (#51).
++ *
++ * `from` is consumed exactly as Linux does -- the caller's reference is
++ * dropped whether or not a match is found -- so
++ *
++ *	while ((np = of_find_compatible_node(np, NULL, "x")) != NULL)
++ *
++ * does not leak. `type` (device_type) is accepted for signature compatibility
++ * and ignored: deprecated in modern bindings, and no vc4 caller passes it.
++ */
++struct device_node *
++of_find_compatible_node(struct device_node *from, const char *type __unused,
++    const char *compat)
++{
++#ifdef FDT
++	struct device_node *np;
++	phandle_t node;
++
++	if (compat == NULL)
++		return (NULL);
++	node = (from != NULL) ? (phandle_t)from->node : 0;
++	if (from != NULL)
++		of_node_put(from);
++
++	while ((node = of_next_node(node)) != 0) {
++		if (!ofw_bus_node_is_compatible(node, compat))
++			continue;
++		np = malloc(sizeof(*np), M_DEVBUF, M_NOWAIT | M_ZERO);
++		if (np == NULL)
++			return (NULL);
++		np->node = node;
++		return (np);
++	}
++	return (NULL);
++#else
++	if (from != NULL)
++		of_node_put(from);
++	return (NULL);
++#endif
++}
++
++/*
++ * As above, but matching a table and reporting WHICH entry matched -- how a
++ * driver picks per-variant data for the node it found.
++ */
++struct device_node *
++of_find_matching_node_and_match(struct device_node *from,
++    const struct of_device_id *matches, const struct of_device_id **match)
++{
++#ifdef FDT
++	struct device_node *np;
++	const struct of_device_id *id;
++	phandle_t node;
++
++	if (match != NULL)
++		*match = NULL;
++	if (matches == NULL)
++		return (NULL);
++	node = (from != NULL) ? (phandle_t)from->node : 0;
++	if (from != NULL)
++		of_node_put(from);
++
++	while ((node = of_next_node(node)) != 0) {
++		for (id = matches; id->compatible[0] != '\0'; id++) {
++			if (!ofw_bus_node_is_compatible(node, id->compatible))
++				continue;
++			np = malloc(sizeof(*np), M_DEVBUF, M_NOWAIT | M_ZERO);
++			if (np == NULL)
++				return (NULL);
++			np->node = node;
++			if (match != NULL)
++				*match = id;
++			return (np);
++		}
++	}
++	return (NULL);
++#else
++	if (from != NULL)
++		of_node_put(from);
++	return (NULL);
++#endif
++}
++
++/*
++ * ofw_bus_node_status_okay() implements Linux's rule: absent status means
++ * available, "okay"/"ok" mean available, anything else does not.
++ */
++bool
++of_device_is_available(const struct device_node *np)
++{
++#ifdef FDT
++	if (np == NULL)
++		return (false);
++	return (ofw_bus_node_status_okay((phandle_t)np->node) != 0);
++#else
++	return (false);
++#endif
++}
++
++bool
++of_device_is_compatible(const struct device_node *np, const char *compat)
++{
++#ifdef FDT
++	if (np == NULL || compat == NULL)
++		return (false);
++	return (ofw_bus_node_is_compatible((phandle_t)np->node, compat) != 0);
++#else
++	return (false);
++#endif
++}
++
++/*
++ * The per-variant data from the of_device_id entry that matched this device.
++ * vc4 uses it to tell BCM2712 from earlier parts, so the wrong entry here
++ * selects the wrong register layout.
++ */
++const void *
++of_device_get_match_data(const struct device *dev)
++{
++#ifdef FDT
++	const struct of_device_id *id;
++
++	if (dev == NULL || dev->driver == NULL)
++		return (NULL);
++	id = of_match_device(dev->driver->of_match_table, dev);
++	return (id != NULL ? id->data : NULL);
++#else
++	return (NULL);
++#endif
++}
++
++/* See linux/of.h for why this does nothing and when that stops being true. */
++int
++of_dma_configure(struct device *dev __unused, struct device_node *np __unused,
++    bool force_dma __unused)
++{
++
++	return (0);
++}
+-- 
+2.50.1 (Apple Git-155)
+
