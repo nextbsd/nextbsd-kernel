@@ -1,16 +1,16 @@
-From 0d944b5da730cf34f7f7d2822ee3188b36c9efb0 Mon Sep 17 00:00:00 2001
+From 13c887347ff2d9c23fbdadc94bd45697fc3cdb06 Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
-Date: Sat, 5 Sep 2026 23:04:28 -0500
+Date: Sat, 5 Sep 2026 23:10:23 -0500
 Subject: [PATCH] linuxkpi: dma_priv init for non-PCI devices
 
 linux_dma_priv_init() sets up dev->dma_priv for a device LinuxKPI did not
-attach itself -- a driver on newbus or the device tree, rather than on
-LinuxKPI's own PCI shim. Without it every allocator in linux_pci.c returns NULL
-on its dma_priv == NULL check, which surfaces as an unexplained ENOMEM:
+attach itself -- one on newbus or the device tree rather than on LinuxKPI's own
+PCI shim. Without it every allocator in linux_pci.c returns NULL on its
+dma_priv == NULL check, surfacing as an unexplained ENOMEM:
 DRM_IOCTL_MODE_CREATE_DUMB failing for a 1.2MB buffer on a machine with 16GB
 free, which is where X stopped during the firmware KMS bring-up.
 
-Kept in the kernel deliberately. It builds the busdma tags and the dma_priv
+Kept in the kernel deliberately: it builds the busdma tags and the dma_priv
 pctrie that live inside linux_pci.c, and a module cannot reach them.
 
 Additive: two new exported functions, no struct changes.
@@ -25,7 +25,7 @@ Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
  2 files changed, 70 insertions(+)
 
 diff --git a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
-index 5e5d40ef833..207ebe1d819 100644
+index f7cab72ca6e..fbfce7ef8a3 100644
 --- a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
 +++ b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
 @@ -90,6 +90,13 @@ struct dma_map_ops {
@@ -41,7 +41,7 @@ index 5e5d40ef833..207ebe1d819 100644
 +void linux_dma_priv_uninit(struct device *);
  int linux_dma_tag_init(struct device *, u64);
  int linux_dma_tag_init_coherent(struct device *, u64);
- void *linux_dma_alloc_coherent(struct device *dev, size_t size,
+ /*
 diff --git a/sys/compat/linuxkpi/common/src/linux_pci.c b/sys/compat/linuxkpi/common/src/linux_pci.c
 index b0613daccd8..e593f9206ee 100644
 --- a/sys/compat/linuxkpi/common/src/linux_pci.c

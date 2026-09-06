@@ -1,35 +1,61 @@
-From 4b89712509c4d09ce5aaeb2b20ce1358fe7ea062 Mon Sep 17 00:00:00 2001
+From 8f36ff30d10f7e8cad29205a8d73b658932fe565 Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
-Date: Sat, 5 Sep 2026 23:03:37 -0500
+Date: Sat, 5 Sep 2026 23:10:05 -0500
 Subject: [PATCH] linuxkpi: dma_alloc_wc() allocator body
 
-What remains of the DRM DMA GEM helper support after the header half moved out
-of the kernel and into the graphics modules' own private LinuxKPI
-(nextbsd-kernel-extensions graphics/lkpi).
+What remains of the DRM DMA GEM helper support after the header half moved into
+the graphics modules' private LinuxKPI (nextbsd-kernel-extensions
+graphics/lkpi).
 
 This half cannot follow it. linux_dma_alloc_wc() is the body of
 linux_dma_alloc_coherent() with the memory attribute lifted into a parameter,
-and it needs the DMA tag machinery, the dma_priv pctrie and the bounce
-bookkeeping that live inside linux_pci.c. A module cannot reach them, and the
-obvious substitute -- allocate coherent, then pmap_change_attr() to
-write-combining -- is a change to the live allocation path for every buffer X
-maps, on the only display driver currently working. That is not a change to
-make blind.
+and it needs the busdma tags, the dma_priv pctrie and the bounce bookkeeping
+that live inside linux_pci.c. A module cannot reach them, and the obvious
+substitute -- allocate coherent, then pmap_change_attr() to write-combining --
+would rewrite the live allocation path for every buffer X maps, on the only
+display driver currently working. On arm64 VM_MEMATTR_WRITE_COMBINING is
+write-through while the coherent allocator gives write-back, so it is not a
+safe alias. Not a change to make blind.
 
-It is additive: a new exported function plus a refactor that leaves
+The prototype stays in <linux/dma-mapping.h> because the kernel builds with
+-Wmissing-prototypes. The dma_alloc_wc()/dma_free_wc() wrappers that call it
+are module-side.
+
+Additive: one new exported function plus a refactor that leaves
 linux_dma_alloc_coherent()'s behaviour identical. No struct changes, so nothing
-here can shift an offset under a module built against older headers -- which is
-the failure that took out amdgpu and, on the boot audit's reading, i915 on a
-Wyse 5070.
+here can shift an offset under a module built against older headers.
 
-Same class as 0012 and 0043: DMA plumbing that only the kernel can host.
+Same class as 0012 and 0043: DMA plumbing only the kernel can host.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
 ---
- sys/compat/linuxkpi/common/src/linux_pci.c | 44 ++++++++++++++++++++--
- 1 file changed, 40 insertions(+), 4 deletions(-)
+ .../common/include/linux/dma-mapping.h        | 11 +++++
+ sys/compat/linuxkpi/common/src/linux_pci.c    | 44 +++++++++++++++++--
+ 2 files changed, 51 insertions(+), 4 deletions(-)
 
+diff --git a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+index 5e5d40ef833..f7cab72ca6e 100644
+--- a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
++++ b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+@@ -92,6 +92,17 @@ struct dma_map_ops {
+ 
+ int linux_dma_tag_init(struct device *, u64);
+ int linux_dma_tag_init_coherent(struct device *, u64);
++/*
++ * Declared here because linux_pci.c defines it and the kernel builds with
++ * -Wmissing-prototypes. The dma_alloc_wc()/dma_free_wc() wrappers that call it
++ * live in the graphics modules' private LinuxKPI
++ * (nextbsd-kernel-extensions graphics/lkpi), not here -- only the allocator
++ * body stays in the kernel, because it needs the busdma tags and the dma_priv
++ * pctrie internal to linux_pci.c.
++ */
++void *linux_dma_alloc_wc(struct device *dev, size_t size,
++    dma_addr_t *dma_handle, gfp_t flag);
++
+ void *linux_dma_alloc_coherent(struct device *dev, size_t size,
+     dma_addr_t *dma_handle, gfp_t flag);
+ void *linuxkpi_dmam_alloc_coherent(struct device *dev, size_t size,
 diff --git a/sys/compat/linuxkpi/common/src/linux_pci.c b/sys/compat/linuxkpi/common/src/linux_pci.c
 index 87c2f8ce55b..b0613daccd8 100644
 --- a/sys/compat/linuxkpi/common/src/linux_pci.c
