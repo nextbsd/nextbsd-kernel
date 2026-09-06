@@ -1,31 +1,48 @@
-From 13c887347ff2d9c23fbdadc94bd45697fc3cdb06 Mon Sep 17 00:00:00 2001
+From 42a764f4519000aa1a0eefb617bfacd3b433fed3 Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
-Date: Sat, 5 Sep 2026 23:10:23 -0500
-Subject: [PATCH] linuxkpi: dma_priv init for non-PCI devices
+Date: Fri, 4 Sep 2026 13:41:53 -0500
+Subject: [PATCH] linuxkpi: let a non-PCI device set up dev->dma_priv
 
-linux_dma_priv_init() sets up dev->dma_priv for a device LinuxKPI did not
-attach itself -- one on newbus or the device tree rather than on LinuxKPI's own
-PCI shim. Without it every allocator in linux_pci.c returns NULL on its
-dma_priv == NULL check, surfacing as an unexplained ENOMEM:
-DRM_IOCTL_MODE_CREATE_DUMB failing for a 1.2MB buffer on a machine with 16GB
-free, which is where X stopped during the firmware KMS bring-up.
+Every allocator in linux_pci.c opens with
 
-Kept in the kernel deliberately: it builds the busdma tags and the dma_priv
-pctrie that live inside linux_pci.c, and a module cannot reach them.
+	if (dev == NULL || dev->dma_priv == NULL)
+		return (NULL);
 
-Additive: two new exported functions, no struct changes.
+and dma_priv is created only by linux_pdev_dma_init(), which is static and
+takes a struct pci_dev. So a LinuxKPI driver on any other bus gets a silent
+ENOMEM from dma_alloc_coherent(), dma_alloc_wc() and the rest, no matter how
+much memory is free, with nothing logged to say why.
 
-Refs nextbsd/nextbsd-kernel-extensions#51
+Measured on a Raspberry Pi 5 bringing up vc4_firmware_kms, whose parent is a
+device tree node (nextbsd-kernel#176). A test program driving the same ioctls
+X uses:
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
+	opened /dev/dri/card0
+	  640x480 x32:   CREATE_DUMB failed: Cannot allocate memory
+	  1920x1080 x32: CREATE_DUMB failed: Cannot allocate memory
+	  2560x1440 x32: CREATE_DUMB failed: Cannot allocate memory
+
+640x480x32 is 1.2MB on a machine with 16GB free, so this was never about
+memory pressure. In X it surfaced only as "AddScreen/ScreenInit failed for
+driver 0", which names nothing.
+
+linux_dma_priv_init() does what linux_pdev_dma_init() does -- allocate the
+priv, init the lock and pctrie, then linux_dma_tag_init() and
+linux_dma_tag_init_coherent() -- but takes a struct device and lets the caller
+choose both masks, since a non-PCI device's addressing limits are its own.
+linux_dma_priv_uninit() releases it.
+
+The existing note on lkpinew_pci_dev() already records this hazard for the
+PCI-wrapping case; this is the same gap for devices that are not PCI at all.
+
+Refs nextbsd-kernel#176.
 ---
  .../common/include/linux/dma-mapping.h        |  7 +++
  sys/compat/linuxkpi/common/src/linux_pci.c    | 63 +++++++++++++++++++
  2 files changed, 70 insertions(+)
 
 diff --git a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
-index f7cab72ca6e..fbfce7ef8a3 100644
+index a704220509f..82f1a30a381 100644
 --- a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
 +++ b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
 @@ -90,6 +90,13 @@ struct dma_map_ops {
@@ -41,7 +58,7 @@ index f7cab72ca6e..fbfce7ef8a3 100644
 +void linux_dma_priv_uninit(struct device *);
  int linux_dma_tag_init(struct device *, u64);
  int linux_dma_tag_init_coherent(struct device *, u64);
- /*
+ void *linux_dma_alloc_wc(struct device *dev, size_t size,
 diff --git a/sys/compat/linuxkpi/common/src/linux_pci.c b/sys/compat/linuxkpi/common/src/linux_pci.c
 index b0613daccd8..e593f9206ee 100644
 --- a/sys/compat/linuxkpi/common/src/linux_pci.c
