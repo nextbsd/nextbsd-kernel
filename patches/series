@@ -37,12 +37,8 @@
 0037-procdesc-flag-processes-orphaned-onto-the-reaper.patch
 0038-linuxkpi-dma_alloc_wc-noncoherent-and-iosys-map-init-vaddr.patch
 0039-linuxkpi-dma_mmap_wc-get_sgtable-and-vm_flags_mod.patch
-0040-linuxkpi-platform-device-of-lookups-and-component.patch
-0041-linuxkpi-fix-to_platform_device-parameter-capture.patch
 0042-bcm2712-l2-interrupt-controller.patch
 0043-linuxkpi-dma_priv-init-for-non-pci-devices.patch
-0044-linuxkpi-request_irq-for-non-pci-devices.patch
-0045-linuxkpi-refcount-pm-runtime-and-platform-irq-byname.patch
 0046-clk_fixed-skip-disabled-nodes.patch
 0047-rp1_clk-peripheral-clock-gates-for-rp1.patch
 0048-rp1_gpio-implement-fdt-pinctrl-for-the-rp1-pin-mux.patch
