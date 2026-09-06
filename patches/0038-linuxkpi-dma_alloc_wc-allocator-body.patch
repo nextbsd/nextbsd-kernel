@@ -1,0 +1,104 @@
+From 4b89712509c4d09ce5aaeb2b20ce1358fe7ea062 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 5 Sep 2026 23:03:37 -0500
+Subject: [PATCH] linuxkpi: dma_alloc_wc() allocator body
+
+What remains of the DRM DMA GEM helper support after the header half moved out
+of the kernel and into the graphics modules' own private LinuxKPI
+(nextbsd-kernel-extensions graphics/lkpi).
+
+This half cannot follow it. linux_dma_alloc_wc() is the body of
+linux_dma_alloc_coherent() with the memory attribute lifted into a parameter,
+and it needs the DMA tag machinery, the dma_priv pctrie and the bounce
+bookkeeping that live inside linux_pci.c. A module cannot reach them, and the
+obvious substitute -- allocate coherent, then pmap_change_attr() to
+write-combining -- is a change to the live allocation path for every buffer X
+maps, on the only display driver currently working. That is not a change to
+make blind.
+
+It is additive: a new exported function plus a refactor that leaves
+linux_dma_alloc_coherent()'s behaviour identical. No struct changes, so nothing
+here can shift an offset under a module built against older headers -- which is
+the failure that took out amdgpu and, on the boot audit's reading, i915 on a
+Wyse 5070.
+
+Same class as 0012 and 0043: DMA plumbing that only the kernel can host.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
+---
+ sys/compat/linuxkpi/common/src/linux_pci.c | 44 ++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/src/linux_pci.c b/sys/compat/linuxkpi/common/src/linux_pci.c
+index 87c2f8ce55b..b0613daccd8 100644
+--- a/sys/compat/linuxkpi/common/src/linux_pci.c
++++ b/sys/compat/linuxkpi/common/src/linux_pci.c
+@@ -1778,9 +1778,14 @@ linux_dma_unmap(struct device *dev, dma_addr_t dma_addr, size_t len)
+ 	lkpi_dma_unmap(dev, dma_addr, len, DMA_NONE, 0);
+ }
+ 
+-void *
+-linux_dma_alloc_coherent(struct device *dev, size_t size,
+-    dma_addr_t *dma_handle, gfp_t flag)
++/*
++ * nextbsd-kernel#176: the body of linux_dma_alloc_coherent(), with the memory
++ * attribute lifted into a parameter so linux_dma_alloc_wc() can reuse it. The
++ * only difference between the two allocators is that attribute.
++ */
++static void *
++lkpi_dma_alloc_attr(struct device *dev, size_t size,
++    dma_addr_t *dma_handle, gfp_t flag, vm_memattr_t attr)
+ {
+ 	struct linux_dma_priv *priv;
+ 	vm_paddr_t high;
+@@ -1801,7 +1806,7 @@ linux_dma_alloc_coherent(struct device *dev, size_t size,
+ 	/* Always zero the allocation. */
+ 	flag |= M_ZERO;
+ 	mem = kmem_alloc_contig(size, flag & GFP_NATIVE_MASK, 0, high,
+-	    align, 0, VM_MEMATTR_DEFAULT);
++	    align, 0, attr);
+ 	if (mem != NULL) {
+ 		*dma_handle = linux_dma_map_phys_common(dev, vtophys(mem), size,
+ 		    priv->dmat_coherent);
+@@ -1815,6 +1820,37 @@ linux_dma_alloc_coherent(struct device *dev, size_t size,
+ 	return (mem);
+ }
+ 
++void *
++linux_dma_alloc_coherent(struct device *dev, size_t size,
++    dma_addr_t *dma_handle, gfp_t flag)
++{
++
++	return (lkpi_dma_alloc_attr(dev, size, dma_handle, flag,
++	    VM_MEMATTR_DEFAULT));
++}
++
++/*
++ * nextbsd-kernel#176: dma_alloc_wc() for the DRM DMA GEM helpers, which is the
++ * live allocation path for a KMS driver -- it is what backs every buffer X
++ * allocates through dumb_create().
++ *
++ * Note what VM_MEMATTR_WRITE_COMBINING means here. On arm64 FreeBSD defines it
++ * as VM_MEMATTR_WRITE_THROUGH (sys/arm64/include/vm.h), so this is not the
++ * write-combining buffer Linux means on x86; it is the closest attribute the
++ * platform offers, chosen by the platform rather than by us. What matters for
++ * scanout is that it is not plain cached memory, which is what
++ * VM_MEMATTR_DEFAULT gives and what the display block cannot see writes
++ * through without explicit flushes.
++ */
++void *
++linux_dma_alloc_wc(struct device *dev, size_t size,
++    dma_addr_t *dma_handle, gfp_t flag)
++{
++
++	return (lkpi_dma_alloc_attr(dev, size, dma_handle, flag,
++	    VM_MEMATTR_WRITE_COMBINING));
++}
++
+ struct lkpi_devres_dmam_coherent {
+ 	size_t size;
+ 	dma_addr_t *handle;
+-- 
+2.50.1 (Apple Git-155)
+
