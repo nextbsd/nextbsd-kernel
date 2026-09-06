@@ -1,0 +1,44 @@
+From 0c68cdcafc20b67d13d374de4d576c015b5f51b4 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 5 Sep 2026 19:34:33 -0500
+Subject: [PATCH] linuxkpi: add platform_driver::remove_new
+
+Upstream renamed .remove to .remove_new during the transition to a void
+return, and 6.12-era drivers assign the new name. Every vc4 component driver
+does -- vc4_hvs, vc4_crtc, vc4_hdmi -- so without this the vendored sources do
+not compile (nextbsd-kernel-extensions#51).
+
+Both names are carried, because the tree contains drivers written against
+each. Same signature: LinuxKPI's .remove already returns void, so this is a
+spelling difference rather than a behavioural one.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
+---
+ .../linuxkpi/common/include/linux/platform_device.h    | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/platform_device.h b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+index 39728c153db..0e2c82dea83 100644
+--- a/sys/compat/linuxkpi/common/include/linux/platform_device.h
++++ b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+@@ -51,6 +51,16 @@ struct platform_driver {
+ 	 */
+ 	int				(*probe)(struct platform_device *);
+ 	void				(*remove)(struct platform_device *);
++	/*
++	 * nextbsd-kernel-extensions#51: upstream renamed .remove to .remove_new
++	 * during the transition to a void return, and 6.12-era drivers assign
++	 * the new name -- vc4_hvs, vc4_crtc and vc4_hdmi all do. Both are
++	 * carried because the tree contains drivers written against each.
++	 *
++	 * Same signature as .remove here: LinuxKPI's .remove already returns
++	 * void, so this is a spelling difference rather than a behavioural one.
++	 */
++	void				(*remove_new)(struct platform_device *);
+ 	struct device_driver		driver;
+ };
+ 
+-- 
+2.50.1 (Apple Git-155)
+
