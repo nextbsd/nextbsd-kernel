@@ -1,0 +1,270 @@
+From 3ce85301629c1d00f05827f35329d64a712f2ee0 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 5 Sep 2026 21:47:20 -0500
+Subject: [PATCH] linuxkpi: real interrupt-names parsing, and more than one IRQ
+ per device
+
+platform_get_irq_byname() returned dev->irq for any name, and request_irq()
+allocated rid 0 for every device off the PCI bus, so a device-tree device could
+hold exactly one interrupt.
+
+bcm2712 needs more than one. The HVS requests three named interrupts
+(ch0-eof, ch1-eof, ch2-eof) and the HDMI controller four (hpd-connected,
+hpd-removed, cec-rx, cec-tx). With a single rid the first request takes it and
+every later one fails -- and vc4_hvs.c does not check the return, so it fails
+silently with all three handlers aliased to one interrupt line.
+
+platform_get_irq() and platform_get_irq_byname() now return the resource rid,
+tagged with LKPI_IRQ_OF, and request_irq() allocates that rid rather than
+assuming 0. The tag bit sits far above any real interrupt number, so an
+untagged value still means "dev->irq at rid 0" and existing callers -- firmware
+KMS among them -- are unaffected.
+
+platform_get_irq_byname() resolves the name against the node's interrupt-names
+property: a list of NUL-separated strings, one per entry in interrupts and in
+the same order, so the index of the matching name is the rid. Both getters
+validate the index against the IRQ entries newbus already built from the node,
+so an out-of-range request returns -ENXIO at lookup rather than failing later
+as a resource allocation.
+
+Both are out of line in linux_of.c because they read the device tree, and
+because a header that names FreeBSD resource types breaks LinuxKPI consumers
+(see patch 0053).
+
+Refs nextbsd/nextbsd-kernel-extensions#51
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
+---
+ .../linuxkpi/common/include/linux/device.h    | 22 +++++
+ .../common/include/linux/platform_device.h    | 38 ++++----
+ .../linuxkpi/common/src/linux_interrupt.c     |  8 +-
+ sys/compat/linuxkpi/common/src/linux_of.c     | 97 +++++++++++++++++++
+ 4 files changed, 145 insertions(+), 20 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/device.h b/sys/compat/linuxkpi/common/include/linux/device.h
+index ebe011729e7..ab860633ac2 100644
+--- a/sys/compat/linuxkpi/common/include/linux/device.h
++++ b/sys/compat/linuxkpi/common/include/linux/device.h
+@@ -137,6 +137,28 @@ struct device {
+ 	void		*driver_data;
+ 	unsigned int	irq;
+ #define	LINUX_IRQ_INVALID	65535
++
++/*
++ * Encoding for interrupts of a device on a bus LinuxKPI did not attach (a
++ * device-tree device, in practice).
++ *
++ * The PCI path maps a Linux irq number back to a resource rid with
++ * lkpi_irq_rid(); off PCI there is no such mapping, so request_irq() used rid
++ * 0 unconditionally and a device could hold exactly one interrupt. bcm2712
++ * needs more: the HVS requests three named interrupts (ch0..2-eof) and the
++ * HDMI controller four (hpd-connected, hpd-removed, cec-rx, cec-tx). With a
++ * single rid the second request fails -- and vc4_hvs.c does not check, so it
++ * fails silently with every handler aliased to one line.
++ *
++ * platform_get_irq() and platform_get_irq_byname() therefore return the rid
++ * tagged with LKPI_IRQ_OF, and lkpi_request_irq() allocates that rid. The tag
++ * bit is far above any real interrupt number, so an untagged value still means
++ * "dev->irq, rid 0" and existing callers are unaffected.
++ */
++#define	LKPI_IRQ_OF_TAG		0x40000000u
++#define	LKPI_IRQ_OF(rid)	(LKPI_IRQ_OF_TAG | (unsigned)(rid))
++#define	LKPI_IRQ_IS_OF(irq)	(((unsigned)(irq) & LKPI_IRQ_OF_TAG) != 0)
++#define	LKPI_IRQ_OF_RID(irq)	((int)((unsigned)(irq) & 0xffffu))
+ 	unsigned int	irq_start;
+ 	unsigned int	irq_end;
+ 	const struct attribute_group **groups;
+diff --git a/sys/compat/linuxkpi/common/include/linux/platform_device.h b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+index 18009290f0d..73a0efa2897 100644
+--- a/sys/compat/linuxkpi/common/include/linux/platform_device.h
++++ b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+@@ -112,35 +112,35 @@ platform_set_drvdata(struct platform_device *pdev, void *data)
+  * any consumer here asks for. A higher index gets -ENXIO rather than a wrong
+  * answer.
+  */
++/*
++ * Interrupts of a platform device.
++ *
++ * Both are out of line, in linux_of.c, because they read the device tree --
++ * platform_get_irq_byname() resolves a name against the node's
++ * interrupt-names property, which is how a DT driver asks for one of several
++ * interrupts without hardcoding an index.
++ *
++ * They return a tagged rid (see LKPI_IRQ_OF in <linux/device.h>), not an
++ * interrupt number: request_irq() needs to know WHICH resource to allocate,
++ * and a device off the PCI bus has no other way to say so. A device with one
++ * unnamed interrupt still works through dev->irq as before.
++ */
++int	lkpi_platform_get_irq(struct platform_device *pdev, unsigned int num);
++int	lkpi_platform_get_irq_byname(struct platform_device *pdev,
++	    const char *name);
++
+ static __inline int
+ platform_get_irq(struct platform_device *pdev, unsigned int num)
+ {
+ 
+-	if (num != 0)
+-		return (-ENXIO);
+-	if (pdev->dev.irq == LINUX_IRQ_INVALID)
+-		return (-ENXIO);
+-	return ((int)pdev->dev.irq);
++	return (lkpi_platform_get_irq(pdev, num));
+ }
+ 
+-/*
+- * Named interrupts are how a device-tree driver asks for one of several IRQs
+- * without hardcoding an index -- the names come from interrupt-names in the
+- * DT node.
+- *
+- * struct device carries a single irq, so this can honestly answer only for a
+- * device with one interrupt. Rather than guess which name that is, return it
+- * for any name and let the caller's own DT contract decide; a driver that
+- * needs several named interrupts needs real interrupt-names parsing here, and
+- * this returning the sole IRQ is not a substitute for that.
+- */
+ static __inline int
+ platform_get_irq_byname(struct platform_device *pdev, const char *name)
+ {
+ 
+-	if (pdev->dev.irq == LINUX_IRQ_INVALID)
+-		return (-ENXIO);
+-	return ((int)pdev->dev.irq);
++	return (lkpi_platform_get_irq_byname(pdev, name));
+ }
+ 
+ /*
+diff --git a/sys/compat/linuxkpi/common/src/linux_interrupt.c b/sys/compat/linuxkpi/common/src/linux_interrupt.c
+index 15502f0f2c9..dc5a01ec848 100644
+--- a/sys/compat/linuxkpi/common/src/linux_interrupt.c
++++ b/sys/compat/linuxkpi/common/src/linux_interrupt.c
+@@ -142,7 +142,13 @@ lkpi_request_irq(struct device *xdev, unsigned int irq,
+ 		if (xdev == NULL || xdev->bsddev == NULL)
+ 			return (-ENXIO);
+ 		dev = xdev;
+-		rid = 0;
++		/*
++		 * platform_get_irq()/platform_get_irq_byname() return the rid
++		 * tagged with LKPI_IRQ_OF so a device tree device can hold more
++		 * than one interrupt; anything else is dev->irq, whose resource
++		 * is rid 0.
++		 */
++		rid = LKPI_IRQ_IS_OF(irq) ? LKPI_IRQ_OF_RID(irq) : 0;
+ 	} else {
+ 		if (xdev != NULL && xdev != dev)
+ 			return -ENXIO;
+diff --git a/sys/compat/linuxkpi/common/src/linux_of.c b/sys/compat/linuxkpi/common/src/linux_of.c
+index 59df8b3af82..f4bcd1b2949 100644
+--- a/sys/compat/linuxkpi/common/src/linux_of.c
++++ b/sys/compat/linuxkpi/common/src/linux_of.c
+@@ -28,6 +28,7 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/err.h>
++#include <linux/errno.h>
+ 
+ #ifdef FDT
+ #include <dev/ofw/openfirm.h>
+@@ -311,3 +312,99 @@ lkpi_platform_ioremap_resource(struct platform_device *pdev, unsigned int index)
+ 	 */
+ 	return (rman_get_virtual(res));
+ }
++
++/*
++ * How many interrupts the node actually has, so an out-of-range index is
++ * reported as -ENXIO here rather than as a resource allocation failure much
++ * later. ofw_bus_intr_to_rl() has already turned the node's interrupts
++ * property into a resource list on the newbus device, so counting IRQ entries
++ * there matches exactly what bus_alloc_resource_any() will be able to hand out.
++ */
++static int
++lkpi_of_irq_count(struct platform_device *pdev)
++{
++#ifdef FDT
++	struct resource_list *rl;
++	struct resource_list_entry *rle;
++	int n;
++
++	if (pdev->dev.bsddev == NULL)
++		return (0);
++	rl = BUS_GET_RESOURCE_LIST(device_get_parent(pdev->dev.bsddev),
++	    pdev->dev.bsddev);
++	if (rl == NULL)
++		return (0);
++	n = 0;
++	STAILQ_FOREACH(rle, rl, link) {
++		if (rle->type == SYS_RES_IRQ)
++			n++;
++	}
++	return (n);
++#else
++	return (0);
++#endif
++}
++
++int
++lkpi_platform_get_irq(struct platform_device *pdev, unsigned int num)
++{
++
++	if (pdev == NULL)
++		return (-ENXIO);
++
++	/*
++	 * A device with a single interrupt read at attach keeps working
++	 * through dev->irq, untagged, which request_irq() treats as rid 0.
++	 * This is the path firmware KMS takes.
++	 */
++	if (num == 0 && lkpi_of_irq_count(pdev) <= 1) {
++		if (pdev->dev.irq == LINUX_IRQ_INVALID)
++			return (-ENXIO);
++		return ((int)pdev->dev.irq);
++	}
++
++	if ((int)num >= lkpi_of_irq_count(pdev))
++		return (-ENXIO);
++	return ((int)LKPI_IRQ_OF(num));
++}
++
++/*
++ * Resolve a name against the node's interrupt-names property.
++ *
++ * interrupt-names is a list of NUL-separated strings, one per entry in
++ * interrupts, in the same order -- so the index of the matching name is the
++ * index of the interrupt, which is the rid.
++ */
++int
++lkpi_platform_get_irq_byname(struct platform_device *pdev, const char *name)
++{
++#ifdef FDT
++	char *names;
++	phandle_t node;
++	int i, len, off;
++
++	if (pdev == NULL || name == NULL || pdev->dev.of_node == NULL)
++		return (-ENXIO);
++	node = (phandle_t)pdev->dev.of_node->node;
++	if (node == 0)
++		return (-ENXIO);
++
++	len = OF_getprop_alloc(node, "interrupt-names", (void **)&names);
++	if (len <= 0)
++		return (-ENXIO);
++
++	for (i = 0, off = 0; off < len; i++) {
++		if (strcmp(&names[off], name) == 0) {
++			OF_prop_free(names);
++			if (i >= lkpi_of_irq_count(pdev))
++				return (-ENXIO);
++			return ((int)LKPI_IRQ_OF(i));
++		}
++		off += strlen(&names[off]) + 1;
++	}
++	OF_prop_free(names);
++	return (-ENXIO);
++#else
++	return (-ENXIO);
++#endif
++}
+-- 
+2.50.1 (Apple Git-155)
+

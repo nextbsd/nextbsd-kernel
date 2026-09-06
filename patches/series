@@ -52,3 +52,4 @@
 0052-linuxkpi-platform_driver-remove_new.patch
 0053-linuxkpi-rman-out-of-platform-device-h.patch
 0054-linuxkpi-component-bind-in-match-order.patch
+0055-linuxkpi-interrupt-names-multi-irq.patch
