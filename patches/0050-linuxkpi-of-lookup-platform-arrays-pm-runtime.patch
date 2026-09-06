@@ -1,6 +1,6 @@
-From d86fb61507cc4f055aa05e0a98fdee0e76175a70 Mon Sep 17 00:00:00 2001
+From c7daea8037e8371dd872750fc0714a899dfa7581 Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
-Date: Sat, 5 Sep 2026 19:16:46 -0500
+Date: Sat, 5 Sep 2026 19:31:15 -0500
 Subject: [PATCH] linuxkpi: OF node lookup, platform driver arrays and
  pm_runtime for full KMS
 
@@ -17,38 +17,34 @@ of.h / linux_of.c:
   of_device_get_match_data().
 - of_dma_configure(), which succeeds without acting. Honest on a SoC with no
   IOMMU and no DMA offset, which BCM2712 is; a platform with either would be
-  handed wrong addresses and needs real dma-ranges parsing. Said so at the
-  definition rather than left to be discovered.
+  handed wrong addresses and needs real dma-ranges parsing.
 
 platform_device.h:
 - platform_register_drivers()/platform_unregister_drivers(), unwinding
   exactly what succeeded rather than the whole array on failure.
-- devm_platform_ioremap_resource(). "devm" does NOT auto-release, because
-  LinuxKPI devres does not track bus resources.
+- devm_platform_ioremap_resource(), returning rman_get_virtual() -- the
+  mapped VA readl()/writel() expect. NOT rman_get_bushandle(), which is a
+  bus_space_handle_t and not pointer-sized on every architecture. "devm"
+  does NOT auto-release: LinuxKPI devres does not track bus resources.
 
 pm_runtime.h:
 - pm_runtime_resume_and_get(), pm_runtime_status_suspended(). Correct rather
   than stubbed: no runtime PM exists here, so nothing is ever suspended.
 
-platform_find_device_by_driver() is deliberately left UNIMPLEMENTED. vc4_drv.c
-uses it to enumerate every device bound to a component driver, and there is
-nothing to enumerate -- platform_driver_register() is a TODO stub returning
--ENXIO, so no platform driver is ever bound and no device_t -> struct device
-registry exists. Returning NULL would compile and then silently build an empty
-component match list, failing later and further away. Left as a compile error
-with the reason in the header.
-
-That stub is the real scope of #51: the compile surface is 22 functions, but
-underneath it the platform bus vc4's component model assumes does not exist.
+platform_find_device_by_driver() is deliberately left UNIMPLEMENTED, with the
+reason in the header: it enumerates devices on Linux's platform bus, and
+NextBSD drives these components from a handwritten newbus master instead --
+the pattern vc4_fkms_master.c already uses on hardware. There is no platform
+bus to enumerate and none is needed.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
 ---
  sys/compat/linuxkpi/common/include/linux/of.h |  27 +++
- .../common/include/linux/platform_device.h    |  65 +++++++
+ .../common/include/linux/platform_device.h    |  73 ++++++++
  .../common/include/linux/pm_runtime.h         |   6 +
  sys/compat/linuxkpi/common/src/linux_of.c     | 167 ++++++++++++++++++
- 4 files changed, 265 insertions(+)
+ 4 files changed, 273 insertions(+)
 
 diff --git a/sys/compat/linuxkpi/common/include/linux/of.h b/sys/compat/linuxkpi/common/include/linux/of.h
 index b6024807f86..95efb415ed9 100644
@@ -87,10 +83,19 @@ index b6024807f86..95efb415ed9 100644
 +
  #endif
 diff --git a/sys/compat/linuxkpi/common/include/linux/platform_device.h b/sys/compat/linuxkpi/common/include/linux/platform_device.h
-index 11b92cf4839..ad69bbf4005 100644
+index 11b92cf4839..39728c153db 100644
 --- a/sys/compat/linuxkpi/common/include/linux/platform_device.h
 +++ b/sys/compat/linuxkpi/common/include/linux/platform_device.h
-@@ -133,6 +133,71 @@ platform_get_irq_byname(struct platform_device *pdev, const char *name)
+@@ -28,6 +28,8 @@
+ #ifndef	_LINUXKPI_LINUX_PLATFORM_DEVICE_H
+ #define	_LINUXKPI_LINUX_PLATFORM_DEVICE_H
+ 
++#include <sys/rman.h>		/* devm_platform_ioremap_resource (#51) */
++
+ #include <linux/kernel.h>
+ #include <linux/device.h>
+ #include <linux/errno.h>
+@@ -133,6 +135,77 @@ platform_get_irq_byname(struct platform_device *pdev, const char *name)
  	return ((int)pdev->dev.irq);
  }
  
@@ -114,7 +119,13 @@ index 11b92cf4839..ad69bbf4005 100644
 +	    RF_ACTIVE | RF_SHAREABLE);
 +	if (res == NULL)
 +		return (ERR_PTR(-ENOMEM));
-+	return ((void *)rman_get_bushandle(res));
++	/*
++	 * The mapped virtual address, which is what readl()/writel() expect.
++	 * NOT rman_get_bushandle(): that is a bus_space_handle_t, and on some
++	 * architectures it is not even pointer-sized, so casting it to void *
++	 * is wrong as well as unportable.
++	 */
++	return (rman_get_virtual(res));
 +}
 +
 +/*
