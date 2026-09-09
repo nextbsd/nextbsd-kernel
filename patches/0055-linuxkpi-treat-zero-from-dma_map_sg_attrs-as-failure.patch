@@ -1,0 +1,70 @@
+From cc5e061e232bc13fc8f162f47dfb0864b98033dc Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 9 Sep 2026 14:13:27 -0500
+Subject: [PATCH] linuxkpi: treat a zero return from dma_map_sg_attrs() as a
+ failure
+
+dma_map_sgtable() tested only for a negative return:
+
+	nents = dma_map_sg_attrs(dev, sgt->sgl, sgt->nents, dir, attrs);
+	if (nents < 0)
+		return (nents);
+	sgt->nents = nents;
+	return (0);
+
+but dma_map_sg_attrs() is linux_dma_map_sg_attrs(), which follows the legacy
+Linux convention: it returns 0 on failure and never a negative value. So
+nents < 0 can never fire, and a failed mapping was stored as sgt->nents = 0
+and reported as success. Callers then used a scatterlist that was never
+mapped, with nothing logged.
+
+Upstream Linux does not behave this way. Its dma_map_sgtable() calls
+__dma_map_sg_attrs(), which returns a negative errno, and the DMA API
+documentation states that dma_map_sgtable() converts a legacy zero return
+into an error. FreeBSD copied the wrapper's shape but wired it to a
+legacy-convention function; 4085bde9 ("Fix return value of dma_map_sgtable")
+introduced this check and deliberately let 0 through.
+
+Measured on a Raspberry Pi 5: drm_gem_shmem_get_pages_sgt_locked() saw
+ret == 0, stored the sgt, and DRM_IOCTL_V3D_CREATE_BO returned a handle for a
+buffer with zero DMA mappings. The GPU then faulted with "write violation,
+pte invalid" and nothing in the log pointed at the mapping.
+
+The preceding change fixes the mapping failure this exposed. This one is
+independent: it makes any remaining failure visible instead of silent.
+
+Note dma_map_sgtable() is a header inline, so this only takes effect in
+modules recompiled against it -- prebuilt kexts keep the old check until
+rebuilt.
+
+Refs nextbsd-kernel#206, nextbsd-kernel-extensions#72.
+---
+ .../linuxkpi/common/include/linux/dma-mapping.h      | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+index 82f1a30..1062870 100644
+--- a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
++++ b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+@@ -524,6 +524,18 @@ dma_map_sgtable(struct device *dev, struct sg_table *sgt,
+ 	nents = dma_map_sg_attrs(dev, sgt->sgl, sgt->nents, dir, attrs);
+ 	if (nents < 0)
+ 		return (nents);
++	/*
++	 * dma_map_sg_attrs() is linux_dma_map_sg_attrs(), which follows the
++	 * legacy Linux convention and returns 0 on failure -- never a
++	 * negative value. Testing only for < 0 therefore recorded a failed
++	 * mapping as sgt->nents = 0 and reported success, handing the caller
++	 * a scatterlist that was never mapped.
++	 *
++	 * Upstream converts the legacy zero to an error here; see the DMA API
++	 * documentation for dma_map_sgtable().
++	 */
++	if (nents == 0)
++		return (-ENOMEM);
+ 	sgt->nents = nents;
+ 	return (0);
+ }
+-- 
+2.50.1 (Apple Git-155)
+
