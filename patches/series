@@ -44,3 +44,5 @@
 0047-rp1_clk-peripheral-clock-gates-for-rp1.patch
 0048-rp1_gpio-implement-fdt-pinctrl-for-the-rp1-pin-mux.patch
 0049-rp1_pwm-driver-for-the-rp1-pwm-blocks.patch
+0054-linuxkpi-map-scatterlist-entries-individually.patch
+0055-linuxkpi-treat-zero-from-dma_map_sg_attrs-as-failure.patch
