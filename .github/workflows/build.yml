@@ -312,6 +312,50 @@ jobs:
             NO_MODULES=yes \
             buildkernel -j"$(nproc)"
 
+      # Gate: the Linuxulator and FUSE must be COMPILED INTO the kernel, on
+      # BOTH arches (#60 follow-up). NextBSD ships no /boot/kernel .ko tree and
+      # no kld tooling, so "compiled in" is the only state in which either one
+      # exists at all -- there is no runtime fallback that could mask a config
+      # regression. Nothing checked this before, which is how arm64 ended up
+      # silently without the Linux ABI while amd64 had it.
+      #
+      # Two layers, because they fail differently:
+      #   1. the .o files prove config(8) SELECTED the entries (a files.* or
+      #      options wiring mistake drops them here, with the kernel still
+      #      linking fine),
+      #   2. the symbols prove they actually LINKED IN (an `optional' entry that
+      #      no option selects compiles nothing and leaves no trace otherwise).
+      #
+      # Deliberately a build-time gate, not a runtime one: CI has no arm64 boot
+      # today, so a runtime probe could not be arch-symmetric. This one is.
+      - name: Gate — Linuxulator + FUSEFS are compiled into the kernel
+        run: |
+          set -eu
+          OBJ="/usr/obj/usr/src/${{ matrix.target }}.${{ matrix.target_arch }}/sys/NEXTBSD"
+          test -d "$OBJ" || { echo "no kernel obj dir at $OBJ" >&2; exit 1; }
+          NM="${CROSS_BINDIR}/llvm-nm"; [ -x "$NM" ] || NM=nm
+          fail=0
+          echo "--- objects config(8) should have selected (${{ matrix.target }})"
+          for o in linux_sysvec.o linux_machdep.o linux_misc.o linux_elf64.o \
+                   linprocfs.o linsysfs.o fuse_vfsops.o fuse_vnops.o; do
+            if [ -f "$OBJ/$o" ]; then echo "  ok    $o"
+            else echo "  MISSING $o" >&2; fail=1; fi
+          done
+          echo "--- symbols that must be in the linked kernel"
+          for s in elf_linux_sysvec fuse_vfsops; do
+            if "$NM" "$OBJ/kernel" 2>/dev/null | grep -qw "$s"; then
+              echo "  ok    $s"
+            else echo "  MISSING symbol $s" >&2; fail=1; fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "" >&2
+            echo "The Linuxulator and/or FUSE are NOT in this kernel." >&2
+            echo "amd64 wires the ABI via src-overlay/conf/files.compat_linux;" >&2
+            echo "arm64 needs the arm64 equivalent (sys/arm64/linux/)." >&2
+            exit 1
+          fi
+          echo "==> Linuxulator + FUSEFS compiled in (${{ matrix.target }})"
+
       # arm64 only: build the Pi 500+ bring-up kernel and wrap it in the arm64
       # Linux `Image` boot header, so the Raspberry Pi firmware can load it
       # directly -- no loader, no UEFI. This is the nextbsd-rpi500 native-boot
