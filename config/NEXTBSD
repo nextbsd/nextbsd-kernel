@@ -102,18 +102,21 @@ options 	FDESCFS
 # src-overlay/conf/files.compat_linux and the declarations by
 # src-overlay/conf/options.compat_linux (wired in build.yml). NextBSD has no
 # /boot/kernel .ko tree and no kldload, so compiling in is the only route.
-# amd64 only in effect: files.compat_linux references amd64/linux/* and
-# x86/linux/*, and build.yml appends it on the amd64 leg only. This config is
-# shared by both matrix legs, so the workflow declares LINPROCFS/LINSYSFS for
-# arm64 as well -- there they are accepted but select nothing. arm64 has a
-# complete Linux ABI in tree (sys/arm64/linux/); mirroring this for it is a
-# follow-up, not a blocker for #60.
+# Both matrix legs now. files.compat_linux is amd64 (amd64/linux/* plus the
+# three x86/linux/* files); files.compat_linux.arm64 is arm64 (arm64/linux/*,
+# no x86 files, aarch64 VDSO flags -mgeneral-regs-only/-ffixed-x18). Two
+# fragments rather than one because config(8) reads a single files.<arch> per
+# target and has no equivalent of the Makefiles' .if MACHINE_CPUARCH guard.
+# LINPROCFS/LINSYSFS also differ: options.amd64 declares both, options.arm64
+# declares neither, so arm64 additionally gets options.compat_linux.arm64
+# appended to sys/conf/options.arm64 -- per-arch, never MI, or amd64 would see
+# a duplicate. On arm64 this reaches NEXTBSD-RPI5 too, which includes NEXTBSD.
 # Revert path when the kext-conversion project lands: drop the workflow wiring
 # and delete the two overlay fragments.
 #
 # COMPAT_LINUX / LINPROCFS / LINSYSFS are NOT named here on purpose. They are
 # appended to the copied config by the workflow's "Wire in the static
-# Linuxulator" step, on the amd64 leg only -- the same pattern COMPAT_MACH uses,
+# Linuxulator" step, on both legs -- the same pattern COMPAT_MACH uses,
 # and for the same reason: nextbsd-kernel-extensions reuses THIS file to build a
 # KBI-matched kernel and lays in none of src-overlay/, so any option declared
 # only by the overlay makes its config(8) die with `unknown option'. That is

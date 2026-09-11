@@ -1,0 +1,2 @@
+spawn qemu-system-aarch64 -machine virt -accel tcg -cpu max -m 4096 -smp 2 -drive if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd -drive if=pflash,format=raw,unit=1,file=vars.fd -drive if=none,id=hd0,format=raw,file=disk.img -device virtio-blk-device,drive=hd0 -netdev user,id=net0 -device virtio-net-device,netdev=net0 -display none -serial stdio
+qemu-system-aarch64: -drive if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd: Could not open '/usr/share/AAVMF/AAVMF_CODE.fd': No such file or directory
