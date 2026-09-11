@@ -520,7 +520,7 @@ jobs:
       # depends on the ISO (which depends on nextbsd-pkg). The image is uploaded
       # for the separate KVM boot job. amd64 only for now (no arm64 boot job).
       - name: Assemble disk.img (this kernel + component continuous artifacts)
-        if: github.event_name == 'pull_request' && matrix.target == 'amd64'
+        if: github.event_name == 'pull_request'
         env:
           # This step only READS public `continuous` release assets from the
           # sibling component repos, so it needs no PAT — the built-in,
@@ -542,8 +542,19 @@ jobs:
             --pattern 'nextbsd-base-${{ matrix.target }}.tar.gz' --dir art --clobber
           gh release download continuous -R nextbsd-redux/nextbsd-userland \
             --pattern 'nextbsd-userland-${{ matrix.target }}.tar.gz' --dir art --clobber
+          # The kext assets are a mix of arch-suffixed (graphics-kexts-amd64,
+          # graphics-kexts-arm64) and unsuffixed (intelwifi-kext, nvidia-kexts)
+          # names, and '*kext*.tar.gz' matches every one of them -- so before
+          # arm64 assembled anything, an amd64 image was being built with the
+          # arm64 graphics kexts laid in alongside its own. Harmless there
+          # (wrong-arch .ko files simply never load) but wrong, and actively
+          # wrong once both arches assemble. Drop the other arch's suffixed
+          # assets after download; unsuffixed ones are left alone rather than
+          # guessed at.
           gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
             --pattern '*kext*.tar.gz' --dir art --clobber || true
+          _other=amd64; [ "${{ matrix.target }}" = amd64 ] && _other=arm64
+          rm -f art/*-"$_other".tar.gz
           export BASE_TGZ="$PWD/art/nextbsd-base-${{ matrix.target }}.tar.gz"
           export USERLAND_TGZ="$PWD/art/nextbsd-userland-${{ matrix.target }}.tar.gz"
           export MODULES_TGZ="$(ls art/*kext*.tar.gz 2>/dev/null | tr '\n' ' ')"
@@ -557,7 +568,7 @@ jobs:
           ./ci/assemble-image.sh
 
       - name: Upload native-assembled image
-        if: github.event_name == 'pull_request' && matrix.target == 'amd64'
+        if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: nextbsd-ci-image-${{ matrix.target }}
@@ -654,6 +665,100 @@ jobs:
         with:
           name: boot-log
           path: tests/boot.log
+          if-no-files-found: ignore
+
+  # arm64 counterpart of the job above. Same contract: boot the disk.img the
+  # build job self-assembled from THIS kernel, gate on reaching the getty login
+  # prompt, never gate `publish`.
+  #
+  # Self-contained rather than reusing nextbsd-redux/nextbsd's boot-test.sh,
+  # which is hardcoded amd64 (qemu-system-x86_64, -machine q35, -cpu qemu64,
+  # OVMF paths). Making that script arch-aware is the right long-term fix and
+  # belongs with TODO(#376), the move to a shared tests repo; doing it here
+  # would mean a cross-repo merge before this PR could go green.
+  #
+  # Runs on a native arm64 runner (free for public repos), so qemu is not
+  # cross-emulating. KVM is used when the runner exposes /dev/kvm and TCG
+  # otherwise -- same detection boot-test.sh does for amd64.
+  #
+  # NEXTBSD-RPI5 is deliberately NOT what boots here: qemu has no BCM2712
+  # machine model. This is the generic arm64 NEXTBSD kernel on -M virt under
+  # UEFI, which is the same shape as the published NextBSD-arm64 image.
+  smoke-test-arm64:
+    name: smoke-test-arm64 (boot the self-assembled arm64 image)
+    needs: kernel
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Download the self-assembled arm64 image
+        uses: actions/download-artifact@v4
+        with:
+          name: nextbsd-ci-image-arm64
+          path: .
+
+      - name: Install qemu + expect + AAVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm qemu-efi-aarch64 expect
+
+      - name: Boot test (this kernel, self-assembled arm64 image)
+        id: boottest
+        continue-on-error: true
+        run: |
+          set -eu
+          # AAVMF wants two pflash volumes and a WRITABLE vars copy.
+          cp /usr/share/AAVMF/AAVMF_VARS.fd vars.fd
+          chmod u+w vars.fd
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm 2>/dev/null || true; fi
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ACCEL="-accel kvm -cpu host"
+          else
+            ACCEL="-accel tcg,thread=single -cpu max"
+          fi
+          echo "==> accel: $ACCEL"
+          export ACCEL
+          cat > boot.exp <<'EXP'
+          set timeout 1800
+          log_file -noappend boot.log
+          eval spawn qemu-system-aarch64 \
+              -machine virt $env(ACCEL) \
+              -m 4096 -smp 2 \
+              -drive if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd \
+              -drive if=pflash,format=raw,unit=1,file=vars.fd \
+              -drive if=none,id=hd0,format=raw,file=disk.img \
+              -device virtio-blk-device,drive=hd0 \
+              -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+              -display none -serial stdio
+          expect {
+              -re {login: *$}  { puts "\nOK: reached the getty login prompt."; exit 0 }
+              timeout          { puts "\nTIMEOUT before login prompt."; exit 1 }
+              eof              { puts "\nqemu exited before login prompt."; exit 1 }
+          }
+          EXP
+          expect -f boot.exp
+
+      # Gate on the same signal the amd64 job uses: the getty "login:" line in
+      # the SERIAL capture. Separate from the step above so an expect-level
+      # hiccup is distinguishable from "this kernel did not boot".
+      - name: Gate — kernel reached the login prompt
+        run: |
+          if grep -aqE "login: *$|login: root" boot.log 2>/dev/null; then
+            echo "OK: this arm64 kernel booted to the getty login prompt."
+          else
+            echo "FAIL: arm64 kernel did not reach the login prompt." >&2
+            echo "--- last 40 serial lines ---" >&2
+            tail -40 boot.log >&2 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Upload arm64 boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log-arm64
+          path: boot.log
           if-no-files-found: ignore
 
   # Refresh the rolling `continuous` release from a successful main build, so
