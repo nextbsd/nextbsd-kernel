@@ -1,0 +1,23 @@
+# options.compat_linux.arm64 -- option declarations for the static Linuxulator
+# on arm64.
+#
+# Appended to /usr/src/sys/conf/options.arm64 by the kernel workflow.
+#
+# WHY THIS EXISTS SEPARATELY FROM options.compat_linux
+# COMPAT_LINUX is declared once, MI, in src-overlay/conf/options.compat_linux
+# (appended to sys/conf/options), so it already covers both legs. LINPROCFS and
+# LINSYSFS are different: sys/conf/options.amd64 declares both live, but
+# sys/conf/options.arm64 declares NEITHER (verified against releng/15.1 -- its
+# only Linux-adjacent entry is LINUX_BOOT_ABI, which is the arm64 `Image' boot
+# protocol and unrelated to the ABI).
+#
+# So they must be declared for arm64, and must NOT be declared MI: adding them
+# to sys/conf/options would collide with options.amd64 and make config(8) die
+# with "Duplicate option LINPROCFS" on the amd64 leg -- the same failure that
+# broke the first CI run when they were redeclared in options.compat_linux.
+#
+# opt_dontuse.h is the correct bucket, matching how options.amd64 declares them:
+# nothing #ifdef's on these, they only select the `optional' entries in
+# files.compat_linux.arm64.
+LINPROCFS	opt_dontuse.h
+LINSYSFS	opt_dontuse.h
