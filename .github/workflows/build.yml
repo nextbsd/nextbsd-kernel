@@ -768,6 +768,12 @@ jobs:
           #
           # Under AAVMF with -display none the loader's default `efi` console
           # routes to serial, so we can interrupt autoboot and set the vars.
+          # send -s paces input a char at a time: this emulated UART drops
+          # characters when fed a line at full speed, and the loader then reads
+          # e.g. `bot` and answers "unknown command". Required by send -s below --
+          # without it expect dies with "send_slow has no value".
+          set send_slow {1 .04}
+
           proc loader_set {cmd} {
               global timeout
               set saved $timeout
@@ -803,7 +809,33 @@ jobs:
           # `val != NULL && strcasecmp(val, "no") != 0`, so =NO clears RB_MUTEMSGS
           # while leaving the variable set.
           loader_set "set boot_mutemsgs=NO"
-          loader_set "boot"
+
+          # NOT loader_set: that syncs on a fresh "OK " prompt, and a successful
+          # boot LEAVES the prompt, so it would time out on success. Sync on the
+          # kernel starting instead, and resend if the UART garbled the command --
+          # a mangled `boot` gets "unknown command" and sits at OK forever.
+          set timeout 20
+          for {set try 1} {$try <= 5} {incr try} {
+              sleep 0.3
+              expect *
+              send -s -- "boot\r"
+              expect {
+                  "unknown command" {
+                      puts "\n==> loader garbled 'boot' (try $try/5); resending"
+                      continue
+                  }
+                  -re "Booting|/boot/kernel/kernel|Loading kernel|---<<" { break }
+                  "OK " {
+                      puts "\n==> still at OK after 'boot' (try $try/5); resending"
+                      continue
+                  }
+                  timeout {
+                      puts "\n==> no response to 'boot' (try $try/5); resending"
+                      continue
+                  }
+              }
+          }
+          set timeout 1800
 
           # -device virtio-gpu-pci above: this lane had no display device at
           # all, so vtgpu0 never attached, vt_allocate() was never called by it,
