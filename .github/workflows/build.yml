@@ -657,7 +657,19 @@ jobs:
           # the actual serial line the getty prints ("<host> login:"), which is
           # the deterministic "this kernel booted to multi-user" signal and is
           # immune to the flaky post-login SYSLOG-RUN marker (#369).
-          if grep -aqE "login: *$|login: root" tests/boot.log 2>/dev/null; then
+          # Three accepted forms, because "this kernel reached multi-user with a
+          # console session" has three shapes now:
+          #   "login:"                  a getty prompt (no autologin, or it failed)
+          #   "login: root"             the historical root login
+          #   "login on console as ..." getty autologin fired (nextbsd-overlays
+          #                             f9dcd5b disabled root; autologin-user logs
+          #                             admin in), in which case NO prompt is ever
+          #                             printed and matching only "login:" fails on
+          #                             a perfectly good boot.
+          # Matching only the prompt made this gate fail *because* the image was
+          # fixed: once /bin/zsh existed, autologin succeeded, the serial ended at
+          # the admin zsh prompt, and no "login:" line was ever emitted.
+          if grep -aqE "login: *$|login: root|login on console as " tests/boot.log 2>/dev/null; then
             echo "OK: this kernel booted to the getty login prompt."
             echo "--- on-image markers (informational; SYSLOG-RUN etc. flaky, #369) ---"
             grep -aoE "[A-Z0-9-]+-(OK|FAIL|SKIP)" tests/boot.log | sort | uniq -c || true
@@ -753,7 +765,8 @@ jobs:
       # hiccup is distinguishable from "this kernel did not boot".
       - name: Gate — kernel reached the login prompt
         run: |
-          if grep -aqE "login: *$|login: root" boot.log 2>/dev/null; then
+          # Same three forms as the amd64 gate above -- autologin prints no prompt.
+          if grep -aqE "login: *$|login: root|login on console as " boot.log 2>/dev/null; then
             echo "OK: this arm64 kernel booted to the getty login prompt."
           else
             echo "FAIL: arm64 kernel did not reach the login prompt." >&2
