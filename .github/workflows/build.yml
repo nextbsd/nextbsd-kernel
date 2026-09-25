@@ -542,6 +542,14 @@ jobs:
             --pattern 'nextbsd-base-${{ matrix.target }}.tar.gz' --dir art --clobber
           gh release download continuous -R nextbsd-redux/nextbsd-userland \
             --pattern 'nextbsd-userland-${{ matrix.target }}.tar.gz' --dir art --clobber
+          # Third-party base programs (zsh, sudo, pico) live in nextbsd-contrib by
+          # the repo boundary rule, so none of the above ships them. Without it the
+          # image has no /bin/zsh -- the login shell the overlay's master.passwd
+          # gives admin -- and the serial reads "login: /bin/zsh: No such file or
+          # directory" in a getty loop, which the login gate below then reports as
+          # a kernel boot regression.
+          gh release download continuous -R nextbsd/nextbsd-contrib \
+            --pattern 'nextbsd-contrib-${{ matrix.target }}.tar.gz' --dir art --clobber
           # The kext assets are a mix of arch-suffixed (graphics-kexts-amd64,
           # graphics-kexts-arm64) and unsuffixed (intelwifi-kext, nvidia-kexts)
           # names, and '*kext*.tar.gz' matches every one of them -- so before
@@ -557,6 +565,7 @@ jobs:
           rm -f art/*-"$_other".tar.gz
           export BASE_TGZ="$PWD/art/nextbsd-base-${{ matrix.target }}.tar.gz"
           export USERLAND_TGZ="$PWD/art/nextbsd-userland-${{ matrix.target }}.tar.gz"
+          export CONTRIB_TGZ="$PWD/art/nextbsd-contrib-${{ matrix.target }}.tar.gz"
           export MODULES_TGZ="$(ls art/*kext*.tar.gz 2>/dev/null | tr '\n' ' ')"
           # pkg-free /etc seed from nextbsd-overlays (no git in container), same
           # as nextbsd-userland's assembly step.

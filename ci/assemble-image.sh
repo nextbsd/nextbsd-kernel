@@ -20,6 +20,7 @@
 #   KERNEL_TGZ  nextbsd-kernel-$ARCH.tar.gz          (-> /boot/kernel/kernel)
 #   MODULES_TGZ space-separated kext tarball(s)      (-> /System/Library/Extensions)
 #   USERLAND_TGZ nextbsd-userland-$ARCH.tar.gz       (Darwin system layer)
+#   CONTRIB_TGZ nextbsd-contrib-$ARCH.tar.gz         (zsh, sudo, pico -- /bin/zsh)
 #   OVERLAY     dir whose contents overlay the rootfs (authoritative /etc + plists)
 #   SRC         freebsd-src checkout                 (default /usr/src)
 # Output: $OUT/disk.img
@@ -103,6 +104,26 @@ stage_rootfs() {
     # (accounts, sshd_config, pam.d, fstab, the loader fragment) is NOT in the
     # package any more; it is seeded from nextbsd-overlays next (mirrors build.sh).
     tar -C "$ROOTFS" -xzf "$USERLAND_TGZ"
+    # Third-party base programs from nextbsd-contrib: zsh, sudo, pico. They live
+    # in their own repo by the boundary rule, so nothing above ships them, and
+    # without this the image has no /bin/zsh -- which is the login shell the
+    # overlay's master.passwd gives admin. getty autologins, login cannot exec
+    # the shell, and the serial reads:
+    #
+    #   login: /bin/zsh: No such file or directory
+    #
+    # That also breaks the gate in build.yml, which looks for a bare "login:" at
+    # end of line: here the colon is followed by the error text, so it never
+    # matches and the job reports "kernel did not reach the login prompt" for
+    # what is really a missing userland component. Optional rather than required,
+    # so an assembly with no contrib asset still produces an image -- it will
+    # just have no shell for admin, and the warning says so.
+    if [ -n "${CONTRIB_TGZ:-}" ] && [ -f "${CONTRIB_TGZ:-}" ]; then
+        tar -C "$ROOTFS" -xzf "$CONTRIB_TGZ"
+        log "laid in nextbsd-contrib ($(basename "$CONTRIB_TGZ"))"
+    else
+        echo "WARNING: CONTRIB_TGZ not set/found -- no /bin/zsh, admin will not get a shell" >&2
+    fi
     seed_overlays
     apple_private_runtime
 }
