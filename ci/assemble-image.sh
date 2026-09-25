@@ -158,6 +158,24 @@ seed_overlays() {
     cp -R "$SEED_ROOTFS/." "$ROOTFS/"
     [ -f "$ROOTFS/private/etc/master.passwd" ] && chmod 0600 "$ROOTFS/private/etc/master.passwd"
     log "seeded /etc from nextbsd-overlays ($SEED_ROOTFS)"
+
+    # /etc/os-release, which nextbsd/build.sh writes and this did not. It is the
+    # ONLY place nextbsd-fetch(1) reads the version from -- PRETTY_NAME -- so
+    # without it the login banner prints a bare "NextBSD" with no version, and
+    # anything asserting on the version string has nothing to match. Stamped from
+    # the kernel that is actually in this image, which is what a kernel
+    # smoke-test image should claim.
+    # The version newvers.sh compiled into the kernel that was laid in above,
+    # which is the only version this image can honestly claim.
+    _osver="$(strings -a "$ROOTFS/boot/kernel/kernel" 2>/dev/null |
+        sed -n 's/^NextBSD Kernel Version \([0-9][0-9-]*\).*/\1/p' | head -1)"
+    [ -n "$_osver" ] || _osver="$(date -u +%Y%m%d-%H%M%S)"
+    cat > "$ROOTFS/private/etc/os-release" <<OSREL
+NAME="NextBSD"
+ID=nextbsd
+PRETTY_NAME="NextBSD ${_osver}"
+OSREL
+    log "wrote /etc/os-release (PRETTY_NAME=\"NextBSD ${_osver}\")"
 }
 
 # /var skeleton + utmpx session files (build.sh:120-138). Without utx.active/

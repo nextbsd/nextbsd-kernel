@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Thu, 25 Sep 2026 20:10:00 -0500
+Subject: [PATCH] vt: drop to no backend when there is nothing to downgrade to
+
+vt_deallocate() on the only backend a machine has leaves vt(4) holding a
+pointer to the backend that is going away, and re-arms the 25 Hz flush timer
+on it. Whether that faults is a race.
+
+The chain, all in stock releng/15.1 and unchanged since 76e2f976561f
+(2015-03-01):
+
+  vt_allocate() assigns main_vd->vd_driver = drv BEFORE calling
+  vt_replace_backend(drv, softc), which then records
+  vd_prev_driver = vd_driver -- already drv -- and vd_prev_softc = NULL. On the
+  first ever backend the driver becomes its own predecessor.
+
+  vt_deallocate()'s guard (vd_prev_driver == NULL || ...) therefore passes, so
+  it prints
+
+      VT: Switching back from "virtio_gpu" to "virtio_gpu".
+
+  -- the same name twice, which is the fingerprint -- and calls
+  vt_replace_backend(NULL, NULL).
+
+  There, the upgrade arm needs drv != NULL and the downgrade arm needs
+  vd_prev_softc != NULL. Neither holds, so NEITHER RUNS: vd_driver and
+  vd_softc still name the departing backend, vd_fini is never called, and the
+  function falls through to vt_upgrade(), vd_postswitch and
+  vt_resume_flush_timer() against it.
+
+The caller then frees the framebuffer. virtio_gpu(4) is the case in hand:
+vtgpu_detach() ignores vt_deallocate()'s return and free()s the contigmalloc'd
+shadow framebuffer, unmapping its KVA, while vd_softc still points at
+sc->vtgpu_fb_info. The next vt_flush -> vd_bitblt_text -> vt_fb_mem_wr4 writes
+into the unmapped page:
+
+    VT: Switching back from "virtio_gpu" to "virtio_gpu".
+    vtgpu0: detached
+    panic: data abort in critical section or under mutex
+    esr 0x96000047 (write, translation fault L3)
+
+esr 0x96000047 is a write, level-3 translation fault: an unmapped page, which
+is what kmem_free leaves behind.
+
+It is a race and not a certainty, which is why this has been survivable in
+practice: if the DRM driver's own vt_allocate() installs a new backend before a
+flush lands, nothing ever writes to the freed page. A NextBSD/arm64 guest under
+qemu `virt` was observed completing the whole sequence -- "Switching back",
+then `VT: Replacing driver "virtio_gpu" with new "drmfb"`, KMS up, no fault --
+and also observed losing it.
+
+Make the no-predecessor case honest instead of dangling. When there is nothing
+to downgrade to, genuinely drop to no backend: clear vd_driver and vd_softc,
+run the departing driver's vd_fini, and return with the flush timer left
+suspended and the terminal left muted, so nothing can draw until a new backend
+arrives. The caller's free() is then safe by construction rather than by luck,
+and the machine is blind for the same window it was already blind for.
+
+Everything after the branch -- vt_upgrade(), vd_postswitch, the flush-timer
+resume, termcn_cnregister() -- is skipped, because all of it dereferences
+vd_driver.
+
+vt(4) already half-believed in this state: vt_suspend_handler() and
+vt_resume_handler() both test `vd->vd_driver != NULL` before use. The rest of
+the file did not, so the draw paths are given the same test -- vt_flush() up
+front, which is what the 25 Hz timer, every console write and every window
+switch funnel through, plus the handful of sites reachable without it:
+vtterm_mmap() and the FBIO_* ioctls from userland, the three vd_postswitch
+calls in vt_window_switch(), the one in vtterm_done(), and the two leaf helpers
+with callers outside vt_flush -- vt_set_border() and, via vt_mouse_state(),
+vt_mark_mouse_position_as_dirty().
+
+The result is that `vd_driver == NULL` is a state vt(4) represents rather than
+one it merely fails to crash in by luck.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ sys/dev/vt/vt_core.c | 63 ++++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 56 insertions(+), 7 deletions(-)
+
+diff --git a/sys/dev/vt/vt_core.c b/sys/dev/vt/vt_core.c
+index 922b440..1d0ded8 100644
+--- a/sys/dev/vt/vt_core.c
++++ b/sys/dev/vt/vt_core.c
+@@ -590,7 +590,7 @@ vt_window_switch(struct vt_window *vw)
+ 
+ 		vd->vd_curwindow = vw;
+ 		vd->vd_flags |= VDF_INVALID;
+-		if (vd->vd_driver->vd_postswitch)
++		if (vd->vd_driver != NULL && vd->vd_driver->vd_postswitch)
+ 			vd->vd_driver->vd_postswitch(vd);
+ 		inside_vt_window_switch = false;
+ 		return (0);
+@@ -604,7 +604,7 @@ vt_window_switch(struct vt_window *vw)
+ 		 * is readable (even when a GUI was using ttyv0).
+ 		 */
+ 		if ((kdb_active || KERNEL_PANICKED()) &&
+-		    vd->vd_driver->vd_postswitch)
++		    vd->vd_driver != NULL && vd->vd_driver->vd_postswitch)
+ 			vd->vd_driver->vd_postswitch(vd);
+ 		inside_vt_window_switch = false;
+ 		VT_UNLOCK(vd);
+@@ -623,7 +623,7 @@ vt_window_switch(struct vt_window *vw)
+ 	cv_broadcast(&vd->vd_winswitch);
+ 	VT_UNLOCK(vd);
+ 
+-	if (vd->vd_driver->vd_postswitch)
++	if (vd->vd_driver != NULL && vd->vd_driver->vd_postswitch)
+ 		vd->vd_driver->vd_postswitch(vd);
+ 
+ 	vt_resume_flush_timer(vw, 0);
+@@ -1295,6 +1295,10 @@ vt_mark_mouse_position_as_dirty(struct vt_device *vd, int locked)
+ 	struct vt_font *vf;
+ 	int x, y;
+ 
++	/* Reachable from vt_mouse_state() with no backend installed. */
++	if (vd->vd_driver == NULL)
++		return;
++
+ 	vw = vd->vd_curwindow;
+ 	vf = vw->vw_font;
+ 
+@@ -1335,7 +1339,11 @@ static void
+ vt_set_border(struct vt_device *vd, const term_rect_t *area,
+     term_color_t c)
+ {
+-	vd_drawrect_t *drawrect = vd->vd_driver->vd_drawrect;
++	vd_drawrect_t *drawrect;
++
++	if (vd->vd_driver == NULL)
++		return;
++	drawrect = vd->vd_driver->vd_drawrect;
+ 
+ 	if (drawrect == NULL)
+ 		return;
+@@ -1491,6 +1499,13 @@ vt_flush(struct vt_device *vd)
+ 	if (inside_vt_flush && KERNEL_PANICKED())
+ 		return (0);
+ 
++	/*
++	 * No backend: a sole backend was deallocated and nothing has called
++	 * vt_allocate() yet. Every draw below dereferences vd_driver.
++	 */
++	if (vd->vd_driver == NULL)
++		return (0);
++
+ 	vw = vd->vd_curwindow;
+ 	if (vw == NULL)
+ 		return (0);
+@@ -1659,7 +1674,8 @@ vtterm_done(struct terminal *tm)
+ 		if (vd->vd_curwindow != vw) {
+ 			vd->vd_curwindow = vw;
+ 			vd->vd_flags |= VDF_INVALID;
+-			if (vd->vd_driver->vd_postswitch)
++			if (vd->vd_driver != NULL &&
++			    vd->vd_driver->vd_postswitch)
+ 				vd->vd_driver->vd_postswitch(vd);
+ 		}
+ 		vd->vd_flags &= ~VDF_SPLASH;
+@@ -2564,7 +2580,7 @@ vtterm_mmap(struct terminal *tm, vm_ooffset_t offset, vm_paddr_t * paddr,
+ 	struct vt_window *vw = tm->tm_softc;
+ 	struct vt_device *vd = vw->vw_device;
+ 
+-	if (vd->vd_driver->vd_fb_mmap)
++	if (vd->vd_driver != NULL && vd->vd_driver->vd_fb_mmap)
+ 		return (vd->vd_driver->vd_fb_mmap(vd, offset, paddr, nprot,
+ 		    memattr));
+ 
+@@ -2792,7 +2808,7 @@ skip_thunk:
+ 	case FBIO_GETLINEWIDTH:	/* get scan line width in bytes */
+ 	case FBIO_BLANK:	/* blank display */
+ 	case FBIO_GETRGBOFFS:	/* get RGB offsets */
+-		if (vd->vd_driver->vd_fb_ioctl)
++		if (vd->vd_driver != NULL && vd->vd_driver->vd_fb_ioctl)
+ 			return (vd->vd_driver->vd_fb_ioctl(vd, cmd, data, td));
+ 		break;
+ 	case CONS_BLANKTIME:
+@@ -3334,6 +3350,39 @@ vt_replace_backend(const struct vt_driver *drv, void *softc)
+ 			old_drv->vd_fini(vd, old_softc);
+ 
+ 		vd->vd_flags &= ~VDF_DOWNGRADE;
++		} else {
++		/*
++		 * No driver given and nothing to downgrade to: this backend is
++		 * the only one the machine has. Drop to no backend rather than
++		 * leave vd_driver and vd_softc pointing at storage the caller
++		 * is about to free, which is a use-after-free the moment the
++		 * flush timer next runs.
++		 *
++		 * The timer stays suspended and the terminal stays muted --
++		 * both done at the top of this function -- so nothing can draw
++		 * until some driver calls vt_allocate(). Return before
++		 * vt_upgrade(), vd_postswitch and vt_resume_flush_timer(),
++		 * every one of which dereferences vd_driver.
++		 */
++		const struct vt_driver *old_drv;
++		void *old_softc;
++
++		old_drv = vd->vd_driver;
++		old_softc = vd->vd_softc;
++
++		vd->vd_driver = NULL;
++		vd->vd_softc = NULL;
++		vd->vd_prev_driver = NULL;
++		vd->vd_prev_softc = NULL;
++
++		if (old_drv != NULL && old_drv->vd_fini != NULL) {
++			vd->vd_flags |= VDF_DOWNGRADE;
++			old_drv->vd_fini(vd, old_softc);
++			vd->vd_flags &= ~VDF_DOWNGRADE;
++		}
++
++		VT_UNLOCK(vd);
++		return;
+ 	}
+ 
+ 	VT_UNLOCK(vd);

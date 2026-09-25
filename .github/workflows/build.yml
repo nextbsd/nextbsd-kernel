@@ -557,12 +557,36 @@ jobs:
           # arm64 graphics kexts laid in alongside its own. Harmless there
           # (wrong-arch .ko files simply never load) but wrong, and actively
           # wrong once both arches assemble. Drop the other arch's suffixed
-          # assets after download; unsuffixed ones are left alone rather than
-          # guessed at.
+          # assets after download.
+          #
+          # And on arm64 drop the UNSUFFIXED ones too. They are amd64 -- the
+          # legacy graphics-kexts.tar.gz, intelwifi-kext, nvidia-kexts -- and
+          # `ls` orders "graphics-kexts.tar.gz" AFTER "graphics-kexts-arm64.tar.gz"
+          # ('-' 0x2d sorts before '.' 0x2e), so the amd64 bundle was extracted
+          # last and laid x86-64 objects over arm64's own. kldload then reported
+          #
+          #   linker_load_file: /System/Library/Extensions/DMABuf.kext/Contents/\
+          #       MacOS/DMABuf - unsupported file type
+          #
+          # and the whole graphics chain never loaded, so nothing on arm64 could
+          # ever exercise VirtIOGraphics. This is the same defect
+          # nextbsd-userland fixed in 64422f0 ("arm64 has never run its own
+          # kexts"); this repo kept the half of it that only drops the other
+          # arch's SUFFIXED assets. Keeping the unsuffixed ones on amd64 is
+          # correct -- there they are that arch's assets.
           gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
             --pattern '*kext*.tar.gz' --dir art --clobber || true
           _other=amd64; [ "${{ matrix.target }}" = amd64 ] && _other=arm64
           rm -f art/*-"$_other".tar.gz
+          if [ "${{ matrix.target }}" != amd64 ]; then
+            for _k in art/*kext*.tar.gz; do
+              [ -e "$_k" ] || continue
+              case "$_k" in
+                *-"${{ matrix.target }}".tar.gz) ;;
+                *) echo "dropping non-arm64 kext asset $_k"; rm -f "$_k" ;;
+              esac
+            done
+          fi
           export BASE_TGZ="$PWD/art/nextbsd-base-${{ matrix.target }}.tar.gz"
           export USERLAND_TGZ="$PWD/art/nextbsd-userland-${{ matrix.target }}.tar.gz"
           export CONTRIB_TGZ="$PWD/art/nextbsd-contrib-${{ matrix.target }}.tar.gz"
@@ -669,7 +693,7 @@ jobs:
           # Matching only the prompt made this gate fail *because* the image was
           # fixed: once /bin/zsh existed, autologin succeeded, the serial ended at
           # the admin zsh prompt, and no "login:" line was ever emitted.
-          if grep -aqE "login: *$|login: root|login on console as " tests/boot.log 2>/dev/null; then
+          if grep -aqE "login: *$|login: root|login on console as |^NextBSD/[a-z0-9]+ \\(.*\\) \\(console\\)" tests/boot.log 2>/dev/null; then
             echo "OK: this kernel booted to the getty login prompt."
             echo "--- on-image markers (informational; SYSLOG-RUN etc. flaky, #369) ---"
             grep -aoE "[A-Z0-9-]+-(OK|FAIL|SKIP)" tests/boot.log | sort | uniq -c || true
@@ -751,18 +775,126 @@ jobs:
               -drive if=none,id=hd0,format=raw,file=disk.img \
               -device virtio-blk-device,drive=hd0 \
               -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+              -device virtio-gpu-pci \
               -display none -serial stdio
           # Three accepted forms. Matching only "login:" cost 30 minutes a run once
           # the image gained /bin/zsh: autologin then succeeds, getty never prints a
           # prompt, and this sat until `set timeout 1800` expired on a boot that had
           # been fine for minutes. "login on console as" is the normal shape now that
           # root is disabled (nextbsd-overlays f9dcd5b) and autologin-user runs.
+          # The shipped image mutes the kernel console: nextbsd-overlays'
+          # /boot/loader.conf.d/nextbsd.conf sets boot_mutemsgs="YES" so a normal
+          # boot has a clean login screen. Nothing then reaches -serial stdio, and
+          # this lane sat until `set timeout 1800` expired on boots that were
+          # fine -- for weeks. The amd64 job never hit it because it delegates to
+          # nextbsd/tests/boot-test.sh, which does this loader dance; this lane
+          # has its own inline expect and never learned it.
+          #
+          # Under AAVMF with -display none the loader's default `efi` console
+          # routes to serial, so we can interrupt autoboot and set the vars.
+          # send -s paces input a char at a time: this emulated UART drops
+          # characters when fed a line at full speed, and the loader then reads
+          # e.g. `bot` and answers "unknown command". Required by send -s below --
+          # without it expect dies with "send_slow has no value".
+          set send_slow {1 .04}
+
+          proc loader_set {cmd} {
+              global timeout
+              set saved $timeout
+              set timeout 20
+              sleep 0.3
+              # Drain the settled prior prompt, THEN send, THEN sync on the fresh
+              # OK. Deliberately not matching the command echo: this emulated UART
+              # drops a char from the ECHO often enough that an exact-echo match
+              # hangs on a cosmetic glitch while the loader took the command fine.
+              expect *
+              send -s -- "$cmd\r"
+              expect {
+                  timeout { puts "\nFAIL: no OK prompt after '$cmd'"; exit 1 }
+                  "OK "
+              }
+              set timeout $saved
+          }
+
           expect {
-              -re {login: *$}            { puts "\nOK: reached the getty login prompt."; exit 0 }
-              -re {login on console as } { puts "\nOK: getty autologin fired."; exit 0 }
-              -re {[#%$] $}              { puts "\nOK: reached a shell prompt."; exit 0 }
+              timeout { puts "\nFAIL: no loader autoboot prompt within 60s"; exit 1 }
+              -re "Hit \\\[Enter\\\]"     { send " " }
+              "Booting"                  { send " " }
+              -re "FreeBSD/\[a-z0-9\]+ EFI" { send " " }
+          }
+          expect {
+              timeout { puts "\nFAIL: no loader OK prompt within 30s"; exit 1 }
+              "OK " { puts "\n==> at loader prompt; enabling the serial console" }
+          }
+          loader_set "set console=comconsole"
+          loader_set "set boot_serial=YES"
+          loader_set "set comconsole_speed=115200"
+          # =NO, not unset: the loader's howto builder tests
+          # `val != NULL && strcasecmp(val, "no") != 0`, so =NO clears RB_MUTEMSGS
+          # while leaving the variable set.
+          loader_set "set boot_mutemsgs=NO"
+
+          # NOT loader_set: that syncs on a fresh "OK " prompt, and a successful
+          # boot LEAVES the prompt, so it would time out on success. Sync on the
+          # kernel starting instead, and resend if the UART garbled the command --
+          # a mangled `boot` gets "unknown command" and sits at OK forever.
+          set timeout 20
+          for {set try 1} {$try <= 5} {incr try} {
+              sleep 0.3
+              expect *
+              send -s -- "boot\r"
+              expect {
+                  "unknown command" {
+                      puts "\n==> loader garbled 'boot' (try $try/5); resending"
+                      continue
+                  }
+                  -re "Booting|/boot/kernel/kernel|Loading kernel|---<<" { break }
+                  "OK " {
+                      puts "\n==> still at OK after 'boot' (try $try/5); resending"
+                      continue
+                  }
+                  timeout {
+                      puts "\n==> no response to 'boot' (try $try/5); resending"
+                      continue
+                  }
+              }
+          }
+          set timeout 1800
+
+          # -device virtio-gpu-pci above: this lane had no display device at
+          # all, so vtgpu0 never attached, vt_allocate() was never called by it,
+          # and the whole virtio-gpu console and takeover path went untested on
+          # the one arch where it is load-bearing. A green arm64 boot proved
+          # nothing about it. `panic:` is matched first so a fault is reported as
+          # a panic instead of as a 30-minute timeout with no cause.
+          expect {
+              -re {panic:[^\r\n]*}       { puts "\nPANIC: $expect_out(0,string)"; exit 1 }
+              -re {login: *$}            { puts "\n==> reached the getty login prompt." }
+              -re {login on console as } { puts "\n==> getty autologin fired." }
+              -re {[#%$] $}              { puts "\n==> reached a shell prompt." }
               timeout                    { puts "\nTIMEOUT before login or shell."; exit 1 }
               eof                        { puts "\nqemu exited before login or shell."; exit 1 }
+          }
+
+          # Do NOT exit here. kextd loads the graphics chain a few seconds AFTER
+          # login, so exiting at the prompt killed qemu before the virtio-gpu
+          # takeover ran -- the job went green having tested none of it (run
+          # 36188459898 ends at "login on console as admin" with no kextd line).
+          #
+          # A fault in that window is the thing this lane exists to catch, so keep
+          # reading. Success is any VT: line naming drmfb: with the sole-backend
+          # deallocate fixed, vt(4) drops to NO backend first, so drmfb arrives as
+          # "initialize with new VT driver" rather than "Replacing driver" -- match
+          # either.
+          #
+          # "Switching back from X to X" is deliberately NOT a failure: vt_deallocate()
+          # still prints it, and the fix is in what vt_replace_backend() then does.
+          set timeout 240
+          expect {
+              -re {panic:[^\r\n]*} { puts "\nPANIC after login: $expect_out(0,string)"; exit 1 }
+              -re {VT: [^\r\n]*drmfb} { puts "\nOK: virtio-gpu handed the console to drmfb: $expect_out(0,string)"; exit 0 }
+              timeout { puts "\nOK: booted to login; no drmfb handover seen in 240s (kext may not have loaded)"; exit 0 }
+              eof     { puts "\nOK: booted to login; qemu exited without a panic"; exit 0 }
           }
           EXP
           expect -f boot.exp
@@ -772,8 +904,19 @@ jobs:
       # hiccup is distinguishable from "this kernel did not boot".
       - name: Gate — kernel reached the login prompt
         run: |
-          # Same three forms as the amd64 gate above -- autologin prints no prompt.
-          if grep -aqE "login: *$|login: root|login on console as " boot.log 2>/dev/null; then
+          # FOUR accepted forms now. The fourth is getty's own issue banner,
+          # "NextBSD/<arch> (<host>) (console)", and it is the deterministic one:
+          # with autologin there is no "login:" prompt, and "login on console as"
+          # is a SYSLOG line, so it only appears if syslogd came up and its output
+          # reached this console. On a self-assembled arm64 image it does not --
+          # run 36187119025 booted perfectly, rendered the banner and reached
+          # `admin@virt-8-2 ~ %`, and this gate still failed with 0 matches.
+          #
+          # The expect block above already accepts a bare shell prompt; the gate
+          # did not, so the two disagreed about what a good boot looks like. getty
+          # prints the banner immediately before login on both arches, so keying on
+          # it makes them agree without depending on userland coming up.
+          if grep -aqE "login: *$|login: root|login on console as |^NextBSD/[a-z0-9]+ \\(.*\\) \\(console\\)" boot.log 2>/dev/null; then
             echo "OK: this arm64 kernel booted to the getty login prompt."
           else
             echo "FAIL: arm64 kernel did not reach the login prompt." >&2
