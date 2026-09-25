@@ -26,42 +26,20 @@ options 	INIT_PATH=/sbin/launchd
 # their auto-load -- see nextbsd #245).
 nodevice 	em
 
-# Drop base virtio_gpu(4) so VirtIOGraphics.kext is the only driver for the
-# device, rather than the second one. (nextbsd-kernel#170)
+# base virtio_gpu(4) is deliberately KEPT (nextbsd-kernel#170).
 #
-# GENERIC gets `device virtio_gpu` from sys/arm64/conf/std.virt, so vtgpu0
-# claims the virtio-gpu and calls vt_allocate() -- on arm64 it becomes the
-# vt(4) console, because neither qemu `virt` nor Virtualization.framework
-# provides an EFI GOP for vt_efifb. The DRM kext then cannot bind without
-# taking the device away from it: bus_generic_driver_added() re-probes only
-# DS_NOTPRESENT children, and releng/15.1 has no DF_REBID, so an attached
-# vtgpu0 is never re-bid. virtio_gpu_drm therefore does an explicit
-# device_detach(), which reaches vtgpu_detach() -> vt_deallocate() and leaves
-# vt(4) with no backend. On qemu the console is live and being written to, so
-# the next write faults -- esr 0x96000047, a level-3 translation fault on a
-# framebuffer address. Removing base removes the detach, and with it the fault.
+# It was removed here for a while, to stop VirtIOGraphics.kext's takeover
+# faulting. That cost more than it bought: on arm64 base virtio_gpu IS the
+# console -- neither qemu `virt` nor Virtualization.framework gives vt_efifb an
+# EFI GOP -- so removing it left the machine with no video at all between the
+# loader and kextd, which means no verbose boot and no single-user console. It
+# also silenced the kext entirely, because the IOKit catalogue only offered the
+# device while an attached vtgpu was there to shadow.
 #
-# This is not a new configuration. Under Apple's Virtualization.framework it is
-# already the effective one: patch 0011 bounds vtgpu's attach-time control-queue
-# wait because VIRTIO_GPU_CMD_GET_DISPLAY_INFO never completes there, so
-# vtgpu_attach() times out after 5s, fails cleanly, and the machine boots with
-# no virtio-gpu console. UTM has run that way since 2026-08-18. This makes qemu
-# match a shape already proven on hardware instead of inventing one.
-#
-# The cost, stated plainly: no console video between the first kernel message
-# and kextd loading VirtIOGraphics. Serial is unaffected, so CI loses nothing
-# and gains coverage -- the arm64 lanes exercise the DRM bind again instead of
-# opting out of it. A display-only arm64 machine sees nothing for that window,
-# and nothing at all if the kext fails to load, because base is no longer there
-# as a fallback. #170 option 3 -- a vt_simplefb-style placeholder arm64 can show
-# from boot and DRM can legitimately evict, as efifb serves on amd64 -- is what
-# closes that window, and this does not substitute for it.
-#
-# amd64 is unaffected: virtio_gpu is declared only in sys/arm64/conf/std.virt,
-# and config(8)'s rmdev_schedule() does nothing when finddev() misses, so the
-# line is a silent no-op there. amd64 gets its console from q35's VGA via efifb
-# and never loads this kext.
-nodevice 	virtio_gpu
+# The fault it was avoiding is fixed at the cause instead, in patch 0058:
+# vt_deallocate() on a sole backend used to leave vt(4) pointing at the backend
+# being torn down with the flush timer re-armed, so the caller's free() raced a
+# flush. It now drops to no backend with the timer stopped.
 
 # Graphics (drm-kmod) base deps. IOGraphics.kext = drm.ko hard-MODULE_DEPENDs on
 # a set of base modules; GENERIC's `options COMPAT_LINUXKPI` already bakes most

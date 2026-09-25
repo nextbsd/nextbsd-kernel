@@ -751,13 +751,21 @@ jobs:
               -drive if=none,id=hd0,format=raw,file=disk.img \
               -device virtio-blk-device,drive=hd0 \
               -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+              -device virtio-gpu-pci \
               -display none -serial stdio
           # Three accepted forms. Matching only "login:" cost 30 minutes a run once
           # the image gained /bin/zsh: autologin then succeeds, getty never prints a
           # prompt, and this sat until `set timeout 1800` expired on a boot that had
           # been fine for minutes. "login on console as" is the normal shape now that
           # root is disabled (nextbsd-overlays f9dcd5b) and autologin-user runs.
+          # -device virtio-gpu-pci above: this lane had no display device at
+          # all, so vtgpu0 never attached, vt_allocate() was never called by it,
+          # and the whole virtio-gpu console and takeover path went untested on
+          # the one arch where it is load-bearing. A green arm64 boot proved
+          # nothing about it. `panic:` is matched first so a fault is reported as
+          # a panic instead of as a 30-minute timeout with no cause.
           expect {
+              -re {panic:[^\r\n]*}       { puts "\nPANIC: $expect_out(0,string)"; exit 1 }
               -re {login: *$}            { puts "\nOK: reached the getty login prompt."; exit 0 }
               -re {login on console as } { puts "\nOK: getty autologin fired."; exit 0 }
               -re {[#%$] $}              { puts "\nOK: reached a shell prompt."; exit 0 }
