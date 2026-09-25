@@ -751,13 +751,29 @@ jobs:
               -drive if=none,id=hd0,format=raw,file=disk.img \
               -device virtio-blk-device,drive=hd0 \
               -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+              -device virtio-gpu-pci \
               -display none -serial stdio
-          # Three accepted forms. Matching only "login:" cost 30 minutes a run once
-          # the image gained /bin/zsh: autologin then succeeds, getty never prints a
-          # prompt, and this sat until `set timeout 1800` expired on a boot that had
-          # been fine for minutes. "login on console as" is the normal shape now that
-          # root is disabled (nextbsd-overlays f9dcd5b) and autologin-user runs.
+          # -device virtio-gpu-pci: this lane had NO display device at all, so
+          # vtgpu0 never attached, vt_allocate() was never called by it, and the
+          # whole virtio-gpu console and KMS path went untested on arm64 -- the
+          # one configuration where it is load-bearing, because neither qemu
+          # `virt` nor Virtualization.framework gives vt_efifb an EFI GOP. A
+          # green arm64 boot proved nothing about it. The -pci form, not
+          # virtio-vga: -pci presents display class "other", which is what a
+          # real arm64 guest sees.
+          #
+          # Three accepted forms for the login gate. Matching only "login:" cost
+          # 30 minutes a run once the image gained /bin/zsh: autologin then
+          # succeeds, getty never prints a prompt, and this sat until `set
+          # timeout 1800` expired on a boot that had been fine for minutes.
+          # "login on console as" is the normal shape now that root is disabled
+          # (nextbsd-overlays f9dcd5b) and autologin-user runs.
+          #
+          # A panic is called out separately: with a GPU present this lane can
+          # now reach vt_deallocate(), and "qemu exited" or a timeout would
+          # otherwise report a panic as a boot failure with no cause.
           expect {
+              -re {panic:[^\r\n]*}       { puts "\nPANIC: $expect_out(0,string)"; exit 1 }
               -re {login: *$}            { puts "\nOK: reached the getty login prompt."; exit 0 }
               -re {login on console as } { puts "\nOK: getty autologin fired."; exit 0 }
               -re {[#%$] $}              { puts "\nOK: reached a shell prompt."; exit 0 }

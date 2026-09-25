@@ -468,44 +468,70 @@ iocat_drmn_bound(device_t vga)
 }
 
 /*
- * True if this virtio transport still has base virtio_gpu(4) (devclass "vtgpu")
- * attached to it.
+ * True if the DRM kext is still wanted on this virtio transport: nothing except
+ * base virtio_gpu(4) has claimed the transport's virtio child.
  *
- * The virtio-gpu case is the mirror image of the vgapci one above, and it needs
- * its own test because the shadowing driver is not a bus — it is a complete,
- * working driver. Base virtio_gpu(4) is compiled into GENERIC, probes long
- * before any kext exists, and becomes the vt(4) console backend; on arm64 it is
- * the ONLY console, because neither qemu `virt` nor Apple Virtualization.framework
- * provides an EFI GOP for vt_efifb. So it cannot simply be removed, and a stock
- * boot legitimately reaches userland with the device already bound and no
- * device_nomatch ever fired for it. Nothing would ask kextd for the DRM bundle.
+ * This is the virtio mirror of iocat_drmn_bound() above, and it asks the same
+ * question that one does -- has the KMS driver bound yet? -- deliberately NOT
+ * "is base virtio_gpu(4) attached". That older phrasing was only ever true
+ * while `device virtio_gpu` was in the kernel config. nextbsd-kernel#249
+ * removed it, the "vtgpu" devclass stopped existing at all, this predicate went
+ * permanently false, and the virtio-gpu was never offered to the catalogue
+ * again -- so kextd was never asked to load VirtIOGraphics and an arm64 guest
+ * booted with no console video and no KMS.
  *
- * An *attached* vtgpu child therefore means "console yes, KMS no, kext wanted".
- * Once VirtIOGraphics has taken the device the child's devclass is
- * virtio_gpu_drm instead, so this returns false and the scan skips it — which is
- * what makes the scan idempotent across repeated runs.
+ * vtpci pre-creates one virtio child per transport, so there are four states:
+ *
+ *	no devclass		created, DS_NOTPRESENT, unclaimed. Base is gone
+ *				(#249) and nothing else took it: kext wanted.
+ *				BUS_DRIVER_ADDED picks the child up when the
+ *				kext lands, so no detach is needed.
+ *	"vtgpu"			base virtio_gpu(4) has it and is the vt(4)
+ *				console. Console yes, KMS no: kext wanted.
+ *	"virtio_gpu_drm"	VirtIOGraphics already has it: nothing to do.
+ *				This is what makes repeated scans idempotent.
+ *	anything else		vtblk, vtnet, vtcon, vtrnd, vtscsi: this
+ *				transport is not a GPU at all. Skipping it is
+ *				what keeps this branch from widening to every
+ *				virtio function on the bus -- the vgapci branch
+ *				gets that from its PCIC_DISPLAY test, and this
+ *				one has no equivalent to lean on.
+ *
+ * The test is the devclass, not device_is_attached(): during
+ * virtio_gpu_drm_attach() the devclass is already virtio_gpu_drm while attached
+ * is still false, and a rescan in that window would re-request a load that is
+ * already under way.
  */
 static bool
-iocat_vtgpu_shadowed(device_t transport)
+iocat_vtgpu_wants_kext(device_t transport)
 {
 	device_t *kids = NULL;
 	int nkids = 0, k;
-	bool shadowed = false;
+	bool wanted = true;
 
 	if (device_get_children(transport, &kids, &nkids) != 0)
 		return (false);
+	if (nkids == 0) {
+		/*
+		 * vtpci always pre-creates its virtio child, so this is not a
+		 * state that arises. Answer no rather than yes: a transport
+		 * with no child cannot be a GPU wanting a driver, and the old
+		 * predicate said no here too.
+		 */
+		free(kids, M_TEMP);
+		return (false);
+	}
 	for (k = 0; k < nkids; k++) {
 		devclass_t dc = device_get_devclass(kids[k]);
 		const char *n = dc != NULL ? devclass_get_name(dc) : NULL;
 
-		if (n != NULL && strcmp(n, "vtgpu") == 0 &&
-		    device_is_attached(kids[k])) {
-			shadowed = true;
-			break;
-		}
+		if (n == NULL || strcmp(n, "vtgpu") == 0)
+			continue;	/* unclaimed, or base has it */
+		wanted = false;		/* KMS bound, or not a gpu */
+		break;
 	}
 	free(kids, M_TEMP);
-	return (shadowed);
+	return (wanted);
 }
 
 static void
@@ -548,14 +574,29 @@ iocat_rematch_present(void)
 			 * then attaches drmn automatically — no manual reprobe
 			 * (that would race the built-in attach). (#64)
 			 *
-			 * virtio_pci: base virtio_gpu(4) has the device and is
-			 * the vt(4) console (the only one arm64 has — no EFI GOP
-			 * under qemu `virt` or Virtualization.framework). It is a
-			 * real driver, so device_nomatch never fires and nothing
-			 * else would ever ask for the DRM bundle. Request it;
-			 * VirtIOGraphics does its own atomic detach/re-probe on
-			 * load, because unlike the vgapci case there is no
-			 * DS_NOTPRESENT child for BUS_DRIVER_ADDED to pick up.
+			 * virtio_pci: two shapes, and the test covers both.
+			 *
+			 * With base virtio_gpu(4) in the kernel it owns the
+			 * device and is the vt(4) console (the only one arm64
+			 * has — no EFI GOP under qemu `virt` or
+			 * Virtualization.framework). It is a real driver, so
+			 * device_nomatch never fires and nothing else would ever
+			 * ask for the DRM bundle.
+			 *
+			 * With `nodevice virtio_gpu` (nextbsd-kernel#249) the
+			 * transport's virtio child is created and left
+			 * DS_NOTPRESENT, so device_nomatch does not fire for it
+			 * either: the handler keys on a parent named "pci"
+			 * (iocat_device_nomatch below), and this child's parent
+			 * is virtio_pciN. Nothing asks for the bundle in that
+			 * shape either, which is the bug this branch exists to
+			 * close.
+			 *
+			 * The kext copes with both. virtio_gpu_drm_takeover()
+			 * opens with devclass_find("vtgpu") and returns at once
+			 * when base is absent, so there is no detach and the
+			 * ordinary BUS_DRIVER_ADDED path attaches it to the
+			 * DS_NOTPRESENT child.
 			 */
 			if (device_get_driver(child) != NULL) {
 				devclass_t dc = device_get_devclass(child);
@@ -570,9 +611,9 @@ iocat_rematch_present(void)
 						continue; /* DRM already bound */
 					/* vgapci-shadowed GPU — fall through. */
 				} else if (strcmp(dn, "virtio_pci") == 0) {
-					if (!iocat_vtgpu_shadowed(child))
-						continue; /* not a shadowed gpu */
-					/* base-shadowed virtio-gpu — fall through. */
+					if (!iocat_vtgpu_wants_kext(child))
+						continue; /* KMS bound, or not a gpu */
+					/* unclaimed or base-shadowed — fall through. */
 				} else
 					continue;	/* real owner — skip */
 			}
