@@ -557,12 +557,36 @@ jobs:
           # arm64 graphics kexts laid in alongside its own. Harmless there
           # (wrong-arch .ko files simply never load) but wrong, and actively
           # wrong once both arches assemble. Drop the other arch's suffixed
-          # assets after download; unsuffixed ones are left alone rather than
-          # guessed at.
+          # assets after download.
+          #
+          # And on arm64 drop the UNSUFFIXED ones too. They are amd64 -- the
+          # legacy graphics-kexts.tar.gz, intelwifi-kext, nvidia-kexts -- and
+          # `ls` orders "graphics-kexts.tar.gz" AFTER "graphics-kexts-arm64.tar.gz"
+          # ('-' 0x2d sorts before '.' 0x2e), so the amd64 bundle was extracted
+          # last and laid x86-64 objects over arm64's own. kldload then reported
+          #
+          #   linker_load_file: /System/Library/Extensions/DMABuf.kext/Contents/\
+          #       MacOS/DMABuf - unsupported file type
+          #
+          # and the whole graphics chain never loaded, so nothing on arm64 could
+          # ever exercise VirtIOGraphics. This is the same defect
+          # nextbsd-userland fixed in 64422f0 ("arm64 has never run its own
+          # kexts"); this repo kept the half of it that only drops the other
+          # arch's SUFFIXED assets. Keeping the unsuffixed ones on amd64 is
+          # correct -- there they are that arch's assets.
           gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
             --pattern '*kext*.tar.gz' --dir art --clobber || true
           _other=amd64; [ "${{ matrix.target }}" = amd64 ] && _other=arm64
           rm -f art/*-"$_other".tar.gz
+          if [ "${{ matrix.target }}" != amd64 ]; then
+            for _k in art/*kext*.tar.gz; do
+              [ -e "$_k" ] || continue
+              case "$_k" in
+                *-"${{ matrix.target }}".tar.gz) ;;
+                *) echo "dropping non-arm64 kext asset $_k"; rm -f "$_k" ;;
+              esac
+            done
+          fi
           export BASE_TGZ="$PWD/art/nextbsd-base-${{ matrix.target }}.tar.gz"
           export USERLAND_TGZ="$PWD/art/nextbsd-userland-${{ matrix.target }}.tar.gz"
           export CONTRIB_TGZ="$PWD/art/nextbsd-contrib-${{ matrix.target }}.tar.gz"
@@ -669,7 +693,7 @@ jobs:
           # Matching only the prompt made this gate fail *because* the image was
           # fixed: once /bin/zsh existed, autologin succeeded, the serial ended at
           # the admin zsh prompt, and no "login:" line was ever emitted.
-          if grep -aqE "login: *$|login: root|login on console as " tests/boot.log 2>/dev/null; then
+          if grep -aqE "login: *$|login: root|login on console as |^NextBSD/[a-z0-9]+ \\(.*\\) \\(console\\)" tests/boot.log 2>/dev/null; then
             echo "OK: this kernel booted to the getty login prompt."
             echo "--- on-image markers (informational; SYSLOG-RUN etc. flaky, #369) ---"
             grep -aoE "[A-Z0-9-]+-(OK|FAIL|SKIP)" tests/boot.log | sort | uniq -c || true
@@ -859,8 +883,19 @@ jobs:
       # hiccup is distinguishable from "this kernel did not boot".
       - name: Gate — kernel reached the login prompt
         run: |
-          # Same three forms as the amd64 gate above -- autologin prints no prompt.
-          if grep -aqE "login: *$|login: root|login on console as " boot.log 2>/dev/null; then
+          # FOUR accepted forms now. The fourth is getty's own issue banner,
+          # "NextBSD/<arch> (<host>) (console)", and it is the deterministic one:
+          # with autologin there is no "login:" prompt, and "login on console as"
+          # is a SYSLOG line, so it only appears if syslogd came up and its output
+          # reached this console. On a self-assembled arm64 image it does not --
+          # run 36187119025 booted perfectly, rendered the banner and reached
+          # `admin@virt-8-2 ~ %`, and this gate still failed with 0 matches.
+          #
+          # The expect block above already accepts a bare shell prompt; the gate
+          # did not, so the two disagreed about what a good boot looks like. getty
+          # prints the banner immediately before login on both arches, so keying on
+          # it makes them agree without depending on userland coming up.
+          if grep -aqE "login: *$|login: root|login on console as |^NextBSD/[a-z0-9]+ \\(.*\\) \\(console\\)" boot.log 2>/dev/null; then
             echo "OK: this arm64 kernel booted to the getty login prompt."
           else
             echo "FAIL: arm64 kernel did not reach the login prompt." >&2
