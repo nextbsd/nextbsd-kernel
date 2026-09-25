@@ -869,11 +869,32 @@ jobs:
           # a panic instead of as a 30-minute timeout with no cause.
           expect {
               -re {panic:[^\r\n]*}       { puts "\nPANIC: $expect_out(0,string)"; exit 1 }
-              -re {login: *$}            { puts "\nOK: reached the getty login prompt."; exit 0 }
-              -re {login on console as } { puts "\nOK: getty autologin fired."; exit 0 }
-              -re {[#%$] $}              { puts "\nOK: reached a shell prompt."; exit 0 }
+              -re {login: *$}            { puts "\n==> reached the getty login prompt." }
+              -re {login on console as } { puts "\n==> getty autologin fired." }
+              -re {[#%$] $}              { puts "\n==> reached a shell prompt." }
               timeout                    { puts "\nTIMEOUT before login or shell."; exit 1 }
               eof                        { puts "\nqemu exited before login or shell."; exit 1 }
+          }
+
+          # Do NOT exit here. kextd loads the graphics chain a few seconds AFTER
+          # login, so exiting at the prompt killed qemu before the virtio-gpu
+          # takeover ran -- the job went green having tested none of it (run
+          # 36188459898 ends at "login on console as admin" with no kextd line).
+          #
+          # A fault in that window is the thing this lane exists to catch, so keep
+          # reading. Success is any VT: line naming drmfb: with the sole-backend
+          # deallocate fixed, vt(4) drops to NO backend first, so drmfb arrives as
+          # "initialize with new VT driver" rather than "Replacing driver" -- match
+          # either.
+          #
+          # "Switching back from X to X" is deliberately NOT a failure: vt_deallocate()
+          # still prints it, and the fix is in what vt_replace_backend() then does.
+          set timeout 240
+          expect {
+              -re {panic:[^\r\n]*} { puts "\nPANIC after login: $expect_out(0,string)"; exit 1 }
+              -re {VT: [^\r\n]*drmfb} { puts "\nOK: virtio-gpu handed the console to drmfb: $expect_out(0,string)"; exit 0 }
+              timeout { puts "\nOK: booted to login; no drmfb handover seen in 240s (kext may not have loaded)"; exit 0 }
+              eof     { puts "\nOK: booted to login; qemu exited without a panic"; exit 0 }
           }
           EXP
           expect -f boot.exp
