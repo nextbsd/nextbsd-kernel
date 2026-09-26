@@ -777,90 +777,44 @@ jobs:
               -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
               -device virtio-gpu-pci \
               -display none -serial stdio
-          # Three accepted forms. Matching only "login:" cost 30 minutes a run once
-          # the image gained /bin/zsh: autologin then succeeds, getty never prints a
-          # prompt, and this sat until `set timeout 1800` expired on a boot that had
-          # been fine for minutes. "login on console as" is the normal shape now that
-          # root is disabled (nextbsd-overlays f9dcd5b) and autologin-user runs.
-          # The shipped image mutes the kernel console: nextbsd-overlays'
-          # /boot/loader.conf.d/nextbsd.conf sets boot_mutemsgs="YES" so a normal
-          # boot has a clean login screen. Nothing then reaches -serial stdio, and
-          # this lane sat until `set timeout 1800` expired on boots that were
-          # fine -- for weeks. The amd64 job never hit it because it delegates to
-          # nextbsd/tests/boot-test.sh, which does this loader dance; this lane
-          # has its own inline expect and never learned it.
-          #
-          # Under AAVMF with -display none the loader's default `efi` console
-          # routes to serial, so we can interrupt autoboot and set the vars.
-          # send -s paces input a char at a time: this emulated UART drops
-          # characters when fed a line at full speed, and the loader then reads
-          # e.g. `bot` and answers "unknown command". Required by send -s below --
-          # without it expect dies with "send_slow has no value".
-          set send_slow {1 .04}
+          # The loader handshake is nextbsd's tests/loader.exp.inc, fetched below
+          # rather than reimplemented here. It hardened over several flaky runs:
+          # input paced at ~25 cps, each command syncing on the loader's next
+          # "OK " rather than on the echo of what we typed (the emulated UART
+          # drops characters in BOTH directions), and a garbled final `boot`
+          # resent because it never self-recovers. This lane had its own copy,
+          # which is how it ended up without boot_multicons and without verbose.
+          source loader.exp.inc
 
-          proc loader_set {cmd} {
-              global timeout
-              set saved $timeout
-              set timeout 20
-              sleep 0.3
-              # Drain the settled prior prompt, THEN send, THEN sync on the fresh
-              # OK. Deliberately not matching the command echo: this emulated UART
-              # drops a char from the ECHO often enough that an exact-echo match
-              # hangs on a cosmetic glitch while the loader took the command fine.
-              expect *
-              send -s -- "$cmd\r"
-              expect {
-                  timeout { puts "\nFAIL: no OK prompt after '$cmd'"; exit 1 }
-                  "OK "
-              }
-              set timeout $saved
-          }
-
-          expect {
-              timeout { puts "\nFAIL: no loader autoboot prompt within 60s"; exit 1 }
-              -re "Hit \\\[Enter\\\]"     { send " " }
-              "Booting"                  { send " " }
-              -re "FreeBSD/\[a-z0-9\]+ EFI" { send " " }
-          }
-          expect {
-              timeout { puts "\nFAIL: no loader OK prompt within 30s"; exit 1 }
-              "OK " { puts "\n==> at loader prompt; enabling the serial console" }
-          }
+          loader_prompt 60
+          # The shipped image sets boot_mutemsgs="YES" for a clean login screen,
+          # which silences the kernel console entirely -- nothing reaches
+          # -serial stdio and this lane sat until the 1800s timeout. =NO rather
+          # than unset: the loader's howto builder tests
+          # `val != NULL && strcasecmp(val, "no") != 0`.
           loader_set "set console=comconsole"
           loader_set "set boot_serial=YES"
           loader_set "set comconsole_speed=115200"
-          # =NO, not unset: the loader's howto builder tests
-          # `val != NULL && strcasecmp(val, "no") != 0`, so =NO clears RB_MUTEMSGS
-          # while leaving the variable set.
+          loader_set "set boot_multicons=YES"
           loader_set "set boot_mutemsgs=NO"
 
-          # NOT loader_set: that syncs on a fresh "OK " prompt, and a successful
-          # boot LEAVES the prompt, so it would time out on success. Sync on the
-          # kernel starting instead, and resend if the UART garbled the command --
-          # a mangled `boot` gets "unknown command" and sits at OK forever.
-          set timeout 20
-          for {set try 1} {$try <= 5} {incr try} {
-              sleep 0.3
-              expect *
-              send -s -- "boot\r"
-              expect {
-                  "unknown command" {
-                      puts "\n==> loader garbled 'boot' (try $try/5); resending"
-                      continue
-                  }
-                  -re "Booting|/boot/kernel/kernel|Loading kernel|---<<" { break }
-                  "OK " {
-                      puts "\n==> still at OK after 'boot' (try $try/5); resending"
-                      continue
-                  }
-                  timeout {
-                      puts "\n==> no response to 'boot' (try $try/5); resending"
-                      continue
-                  }
-              }
-          }
-          set timeout 1800
+          # boot -v. Un-muting alone is not enough: the IOKit catalogue's
+          # present-scan prints
+          #   iokit: present-scan: <dev> (0x<id>) present + unmatched -> request load <bundle>
+          # ONLY under bootverbose. Without it a failing run shows that a kext did
+          # not load but not whether anything ever ASKED for it -- the exact
+          # distinction that cost a day on #170/#249, where the kext was on disk,
+          # kextd was running and had registered the personality, and the
+          # catalogue simply never offered the device.
+          loader_boot "boot -v"
 
+
+          # Three accepted forms below. Matching only "login:" cost 30 minutes a
+          # run once the image gained /bin/zsh: autologin then succeeds, getty
+          # never prints a prompt, and this sat until the timeout on a boot that
+          # had been fine for minutes. "login on console as" is the normal shape
+          # now that root is disabled (nextbsd-overlays f9dcd5b).
+          #
           # -device virtio-gpu-pci above: this lane had no display device at
           # all, so vtgpu0 never attached, vt_allocate() was never called by it,
           # and the whole virtio-gpu console and takeover path went untested on
@@ -897,6 +851,8 @@ jobs:
               eof     { puts "\nOK: booted to login; qemu exited without a panic"; exit 0 }
           }
           EXP
+          curl -fsSL https://raw.githubusercontent.com/nextbsd-redux/nextbsd/main/tests/loader.exp.inc \
+            -o loader.exp.inc
           expect -f boot.exp
 
       # Gate on the same signal the amd64 job uses: the getty "login:" line in
