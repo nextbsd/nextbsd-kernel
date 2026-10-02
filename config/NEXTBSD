@@ -1,0 +1,255 @@
+include GENERIC
+
+ident	NEXTBSD
+
+# NextBSD kernel configuration.
+# Starts as stock GENERIC; add Mach/launchd-related options and devices below
+# as patches in ../patches/ introduce them.
+
+# Bake the root device and init path into the kernel so loader.conf doesn't
+# have to set vfs.root.mountfrom / init_path (#180, eliminating loader.conf).
+# Both are stock config options (sys/conf/options); the loader tunables still
+# override these when present, so they are a safe compiled-in default.
+#   ROOTDEVNAME -> a C string used by vfs_mountroot (quoted).
+#   INIT_PATH   -> stringified via __XSTRING in init_main.c (unquoted).
+options 	ROOTDEVNAME=\"ufs:/dev/ufs/ROOTFS\"
+options 	INIT_PATH=/sbin/launchd
+
+# D1 (#219): drop the built-in Intel GbE driver so it auto-loads as a kext.
+# GENERIC's `device em` compiles the e1000 driver (if_em.c registers BOTH the
+# `em` and `igb` drivers — the whole Intel PRO/1000 GbE family) into the kernel.
+# Removing it makes the e1000 hit device_nomatch at attach, so the in-kernel
+# IOKit matcher (#211) -> kextd auto-loads IntelEthernet.kext (if_em, shipped by
+# nextbsd-kernel-extensions) to bind it. iflib + miibus (if_em's load-time deps)
+# stay built in. NIC only -- not boot-critical (root is ahci/virtio). First
+# driver->kext conversion; ix/ixl/ice/igc stay built in (no qemu device to prove
+# their auto-load -- see nextbsd #245).
+nodevice 	em
+
+# base virtio_gpu(4) is deliberately KEPT (nextbsd-kernel#170).
+#
+# It was removed here for a while, to stop VirtIOGraphics.kext's takeover
+# faulting. That cost more than it bought: on arm64 base virtio_gpu IS the
+# console -- neither qemu `virt` nor Virtualization.framework gives vt_efifb an
+# EFI GOP -- so removing it left the machine with no video at all between the
+# loader and kextd, which means no verbose boot and no single-user console. It
+# also silenced the kext entirely, because the IOKit catalogue only offered the
+# device while an attached vtgpu was there to shadow.
+#
+# The fault it was avoiding is fixed at the cause instead, in patch 0058:
+# vt_deallocate() on a sole backend used to leave vt(4) pointing at the backend
+# being torn down with the flush timer re-armed, so the caller's free() raced a
+# flush. It now drops to no backend with the timer stopped.
+
+# Graphics (drm-kmod) base deps. IOGraphics.kext = drm.ko hard-MODULE_DEPENDs on
+# a set of base modules; GENERIC's `options COMPAT_LINUXKPI` already bakes most
+# (iicbus, iicbb, backlight, linuxkpi) but NOT these two:
+#   iic        -- `optional iic` only; the /dev/iic char layer drm uses for DDC.
+#   lindebugfs -- `optional lindebugfs`; drm's debugfs interface. Functionally
+#                 optional, but the MODULE_DEPEND is HARD so drm.ko won't load
+#                 without the module present.
+# NextBSD ships no /boot/kernel .ko tree (kernel-only; everything else is a
+# kext), so unbaked module deps can't be resolved at load time -- drm.ko fails
+# with "depends on iic - not available". Baking them here satisfies the linker.
+# drm's third missing dep, linuxkpi_video, has no config option and is wired in
+# via src-overlay/conf/files.linuxkpi_video (build.yml). (graphics autoload, #64)
+device		iic
+options 	LINDEBUGFS
+
+# Live-media root (nextbsd #70 + the live-root overlay design). The live ISO
+# boots a compressed, read-only root and a writable tmpfs+unionfs overlay is
+# stacked over it (by a vfs_mountroot hook, gated on a vfs.root.overlay kenv the
+# live image declares); the installed system stays plain rw-UFS and never
+# unions, decided at boot by the root provider being writable + the absence of
+# that kenv. GENERIC already bakes everything else this needs (FFS, CD9660,
+# MD_ROOT, TMPFS, GEOM_LABEL, ZSTDIO, md); these are the gap, and since NextBSD
+# ships no .ko tree they must be compiled in:
+#   GEOM_UZIP -- compressed read-only block image; block-level random-access
+#                decompression (snappier scattered reads on a desktop root).
+#                Leading candidate. zlib/LZMA/zstd codecs come with it.
+#   TARFS     -- read-only tar filesystem; whole-stream zstd gives a better
+#                ratio. Baked alongside uzip so the ISO build can produce both
+#                and we pick the winner on real image-size vs boot/launch
+#                latency. (ZSTDIO, already in GENERIC, covers zstd for both.)
+#   UNIONFS   -- merges the read-only lower with a writable tmpfs upper so the
+#                live / appears read-write.
+#   NULLFS    -- not needed for the core overlay (unionfs does the copy-up), but
+#                kept as cheap insurance for the deferred install/persistence
+#                plumbing: bind the pristine uzip lower for a cpdup clone, or
+#                bind a writable partition into the union for a "live USB with
+#                save". nullfs is a pass-through mirror (no copy-up of its own).
+options 	GEOM_UZIP
+options 	TARFS
+options 	UNIONFS
+options 	NULLFS
+
+# FUSE (nextbsd-kernel#60). Stock option -- fs/fuse/*.c is gated `optional fusefs'
+# in sys/conf/files -- so this needs no overlay, just the option. Compiling it in
+# rather than shipping fusefs.ko sidesteps #52 entirely: there is no .ko for
+# assemble-image.sh:168 to delete, and no kld tooling is needed to load it.
+options 	FUSEFS
+
+# fdescfs -- /dev/fd/N for N > 2 (nextbsd-kernel#60). devfs alone only supplies
+# /dev/fd/{0,1,2}; arbitrary descriptors need fdescfs, which upstream ships as a
+# module and GENERIC does not compile in -- the same module-only trap as FUSEFS
+# and the Linuxulator, and unreachable here because NextBSD has no .ko tree.
+#
+# Needed because Bun (claude-code 2.x is a Bun binary) resolves its working
+# directory by open(cwd, O_PATH) followed by readlink("/dev/fd/N"). Traced:
+#
+#   linux_openat(AT_FDCWD,"/root",O_RDONLY|O_LARGEFILE|O_PATH) -> 14
+#   linux_readlink("/dev/fd/14")            -> -1 errno -2 ENOENT
+#   linux_write(9, ..., 0x49)               -> 73 bytes, the error text
+#   linux_exit_group(1)
+#
+# which surfaces as: Can't access working directory /root: Path does not exist.
+# MI (sys/conf/options:267, sys/conf/files:3600), so safe on both matrix legs --
+# unlike LINPROCFS/LINSYSFS, which are declared only in options.amd64.
+#
+# Mounting is separate and still required:
+#   mount -t fdescfs -o linrdlnk fdesc /compat/linux/dev/fd
+# The linrdlnk option gives Linux-style readlink semantics; rc.d/linux uses it.
+options 	FDESCFS
+
+# 64-bit Linux ABI + linprocfs/linsysfs (nextbsd-kernel#60). Upstream ships these
+# only as modules and there has never been a static path for the 64-bit ABI, so
+# the `optional compat_linux' entries these select are supplied by
+# src-overlay/conf/files.compat_linux and the declarations by
+# src-overlay/conf/options.compat_linux (wired in build.yml). NextBSD has no
+# /boot/kernel .ko tree and no kldload, so compiling in is the only route.
+# Both matrix legs now. files.compat_linux is amd64 (amd64/linux/* plus the
+# three x86/linux/* files); files.compat_linux.arm64 is arm64 (arm64/linux/*,
+# no x86 files, aarch64 VDSO flags -mgeneral-regs-only/-ffixed-x18). Two
+# fragments rather than one because config(8) reads a single files.<arch> per
+# target and has no equivalent of the Makefiles' .if MACHINE_CPUARCH guard.
+# LINPROCFS/LINSYSFS also differ: options.amd64 declares both, options.arm64
+# declares neither, so arm64 additionally gets options.compat_linux.arm64
+# appended to sys/conf/options.arm64 -- per-arch, never MI, or amd64 would see
+# a duplicate. On arm64 this reaches NEXTBSD-RPI5 too, which includes NEXTBSD.
+# Revert path when the kext-conversion project lands: drop the workflow wiring
+# and delete the two overlay fragments.
+#
+# COMPAT_LINUX / LINPROCFS / LINSYSFS are NOT named here on purpose. They are
+# appended to the copied config by the workflow's "Wire in the static
+# Linuxulator" step, on both legs -- the same pattern COMPAT_MACH uses,
+# and for the same reason: nextbsd-kernel-extensions reuses THIS file to build a
+# KBI-matched kernel and lays in none of src-overlay/, so any option declared
+# only by the overlay makes its config(8) die with `unknown option'. That is
+# exactly what happened when these three landed here (modules red on both legs
+# from 2026-08-03; nextbsd-kernel itself stayed green because it does apply the
+# overlay). Keep this file to options that stock FreeBSD declares.
+
+# POSIX message queues -- a hard link-time dependency of the Linuxulator, not a
+# nicety. compat/linux/linux_misc.c:2989-3076 calls kern_kmq_open/sys_kmq_unlink/
+# kern_kmq_timedsend/kern_kmq_timedreceive/kern_kmq_notify/kern_kmq_setattr
+# unconditionally, and kern/uipc_mqueue.c is `optional p1003_1b_mqueue' which
+# GENERIC does not set (it ships as mqueuefs.ko -- the same module-only trap as
+# the ABI itself, one layer down). Without this the static kernel fails to link
+# with six undefined symbols. Declared in the MI sys/conf/options, and
+# uipc_mqueue.c is MI too, so this is safe on both matrix legs.
+options 	P1003_1B_MQUEUE
+
+# 802.11 WPA authenticator (#51). GENERIC brings `device wlan` plus the crypto
+# set (wep/tkip/ccmp/gcmp/amrr) but deliberately NOT wlan_xauth: on stock FreeBSD
+# net80211 autoloads it as a .ko the first time a WPA network is touched. That
+# recovery path does not exist here (assemble-image.sh:168 rm's /boot/kernel/*.ko),
+# so the module is simply absent and the autoload silently fails:
+#   wpa_supplicant sets authmode IEEE80211_AUTH_WPA
+#     -> ieee80211_ioctl.c  ieee80211_authenticator_get()
+#     -> ieee80211_proto.c:446  auth_modnames[IEEE80211_AUTH_WPA] = "wlan_xauth"
+#     -> ieee80211_load_module("wlan_xauth") -> kldload -> no such module
+#     -> returns NULL -> ioctl(SIOCS80211) returns EINVAL, always.
+# Result: EVERY WPA/WPA2/WPA3 association fails; open networks work. Same class of
+# bug as the drm iic/lindebugfs and HID hms/hmt deps above -- an unbaked module
+# dep that can't be resolved at load time because there is no .ko tree.
+# Purely additive; cannot regress the wired path. (nextbsd-kernel#51)
+device		wlan_xauth
+
+# HID input drivers (#335; see the input/touch driver spike). GENERIC compiles
+# in only the HID transport (hid, hidbus, usbhid) and the keyboard leaves (hkbd,
+# ukbd) -- the mouse/touch/pen leaves ship as loadable .ko modules that devd
+# auto-loads on stock FreeBSD. NextBSD ships NO .ko tree, so those leaves are
+# simply absent (config -x confirmed no hms/ums/hmt on the running kernel): a
+# USB mouse enumerates (usbhid0 -> hidbus0) with nothing to bind it, no
+# /dev/input node, no pointer. They must be compiled in here.
+
+# Mouse -- the reported bug (#335). hms is the hidbus mouse leaf (peer of hkbd):
+# relative mice AND absolute pointers (VM "tablet": QEMU usb-tablet, VirtualBox,
+# bhyve). Supersedes legacy ums (relative-only; won't attach while usbhid owns
+# the device). Built on the hidmap usage->evdev mapper.
+device		hms
+
+# Touch / touchpad / pen. hmt = multitouch touchpads AND touchscreens; hpen =
+# pens + single-touch digitizers; hconf drives the digitizer config TLC (puts a
+# Precision Touchpad into MT mode -- hmt hard-MODULE_DEPENDs on it). hidmap is
+# the 1:1 usage->evdev mapper hms/hpen are built on.
+device		hidmap
+device		hmt
+device		hpen
+device		hconf
+
+# I2C-HID transport for laptop precision touchpads/touchscreens: acpi -> ig4
+# (Intel/AMD LPSS I2C controller) -> iicbus -> iichid -> hidbus -> hmt/hms/hconf.
+# iichid matches ACPI _HID PNP0C50/ACPI0C50/ELAN0000; ietp catches Elan pads
+# that bind there instead of hmt. IICHID_SAMPLING is MANDATORY on amd64: the
+# touchpad IRQ is a GPIO line the kernel can't hand out, so iichid falls back to
+# polling -- without this option an IRQ-less I2C HID device fails to attach.
+device		iicbus
+device		ig4
+device		iichid
+device		ietp
+options 	IICHID_SAMPLING
+
+# USB audio. Same unbaked-module-dep class as hms/hmt, wlan_xauth and drm's
+# iic/lindebugfs above -- the core is baked, the leaf that binds the actual
+# hardware is not:
+#   amd64 GENERIC:340 and arm64 std.dev:107 both bake `device sound` (the pcm
+#   core, /dev/dsp, feeder chain, midi) plus the PCI leaves (snd_hda, snd_ich,
+#   ...) on amd64. Neither bakes snd_uaudio -- on stock FreeBSD it ships as
+#   sys/modules/sound/driver/uaudio and devd kldloads it on USB attach.
+# NextBSD ships no /boot/kernel .ko tree (ci/assemble-image.sh:168 rm's them),
+# so that autoload can never resolve: a USB headset/DAC/mic enumerates on uhub
+# with no driver to claim it, no /dev/dsp node, no sound. Built-in HDA audio is
+# unaffected -- this is USB-only.
+#
+# DRIVER_MODULE_ORDERED(snd_uaudio, uhub, ...) so the attach path is
+# usb -> uhub -> uaudio -> ua_pcm (uaudio_pcm.c) -> pcm. All three of its hard
+# MODULE_DEPENDs (usb, sound, hid) are already compiled in on both arches, so
+# this is purely additive and cannot regress the PCI audio path. snd_uaudio is
+# a stock config token (sys/conf/files:3192, sys/conf/NOTES:2137), valid on
+# amd64 and arm64 alike -- one line covers the shared config for both.
+device		snd_uaudio
+
+# PCI HDA audio. The companion to snd_uaudio above, and the same unbaked-leaf
+# problem one bus over: arm64's std.dev:107 bakes `device sound` -- the pcm
+# core, the feeder chain, /dev/sndstat -- but unlike amd64 GENERIC it bakes
+# none of the PCI leaves that bind actual controllers. snd_hda is the one that
+# matters here, because it is what every hypervisor emits by default.
+#
+# Measured on virt-10-0 (arm64, UTM/qemu, 20260819-200048) before this change:
+#
+#   none0@pci0:0:3:0:  vendor=0x8086 device=0x2668
+#       'Intel 82801FB/FBM/FR/FW/FRW (ICH6 Family) HD Audio Controller'
+#   pci0: <multimedia, HDA> at device 3.0 (no driver attached)
+#   # cat /dev/sndstat
+#   No devices installed.
+#
+# UTM emits ich6-intel-hda for every guest regardless of arch -- an arm64 VM
+# gets the same emulated Intel controller a Linux x86 guest does -- so this is
+# the default-configuration path, not an exotic one. The hw.snd.* sysctl tree
+# is already fully populated on that box; the framework is present and idle,
+# waiting for a leaf driver that was never compiled in.
+#
+# kldload is not an escape hatch: ci/assemble-image.sh:168 rm's the .ko tree,
+# so /boot/kernel on a shipped image holds exactly one file (`kernel`) and the
+# userland has no kldstat at all. Anything that must attach has to be static.
+#
+# snd_hda is declared in the MI sys/conf/files (dev/sound/pci/hda/*.c, optional
+# snd_hda pci), not files.amd64, so the token is valid on arm64 and the driver
+# builds there. Its MODULE_DEPENDs are sound and pci, both already compiled in
+# on both arches -- purely additive, and it cannot regress the USB path above.
+#
+# Not virtio-sound: FreeBSD base ships no virtio_snd driver, and qemu does not
+# put a virtio-sound device on the bus here anyway (net, gpu, block, console
+# and rng are the only virtio functions present). HDA is the supported path.
+device		snd_hda

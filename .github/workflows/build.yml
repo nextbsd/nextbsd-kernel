@@ -1,0 +1,1018 @@
+name: Build NextBSD Kernel
+on:
+  repository_dispatch:
+    types: [toolchain-updated]
+  push:
+    paths: ['patches/**', 'config/**', 'src-overlay/**', 'ci/**', '.github/workflows/build.yml']
+  pull_request:
+    # Validate the kernel build on PRs touching patches/config/workflow. PR
+    # runs never cascade — the module-build trigger is gated on
+    # github.event_name == 'repository_dispatch', which a pull_request is not.
+    paths: ['patches/**', 'config/**', 'src-overlay/**', 'ci/**', '.github/workflows/build.yml']
+  workflow_dispatch:
+
+env:
+  FREEBSD_BRANCH: releng/15.1
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: amd64
+            target_arch: amd64
+          - target: arm64
+            target_arch: aarch64
+    container:
+      # Per-arch toolchain image. repository_dispatch carries fbsd_sha (the
+      # pinned source commit) -> :<arch>-fbsd-<sha>; a patch-only push or manual
+      # run has no sha and falls back to :<arch>-latest. Both arches cross-build
+      # on the x86_64 runner (clang cross-compiles; no emulation).
+      image: ghcr.io/nextbsd/nextbsd-kernel-toolchain:${{ matrix.target }}-${{ github.event.client_payload.fbsd_sha && format('fbsd-{0}', github.event.client_payload.fbsd_sha) || 'latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply patches
+        run: |
+          cd /usr/src
+          for p in $(cat "$GITHUB_WORKSPACE/patches/series"); do
+            echo "Applying $p"
+            git apply "$GITHUB_WORKSPACE/patches/$p"
+          done
+
+      - name: Rebrand kernel identity (NextBSD)
+        # Done with sed keyed on the stable variable NAMES, NOT a git-apply
+        # patch: a regex per line is immune to version-string bumps
+        # (15.0->15.1, p10->p11) and surrounding-code restructuring, whereas
+        # git apply needs matching context and broke on the p9->p10 bump.
+        #
+        # IMPORTANT: REVISION is left STOCK. The build derives the compiler
+        # target triple (x86_64-unknown-freebsd${OS_REVISION}) from REVISION,
+        # and that sets __FreeBSD__. A timestamp in REVISION poisons __FreeBSD__
+        # kernel-wide (e.g. smartpqi assigns it to a u_char -> -Werror). So the
+        # timestamp goes in RELEASE only (= osrelease / uname -r); REVISION
+        # stays 15.0 so __FreeBSD__ stays 15. Each sed line is self-contained
+        # because the version-extraction machinery evaluates these lines in
+        # isolation. date -u +FMT and date -u are GNU+BSD portable.
+        run: |
+          cd /usr/src
+          nv=sys/conf/newvers.sh
+          # Also reformat the version banner (VERINFO/VERSTR, both metadata
+          # branches) to a clean NextBSD string and drop the FreeBSD bits that
+          # don't fit out-of-tree: the #N build counter and the
+          # <hash>[-dirty] VCS tag (the tree is always "dirty" -- it's
+          # releng/15.1 + the NextBSD patch stack). Result (uname -v):
+          #   NextBSD Kernel Version <RELEASE>; <date>; <user>@<host>:<objdir>
+          # RELEASE (the build timestamp) leads, so nextbsd-version -k can still
+          # find it. Replaced lines are tab-indented inside an if/else; both
+          # branches get the same value, which is fine.
+          sed -i \
+            -e 's~^TYPE=.*~TYPE="NextBSD"~' \
+            -e 's~^RELEASE=.*~RELEASE=$(date -u +%Y%m%d-%H%M%S)~' \
+            -e 's~t=$(date)$~t=$(date -u)~' \
+            -e 's~^[[:space:]]*VERINFO=".*~VERINFO="${TYPE} Kernel Version ${RELEASE}; ${t}; ${u}@${h}:${d}"~' \
+            -e 's~^[[:space:]]*VERSTR=".*~VERSTR="${VERINFO}\\\\n"~' \
+            "$nv"
+          echo "=== newvers.sh identity after rebrand ==="
+          grep -nE '^TYPE=|^RELEASE=|t=\$\(date|VERINFO=|VERSTR=' "$nv" || true
+
+      # A syscalls.master patch changes the GENERATED syscall tables
+      # (init_sysent.c, sys/sys/syscall.h, sysproto.h, syscalls.c, ...).
+      # buildkernel compiles the committed generated files and does NOT
+      # regenerate them, so run the `sysent` target in the build env (where
+      # flua from the baked kernel-toolchain is on PATH) to regenerate them in
+      # the runner's /usr/src before building. No generated source is ever
+      # committed to this repo — it carries patches only. Idempotent when no
+      # patch touches syscalls.master.
+      - name: Regenerate syscall tables (sysent)
+        run: |
+          cd /usr/src
+          ./tools/build/make.py \
+            --cross-bindir="${CROSS_BINDIR}" \
+            TARGET="${{ matrix.target }}" \
+            TARGET_ARCH="${{ matrix.target_arch }}" \
+            buildenv BUILDENV_SHELL='make -C sys/kern sysent'
+
+      - name: Copy kernel config
+        run: cp "$GITHUB_WORKSPACE/config/NEXTBSD" /usr/src/sys/${{ matrix.target }}/conf/
+
+      # Build the out-of-tree Mach module INTO the kernel (options COMPAT_MACH,
+      # nextbsd#181). The mach sources are NextBSD-original (not freebsd-src),
+      # carried in src-overlay/ and laid into the throwaway clone here — the
+      # fork is never touched. The COMPAT_MACH wiring is done here, NOT in
+      # patches/series, on purpose: the modules build shares the series and
+      # must never see COMPAT_MACH (it would choke config with the source
+      # absent). config/NEXTBSD in the repo stays clean for the same reason.
+      - name: Build mach into the kernel (overlay + COMPAT_MACH wiring)
+        run: |
+          set -eu
+          cp -R "$GITHUB_WORKSPACE/src-overlay/sys/." /usr/src/sys/
+          # kern_event.c's knote_enqueue() is static; the kmod resolved it via
+          # the runtime kld symtab (which includes locals), but the in-kernel
+          # static link can't. Append a global wrapper in kern_event.c's own TU
+          # (it can call the static fn); ipc_pset.c calls mach_knote_enqueue.
+          printf '\n/* nextbsd#181: global wrapper so compat/mach can reach the static knote_enqueue */\nvoid mach_knote_enqueue(struct knote *kn);\nvoid mach_knote_enqueue(struct knote *kn) { knote_enqueue(kn); }\n' >> /usr/src/sys/kern/kern_event.c
+          grep -q '^COMPAT_MACH[[:space:]]' /usr/src/sys/conf/options || \
+            printf 'COMPAT_MACH\topt_compat_mach.h\n' >> /usr/src/sys/conf/options
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_mach" >> /usr/src/sys/conf/files
+          # COMPAT_MACH_C: extra flags for compat/mach/*.c. -Wno-error mirrors
+          # the out-of-tree kmod's WERROR= (the in-kernel build defaults to
+          # -Werror); -DCOMPAT_MACH is omitted (opt_compat_mach.h provides it).
+          # $S stays literal (single quotes) — it expands in the kernel Makefile.
+          printf '\n# mach compat subsystem (options COMPAT_MACH, nextbsd#181)\n' >> /usr/src/sys/conf/kern.pre.mk
+          printf 'COMPAT_MACH_C= -DMACH_INTERNAL= -DAUDIT -I$S/apple -include $S/compat/mach/compat_shim.h -Wno-error\n' >> /usr/src/sys/conf/kern.pre.mk
+          grep -q '^options[[:space:]]*COMPAT_MACH' \
+            /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD || \
+            printf 'options\tCOMPAT_MACH\n' >> /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD
+          echo "==> mach wired in; compat/mach .c files: $(grep -c 'optional compat_mach' /usr/src/sys/conf/files)"
+
+      # In-kernel IOKit catalogue (K2, nextbsd#215). iokit_catalogue.c +
+      # sys/iocatalogue.h are laid into /usr/src/sys by the overlay cp above;
+      # here we just append its files fragment to the kernel source list. It is
+      # `standard` (always compiled) and needs no option/config line. Wired here
+      # (not in patches/series) for the same reason as mach: the modules build
+      # shares the series but does not lay in the overlay, so it must never see
+      # this source listed in sys/conf/files.
+      # Generate the mach_port MIG server from its .defs, rather than
+      # compiling a copy that was generated in 2015 by a MIG we no longer have
+      # and checked in as source (nextbsd-kernel#125, #126). This is the same
+      # arrangement as the `sysent` step above, and follows the rule this
+      # workflow already states: "No generated source is ever committed to this
+      # repo -- it carries patches only."
+      #
+      # migcom lives in nextbsd-userland and must run on the BUILD HOST, so it
+      # is built from source here; the migcom inside nextbsd-userland-$ARCH.tar.gz
+      # is target-arch and unusable when the x86 runner cross-builds arm64. This
+      # mirrors Apple, where bootstrap_cmds is built before xnu. The same
+      # checkout also supplies std_types.defs / mach_types.defs -- the wire type
+      # vocabulary, which must be one copy shared by both sides of the RPC.
+      - name: Checkout nextbsd-userland (migcom + wire types)
+        uses: actions/checkout@v4
+        with:
+          repository: nextbsd-redux/nextbsd-userland
+          ref: main
+          path: .userland
+
+      - name: Generate MIG servers from .defs
+        run: |
+          set -eu
+          # The toolchain image runs as root; there is no sudo. Only install
+          # if the generators are actually missing, and do not fail the step
+          # when the image already carries them.
+          if ! command -v bison >/dev/null 2>&1 && ! command -v byacc >/dev/null 2>&1; then
+            (pkg install -y bison || apt-get update && apt-get install -y bison) || true
+          fi
+          if ! command -v flex >/dev/null 2>&1 && ! command -v lex >/dev/null 2>&1; then
+            (pkg install -y flex || apt-get install -y flex) || true
+          fi
+          "$GITHUB_WORKSPACE/ci/gen-mig-servers.sh" /usr/src/sys "$GITHUB_WORKSPACE/.userland"
+
+      # msgh_id is subsystem base + index, so a misplaced or omitted `skip;`
+      # silently renumbers every routine after it and the kernel then executes
+      # the WRONG FUNCTION for a given message -- no error, no crash. Nothing
+      # else catches that, so the ABI contract is checked on every build.
+      - name: Verify MIG ABI against the frozen contract
+        run: |
+          set -eu
+          # mach_port is GENERATED, so this checks the generator's output.
+          "$GITHUB_WORKSPACE/ci/verify-mig-abi.sh" \
+            /usr/src/sys/compat/mach/mach_port_server.c \
+            "$GITHUB_WORKSPACE/src-overlay/sys/sys/mach/mach_port.msgids"
+
+          # All of these are GENERATED now as well (#125), so this checks the
+          # generator's output for every subsystem -- there is no frozen server
+          # left in the build. Pinning the contract against the servers actually
+          # being built is what stops a bad `skip;` or a renumbering from
+          # landing unnoticed.
+          for sub in task vm_map host_priv mach_host mach_vm clock; do
+            "$GITHUB_WORKSPACE/ci/verify-mig-abi.sh" \
+              "/usr/src/sys/compat/mach/${sub}_server.c" \
+              "$GITHUB_WORKSPACE/src-overlay/sys/sys/mach/${sub}.msgids"
+          done
+
+      - name: Wire in-kernel IOKit catalogue (K2, #215)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.iocatalogue" >> /usr/src/sys/conf/files
+          test -f /usr/src/sys/dev/iokit/iokit_catalogue.c
+          test -f /usr/src/sys/sys/iocatalogue.h
+          echo "==> iocatalogue wired: $(grep -c 'dev/iokit/iokit_catalogue.c' /usr/src/sys/conf/files) entry; source + header present"
+
+      # In-kernel IORegistry (K1, nextbsd#214). iokit_registry.c +
+      # sys/ioregistry.h are laid into /usr/src/sys by the overlay cp above; here
+      # we append its files fragment to the kernel source list. It is `standard`
+      # (always compiled) and needs no option/config line. Wired here (not in
+      # patches/series) for the same reason as the catalogue: the modules build
+      # shares the series but does not lay in the overlay, so it must never see
+      # this source listed in sys/conf/files. It hangs hw.iokit.registry off the
+      # shared hw.iokit node defined (now non-static) by iokit_catalogue.c.
+      - name: Wire in-kernel IORegistry (K1, #214)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.ioregistry" >> /usr/src/sys/conf/files
+          test -f /usr/src/sys/dev/iokit/iokit_registry.c
+          test -f /usr/src/sys/sys/ioregistry.h
+          echo "==> ioregistry wired: $(grep -c 'dev/iokit/iokit_registry.c' /usr/src/sys/conf/files) entry; source + header present"
+
+      # Bake linuxkpi_video into the kernel (graphics autoload, #64). drm.ko
+      # (IOGraphics.kext) hard-MODULE_DEPENDs on linuxkpi_video -- drm-kmod's
+      # video helpers (drm_aperture/HDMI/cmdline) -- which FreeBSD ships module-
+      # only with no config option (no in-tree consumer). NextBSD ships no
+      # /boot/kernel .ko tree, so we compile its sources in here, gated on
+      # COMPAT_LINUXKPI. The source files are stock base sources (already in the
+      # clone); we only append the files fragment. KERNEL build only -- the
+      # modules build shares patches/series but does not lay the overlay or cat
+      # these fragments, so it keeps building linuxkpi_video as its own .ko (same
+      # rule as iocatalogue/ioregistry). iic + lindebugfs, drm's other two
+      # missing base deps, are baked via config/NEXTBSD (device iic + LINDEBUGFS).
+      - name: Wire in linuxkpi_video (drm dep; graphics autoload, #64)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.linuxkpi_video" >> /usr/src/sys/conf/files
+          for s in linux_hdmi linux_aperture linux_cmdline linuxkpi_videokmod; do
+            test -f "/usr/src/sys/compat/linuxkpi/common/src/$s.c"
+          done
+          echo "==> linuxkpi_video wired: $(grep -c 'linuxkpi_videokmod.c' /usr/src/sys/conf/files) entry; sources present"
+
+      # vfs.pivot primitive (live-root, #70). kern/vfs_pivot.c is laid into
+      # /usr/src/sys by the overlay cp above; append its files fragment so it
+      # compiles into the kernel. It self-registers a `sysctl vfs.pivot` (no base
+      # patch) and is inert until written. KERNEL build only -- same rule as the
+      # iocatalogue/ioregistry/linuxkpi_video wiring above.
+      - name: Wire in vfs.pivot primitive (live-root, #70)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.vfs_pivot" >> /usr/src/sys/conf/files
+          test -f /usr/src/sys/kern/vfs_pivot.c
+          echo "==> vfs.pivot wired: $(grep -c 'kern/vfs_pivot.c' /usr/src/sys/conf/files) entry; source present"
+
+      # Static Linuxulator: the 64-bit Linux ABI + linprocfs/linsysfs (#60).
+      # Upstream ships these only as sys/modules/*, and there has never been a
+      # static path for the 64-bit ABI (COMPAT_LINUX is commented out in
+      # sys/conf/options.amd64 and absent from options.arm64; neither
+      # files.amd64 nor files.arm64 has any linux entries). NextBSD ships no
+      # /boot/kernel .ko tree (assemble-image.sh:168) and no kld tooling
+      # (kldload/kldstat/kldunload are superseded by kext*), so a module cannot
+      # be loaded here at all -- compiling in is the only route. Sources are
+      # stock base sources already in the clone; we append the declarations and
+      # the files fragment. KERNEL build only, same rule as linuxkpi_video.
+      #
+      # BOTH arches now. amd64 uses files.compat_linux (amd64/linux/* plus the
+      # three x86/linux/* files); arm64 uses files.compat_linux.arm64
+      # (arm64/linux/*, no x86 files, aarch64 VDSO flags). The split is per-file
+      # because config(8) reads one files.<arch> per target and has no
+      # equivalent of the Makefiles' `.if ${MACHINE_CPUARCH} == "amd64"'.
+      #
+      # On arm64 this also reaches NEXTBSD-RPI5: that config does `include
+      # NEXTBSD', and the options are appended to the copied
+      # sys/arm64/conf/NEXTBSD below, so the Pi kernel inherits them.
+      - name: Wire in the static Linuxulator (linux64 + linprocfs/linsysfs, #60)
+        run: |
+          set -eu
+          # COMPAT_LINUX is declared once, MI, so it covers both legs.
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/options.compat_linux" >> /usr/src/sys/conf/options
+          # The three options go into the COPIED config here, not into
+          # config/NEXTBSD in the repo -- same rule as COMPAT_MACH above.
+          # nextbsd-kernel-extensions reuses config/NEXTBSD to build a KBI-matched
+          # kernel and lays in none of src-overlay/, so an option the overlay
+          # alone declares makes its config(8) die with `unknown option'. Naming
+          # them in the shared file is what broke that build on both legs from
+          # 2026-08-03.
+          case "${{ matrix.target }}" in
+            amd64)
+              cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux" \
+                >> /usr/src/sys/conf/files.amd64
+              # LINPROCFS/LINSYSFS are already declared live in options.amd64;
+              # redeclaring them is a "Duplicate option" failure in config(8).
+              ;;
+            arm64)
+              cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux.arm64" \
+                >> /usr/src/sys/conf/files.arm64
+              # options.arm64 declares NEITHER, so unlike amd64 they must be
+              # added -- per-arch, never MI, or amd64 gets a duplicate.
+              cat "$GITHUB_WORKSPACE/src-overlay/conf/options.compat_linux.arm64" \
+                >> /usr/src/sys/conf/options.arm64
+              ;;
+            *) echo "unhandled target ${{ matrix.target }}" >&2; exit 1 ;;
+          esac
+          for _o in COMPAT_LINUX LINPROCFS LINSYSFS; do
+            grep -qE "^options[[:space:]]+${_o}\b" \
+              /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD || \
+              printf 'options\t%s\n' "$_o" >> /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD
+          done
+          # We declare COMPAT_LINUX ourselves, so it must still be commented out
+          # (amd64) or absent (arm64) upstream, and the per-arch LINPROCFS/
+          # LINSYSFS state must be what each branch above assumes. Either
+          # assumption breaking on a FreeBSD bump is a "Duplicate option" or
+          # "unknown option" failure in config(8), so assert it here where the
+          # message is legible.
+          grep -qE '^#COMPAT_LINUX[[:space:]]' /usr/src/sys/conf/options.amd64
+          if [ "${{ matrix.target }}" = "amd64" ]; then
+            grep -qE '^LINPROCFS[[:space:]]' /usr/src/sys/conf/options.amd64
+            grep -qE '^LINSYSFS[[:space:]]'  /usr/src/sys/conf/options.amd64
+            _mdsrc="amd64/linux"
+          else
+            # Must be absent from the pristine file -- we append them ourselves,
+            # so an upstream addition would become a duplicate.
+            git -C /usr/src show HEAD:sys/conf/options.arm64 \
+              | grep -qE '^(LINPROCFS|LINSYSFS)[[:space:]]' && {
+                echo "options.arm64 now declares LINPROCFS/LINSYSFS upstream;" >&2
+                echo "drop options.compat_linux.arm64 or config(8) will duplicate." >&2
+                exit 1; } || true
+            _mdsrc="arm64/linux"
+          fi
+          for s in $_mdsrc/linux_sysvec.c $_mdsrc/linux_genassym.c \
+                   $_mdsrc/linux_locore.asm $_mdsrc/linux_vdso_gtod.c \
+                   $_mdsrc/linux_vdso.lds.s compat/linux/linux_vdso_inc.S \
+                   compat/linux/linux_elf64.c compat/linprocfs/linprocfs.c \
+                   compat/linsysfs/linsysfs.c; do
+            test -f "/usr/src/sys/$s" || { echo "MISSING /usr/src/sys/$s" >&2; exit 1; }
+          done
+          n=$(grep -c 'optional compat_linux' \
+                /usr/src/sys/conf/files.${{ matrix.target }} || true)
+          echo "==> Linuxulator wired (${{ matrix.target }}): $n entries in files.${{ matrix.target }}; sources present"
+
+      - name: Build kernel (no modules)
+        run: |
+          cd /usr/src
+          # --cross-bindir points at the external Clang 19 cross toolchain
+          # (CROSS_BINDIR), inherited from the toolchain image ENV.
+          ./tools/build/make.py \
+            --cross-bindir="${CROSS_BINDIR}" \
+            TARGET="${{ matrix.target }}" \
+            TARGET_ARCH="${{ matrix.target_arch }}" \
+            KERNCONF=NEXTBSD \
+            NO_MODULES=yes \
+            buildkernel -j"$(nproc)"
+
+      # Gate: the Linuxulator and FUSE must be COMPILED INTO the kernel, on
+      # BOTH arches (#60 follow-up). NextBSD ships no /boot/kernel .ko tree and
+      # no kld tooling, so "compiled in" is the only state in which either one
+      # exists at all -- there is no runtime fallback that could mask a config
+      # regression. Nothing checked this before, which is how arm64 ended up
+      # silently without the Linux ABI while amd64 had it.
+      #
+      # Two layers, because they fail differently:
+      #   1. the .o files prove config(8) SELECTED the entries (a files.* or
+      #      options wiring mistake drops them here, with the kernel still
+      #      linking fine),
+      #   2. the symbols prove they actually LINKED IN (an `optional' entry that
+      #      no option selects compiles nothing and leaves no trace otherwise).
+      #
+      # Deliberately a build-time gate, not a runtime one: CI has no arm64 boot
+      # today, so a runtime probe could not be arch-symmetric. This one is.
+      - name: Gate — Linuxulator + FUSEFS are compiled into the kernel
+        run: |
+          set -eu
+          OBJ="/usr/obj/usr/src/${{ matrix.target }}.${{ matrix.target_arch }}/sys/NEXTBSD"
+          test -d "$OBJ" || { echo "no kernel obj dir at $OBJ" >&2; exit 1; }
+          NM="${CROSS_BINDIR}/llvm-nm"; [ -x "$NM" ] || NM=nm
+          fail=0
+          echo "--- objects config(8) should have selected (${{ matrix.target }})"
+          for o in linux_sysvec.o linux_machdep.o linux_misc.o linux_elf64.o \
+                   linprocfs.o linsysfs.o fuse_vfsops.o fuse_vnops.o; do
+            if [ -f "$OBJ/$o" ]; then echo "  ok    $o"
+            else echo "  MISSING $o" >&2; fail=1; fi
+          done
+          echo "--- symbols that must be in the linked kernel"
+          for s in elf_linux_sysvec fuse_vfsops; do
+            if "$NM" "$OBJ/kernel" 2>/dev/null | grep -qw "$s"; then
+              echo "  ok    $s"
+            else echo "  MISSING symbol $s" >&2; fail=1; fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "" >&2
+            echo "The Linuxulator and/or FUSE are NOT in this kernel." >&2
+            echo "amd64 wires the ABI via src-overlay/conf/files.compat_linux;" >&2
+            echo "arm64 needs the arm64 equivalent (sys/arm64/linux/)." >&2
+            exit 1
+          fi
+          echo "==> Linuxulator + FUSEFS compiled in (${{ matrix.target }})"
+
+      # arm64 only: build the Pi 500+ bring-up kernel and wrap it in the arm64
+      # Linux `Image` boot header, so the Raspberry Pi firmware can load it
+      # directly -- no loader, no UEFI. This is the nextbsd-rpi500 native-boot
+      # path (route (a)): the firmware parses the header, copies the payload to
+      # 0x200000 and enters at EL2 with x0 = physical FDT.
+      #
+      # A separate KERNCONF rather than options on NEXTBSD, because config/NEXTBSD
+      # is copied to BOTH sys/amd64/conf and sys/arm64/conf -- SOCDEV_PA there
+      # would break the amd64 build, and pointing an early console at an address
+      # that does not exist on other arm64 targets (the test VM) is worse than
+      # having no early console at all.
+      #
+      # Nothing below is new code; FreeBSD already ships every piece:
+      #   sys/conf/Makefile.arm64           the kernel.bin target (strip + prepend)
+      #   sys/tools/arm_kernel_boothdr.awk  write_v8booti(), magic 0x644d5241
+      #   sys/arm64/conf/std.arm64          LINUX_BOOT_ABI, already in GENERIC
+      #   sys/arm64/arm64/locore.S          maps SOCDEV_PA, sets socdev_va
+      - name: Build NEXTBSD-RPI5 + kernel.bin (arm64 booti image)
+        if: matrix.target == 'arm64'
+        run: |
+          cd /usr/src
+          cp "$GITHUB_WORKSPACE/config/NEXTBSD-RPI5" /usr/src/sys/arm64/conf/
+          cp "$GITHUB_WORKSPACE/config/rpi5.env" /usr/src/sys/arm64/conf/
+          ./tools/build/make.py \
+            --cross-bindir="${CROSS_BINDIR}" \
+            TARGET=arm64 TARGET_ARCH=aarch64 \
+            KERNCONF=NEXTBSD-RPI5 \
+            NO_MODULES=yes \
+            buildkernel -j"$(nproc)"
+          KO=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD-RPI5' | head -1)
+          KO=${KO#./}
+          test -n "$KO" || { echo "no sys/NEXTBSD-RPI5 obj dir" >&2; exit 1; }
+          ./tools/build/make.py \
+            --cross-bindir="${CROSS_BINDIR}" \
+            TARGET=arm64 TARGET_ARCH=aarch64 \
+            KERNCONF=NEXTBSD-RPI5 \
+            NO_MODULES=yes \
+            buildenv BUILDENV_SHELL="make -C /usr/obj/$KO kernel.bin"
+          ls -lh "/usr/obj/$KO/kernel.bin"
+          # Prove the header is there rather than trusting the exit code: the
+          # arm64 Image magic 0x644d5241 sits at offset 56, little-endian,
+          # i.e. the bytes 41 52 4d 64 ("ARM\x64"). A headerless image would
+          # be refused by the firmware and look exactly like a dead board.
+          MAGIC=$(od -An -tx1 -j56 -N4 "/usr/obj/$KO/kernel.bin" | tr -d ' \n')
+          echo "Image_header magic @56: $MAGIC"
+          test "$MAGIC" = "41524d64" || { echo "BAD or MISSING arm64 Image header" >&2; exit 1; }
+          # Prove the early console is actually compiled in, for the same
+          # reason: a kernel without it boots and says nothing. config(8)
+          # writes both options into opt_global.h (sys/conf/options.arm64 for
+          # SOCDEV_PA, sys/conf/options for EARLY_PRINTF), so that file is the
+          # authoritative evidence that the config was accepted -- checking the
+          # config file we just wrote would only prove we can read our own input.
+          OG="/usr/obj/$KO/opt_global.h"
+          test -f "$OG" || { echo "no opt_global.h at $OG" >&2; exit 1; }
+          grep -qE '^#define[[:space:]]+SOCDEV_PA[[:space:]]' "$OG" \
+            || { echo "SOCDEV_PA absent from opt_global.h -- config(8) did not take it" >&2; exit 1; }
+          grep -qE '^#define[[:space:]]+EARLY_PRINTF[[:space:]]' "$OG" \
+            || { echo "EARLY_PRINTF absent from opt_global.h" >&2; exit 1; }
+          echo "opt_global.h says:"
+          grep -E '^#define[[:space:]]+(SOCDEV_PA|EARLY_PRINTF)[[:space:]]' "$OG" | sed 's/^/  /'
+
+          # Corroborate against the linked kernel. NEXTBSD sets no
+          # `makeoptions DEBUG=-g`, so there is no kernel.full -- only kernel.
+          # Do NOT hide nm's stderr: a missing tool or file must not be
+          # indistinguishable from a missing symbol, which is exactly how the
+          # first version of this check produced a false failure.
+          KELF="/usr/obj/$KO/kernel.full"
+          [ -f "$KELF" ] || KELF="/usr/obj/$KO/kernel"
+          NM="${CROSS_BINDIR}/llvm-nm"
+          [ -x "$NM" ] || NM="$(command -v llvm-nm || command -v nm || true)"
+          if [ -n "$NM" ] && [ -f "$KELF" ]; then
+            if "$NM" "$KELF" | grep -q ' socdev_va'; then
+              echo "socdev_va present in $(basename "$KELF"): early console linked in"
+            else
+              echo "socdev_va NOT in $(basename "$KELF") despite opt_global.h" >&2; exit 1
+            fi
+          else
+            echo "note: no nm ($NM) or no kernel ELF ($KELF); opt_global.h check stands alone"
+          fi
+          mkdir -p /tmp/rpi5 && cp "/usr/obj/$KO/kernel.bin" /tmp/rpi5/kernel8.img
+
+      - name: Upload kernel8.img (arm64 booti image)
+        if: matrix.target == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi5-kernel8-arm64
+          path: /tmp/rpi5/kernel8.img
+
+      # Tar the obj tree IN-CONTAINER, where /usr/obj perms are intact. The
+      # exec bit (bmake, cross-tools) survives inside the tar stream; a raw
+      # upload-artifact tree comes back 0644 and breaks make.py's bmake
+      # bootstrap downstream (PermissionError on /usr/obj/bmake-install/bin/bmake).
+      - name: Package obj tree (preserves exec bits)
+        run: |
+          # Full /usr/obj — consumed by nextbsd-kernel-extensions.
+          tar -czf "/tmp/kernel-obj-${{ matrix.target }}.tar.gz" -C /usr/obj .
+          # sys/NEXTBSD subtree (kernel binary + opt_*.h) — consumed by nextbsd.
+          SUB=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD' | head -1)
+          echo "sys/NEXTBSD subtree: ${SUB:-<not found>}"
+          test -n "$SUB"
+          tar -czf "/tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz" -C /usr/obj "$SUB"
+          ls -lh /tmp/kernel-obj-${{ matrix.target }}.tar.gz /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
+
+      # Artifacts are now single .tar.gz files (already gzip'd → store-only).
+      # Their CONTENTS carry the perms, so the round-trip through artifacts +
+      # the continuous release no longer strips the exec bit.
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextbsd-kernel-${{ matrix.target }}
+          path: /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
+          compression-level: 0
+
+      - name: Upload obj tree for modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-obj-${{ matrix.target }}
+          path: /tmp/kernel-obj-${{ matrix.target }}.tar.gz
+          compression-level: 0
+
+      # --- Native image assembly (nextbsd#369) ---
+      # Assemble a bootable disk.img HERE, in the toolchain container (which has
+      # /usr/src + $CROSS_BINDIR to host-build makefs/mkimg), from THIS build's
+      # kernel + the component `continuous` artifacts — exactly like
+      # nextbsd-userland does. This replaces the old "download the published ISO
+      # and inject the kernel in a FreeBSD VM" path, so the kernel CI no longer
+      # depends on the ISO (which depends on nextbsd-pkg). The image is uploaded
+      # for the separate KVM boot job. amd64 only for now (no arm64 boot job).
+      - name: Assemble disk.img (this kernel + component continuous artifacts)
+        if: github.event_name == 'pull_request'
+        env:
+          # This step only READS public `continuous` release assets from the
+          # sibling component repos, so it needs no PAT — the built-in,
+          # auto-injected GITHUB_TOKEN authenticates gh for public cross-repo
+          # reads. Using it (not secrets.DISPATCH_TOKEN) is what lets PRs from
+          # forks build: fork PRs never receive repo secrets, but they do get a
+          # read-only github.token. The PAT stays only on the cross-repo
+          # repository_dispatch step below, which forks can never trigger.
+          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.target }}
+          KERNEL_TGZ: /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
+          WORK: ${{ github.workspace }}/nbimg
+        run: |
+          set -eu
+          mkdir -p art
+          # base rootfs (compat), the Darwin userland layer, and driver kexts —
+          # each from its own `continuous` release; the kernel is THIS build's.
+          gh release download continuous -R nextbsd-redux/nextbsd-freebsd-compat \
+            --pattern 'nextbsd-base-${{ matrix.target }}.tar.gz' --dir art --clobber
+          gh release download continuous -R nextbsd-redux/nextbsd-userland \
+            --pattern 'nextbsd-userland-${{ matrix.target }}.tar.gz' --dir art --clobber
+          # Third-party base programs (zsh, sudo, pico) live in nextbsd-contrib by
+          # the repo boundary rule, so none of the above ships them. Without it the
+          # image has no /bin/zsh -- the login shell the overlay's master.passwd
+          # gives admin -- and the serial reads "login: /bin/zsh: No such file or
+          # directory" in a getty loop, which the login gate below then reports as
+          # a kernel boot regression.
+          gh release download continuous -R nextbsd/nextbsd-contrib \
+            --pattern 'nextbsd-contrib-${{ matrix.target }}.tar.gz' --dir art --clobber
+          # The kext assets are a mix of arch-suffixed (graphics-kexts-amd64,
+          # graphics-kexts-arm64) and unsuffixed (intelwifi-kext, nvidia-kexts)
+          # names, and '*kext*.tar.gz' matches every one of them -- so before
+          # arm64 assembled anything, an amd64 image was being built with the
+          # arm64 graphics kexts laid in alongside its own. Harmless there
+          # (wrong-arch .ko files simply never load) but wrong, and actively
+          # wrong once both arches assemble. Drop the other arch's suffixed
+          # assets after download.
+          #
+          # And on arm64 drop the UNSUFFIXED ones too. They are amd64 -- the
+          # legacy graphics-kexts.tar.gz, intelwifi-kext, nvidia-kexts -- and
+          # `ls` orders "graphics-kexts.tar.gz" AFTER "graphics-kexts-arm64.tar.gz"
+          # ('-' 0x2d sorts before '.' 0x2e), so the amd64 bundle was extracted
+          # last and laid x86-64 objects over arm64's own. kldload then reported
+          #
+          #   linker_load_file: /System/Library/Extensions/DMABuf.kext/Contents/\
+          #       MacOS/DMABuf - unsupported file type
+          #
+          # and the whole graphics chain never loaded, so nothing on arm64 could
+          # ever exercise VirtIOGraphics. This is the same defect
+          # nextbsd-userland fixed in 64422f0 ("arm64 has never run its own
+          # kexts"); this repo kept the half of it that only drops the other
+          # arch's SUFFIXED assets. Keeping the unsuffixed ones on amd64 is
+          # correct -- there they are that arch's assets.
+          gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
+            --pattern '*kext*.tar.gz' --dir art --clobber || true
+          _other=amd64; [ "${{ matrix.target }}" = amd64 ] && _other=arm64
+          rm -f art/*-"$_other".tar.gz
+          if [ "${{ matrix.target }}" != amd64 ]; then
+            for _k in art/*kext*.tar.gz; do
+              [ -e "$_k" ] || continue
+              case "$_k" in
+                *-"${{ matrix.target }}".tar.gz) ;;
+                *) echo "dropping non-arm64 kext asset $_k"; rm -f "$_k" ;;
+              esac
+            done
+          fi
+          export BASE_TGZ="$PWD/art/nextbsd-base-${{ matrix.target }}.tar.gz"
+          export USERLAND_TGZ="$PWD/art/nextbsd-userland-${{ matrix.target }}.tar.gz"
+          export CONTRIB_TGZ="$PWD/art/nextbsd-contrib-${{ matrix.target }}.tar.gz"
+          export MODULES_TGZ="$(ls art/*kext*.tar.gz 2>/dev/null | tr '\n' ' ')"
+          # pkg-free /etc seed from nextbsd-overlays (no git in container), same
+          # as nextbsd-userland's assembly step.
+          gh api repos/nextbsd-redux/nextbsd-overlays/tarball/main > /tmp/overlays.tar.gz
+          mkdir -p "$WORK/seed"
+          tar -C "$WORK/seed" --strip-components=1 -xzf /tmp/overlays.tar.gz
+          export SEED_ROOTFS="$WORK/seed/rootfs"
+          chmod +x ci/assemble-image.sh
+          ./ci/assemble-image.sh
+
+      - name: Upload native-assembled image
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextbsd-ci-image-${{ matrix.target }}
+          path: nbimg/out/disk.img
+
+  # PR-only boot smoke test: boot the disk.img the build job self-assembled from
+  # THIS kernel + the component `continuous` artifacts (nextbsd#369). No ISO, no
+  # nextbsd-pkg, no FreeBSD VM — the kernel CI holds its own, the way
+  # nextbsd-userland does. The trap/Mach code under test compiles INTO the base
+  # kernel (options COMPAT_MACH), so the freshly-built kernel in this image
+  # carries it.
+  #
+  # Deliberately scoped: runs ONLY on pull_request, never on main/dispatch, and
+  # does NOT gate `publish` or the downstream cascade. amd64 only (no arm64 boot
+  # job yet).
+  smoke-test:
+    name: smoke-test (boot the self-assembled image with this kernel)
+    needs: kernel
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # The image (~2G raw) + qemu need headroom.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      # The bootable image the build job self-assembled from THIS kernel + the
+      # component `continuous` artifacts. No ISO, no FreeBSD VM, no kernel
+      # injection — the freshly-built kernel is already the one in the image.
+      - name: Download the self-assembled image
+        uses: actions/download-artifact@v4
+        with:
+          name: nextbsd-ci-image-amd64
+          path: .
+
+      - name: Install qemu + expect + OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 expect ovmf
+
+      # Reuse nextbsd's canonical boot test (the on-image /usr/tests/.../run.sh
+      # marker suite drives the actual assertions). Fetched from nextbsd main to
+      # stay in sync (now carries the un-mute/trace-gate/teardown fixes, #375).
+      # TODO(#376): pull this from the shared tests repo once it exists.
+      - name: Fetch nextbsd boot test
+        run: |
+          mkdir -p tests
+          curl -fsSL https://raw.githubusercontent.com/nextbsd-redux/nextbsd/main/tests/boot-test.sh \
+            -o tests/boot-test.sh
+          chmod +x tests/boot-test.sh
+
+      # A KERNEL smoke-test gates on "does THIS kernel boot" — reaching the getty
+      # login prompt — NOT on the post-login userland marker suite. SYSLOG-RUN /
+      # NOTIFYD-PROC etc. are known-flaky USERLAND races (#369; userland's own CI
+      # runs them boot_soft/non-gating for the same reason). So run the full boot
+      # test but don't let a post-login userland marker fail the kernel job...
+      - name: Boot test (this kernel, self-assembled image)
+        id: boottest
+        continue-on-error: true
+        run: ./tests/boot-test.sh disk.img
+      # ...then gate on the kernel actually reaching login. A kernel/config change
+      # that breaks boot never prints this line, so this still catches the real
+      # regression this job exists to catch, without red-flaking on #369.
+      - name: Gate — kernel reached the login prompt
+        run: |
+          # Gate on the getty "login:" prompt in the SERIAL capture (boot.log).
+          # NOTE: boot-test.sh's own "OK: boot reached the login prompt" is an
+          # expect `puts` — it goes to the job stdout, NOT boot.log — so we grep
+          # the actual serial line the getty prints ("<host> login:"), which is
+          # the deterministic "this kernel booted to multi-user" signal and is
+          # immune to the flaky post-login SYSLOG-RUN marker (#369).
+          # Three accepted forms, because "this kernel reached multi-user with a
+          # console session" has three shapes now:
+          #   "login:"                  a getty prompt (no autologin, or it failed)
+          #   "login: root"             the historical root login
+          #   "login on console as ..." getty autologin fired (nextbsd-overlays
+          #                             f9dcd5b disabled root; autologin-user logs
+          #                             admin in), in which case NO prompt is ever
+          #                             printed and matching only "login:" fails on
+          #                             a perfectly good boot.
+          # Matching only the prompt made this gate fail *because* the image was
+          # fixed: once /bin/zsh existed, autologin succeeded, the serial ended at
+          # the admin zsh prompt, and no "login:" line was ever emitted.
+          if grep -aqE "login: *$|login: root|login on console as |^NextBSD/[a-z0-9]+ \\(.*\\) \\(console\\)" tests/boot.log 2>/dev/null; then
+            echo "OK: this kernel booted to the getty login prompt."
+            echo "--- on-image markers (informational; SYSLOG-RUN etc. flaky, #369) ---"
+            grep -aoE "[A-Z0-9-]+-(OK|FAIL|SKIP)" tests/boot.log | sort | uniq -c || true
+          else
+            echo "FAIL: kernel did not reach the login prompt — real boot regression." >&2
+            echo "--- last 20 serial lines ---" >&2
+            tail -20 tests/boot.log >&2 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Upload boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log
+          path: tests/boot.log
+          if-no-files-found: ignore
+
+  # arm64 counterpart of the job above. Same contract: boot the disk.img the
+  # build job self-assembled from THIS kernel, gate on reaching the getty login
+  # prompt, never gate `publish`.
+  #
+  # Self-contained rather than reusing nextbsd-redux/nextbsd's boot-test.sh,
+  # which is hardcoded amd64 (qemu-system-x86_64, -machine q35, -cpu qemu64,
+  # OVMF paths). Making that script arch-aware is the right long-term fix and
+  # belongs with TODO(#376), the move to a shared tests repo; doing it here
+  # would mean a cross-repo merge before this PR could go green.
+  #
+  # Runs on a native arm64 runner (free for public repos), so qemu is not
+  # cross-emulating. KVM is used when the runner exposes /dev/kvm and TCG
+  # otherwise -- same detection boot-test.sh does for amd64.
+  #
+  # NEXTBSD-RPI5 is deliberately NOT what boots here: qemu has no BCM2712
+  # machine model. This is the generic arm64 NEXTBSD kernel on -M virt under
+  # UEFI, which is the same shape as the published NextBSD-arm64 image.
+  smoke-test-arm64:
+    name: smoke-test-arm64 (boot the self-assembled arm64 image)
+    needs: kernel
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Download the self-assembled arm64 image
+        uses: actions/download-artifact@v4
+        with:
+          name: nextbsd-ci-image-arm64
+          path: .
+
+      - name: Install qemu + expect + AAVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm qemu-efi-aarch64 expect
+
+      - name: Boot test (this kernel, self-assembled arm64 image)
+        id: boottest
+        continue-on-error: true
+        run: |
+          set -eu
+          # AAVMF wants two pflash volumes and a WRITABLE vars copy.
+          cp /usr/share/AAVMF/AAVMF_VARS.fd vars.fd
+          chmod u+w vars.fd
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm 2>/dev/null || true; fi
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ACCEL="-accel kvm -cpu host"
+          else
+            ACCEL="-accel tcg,thread=single -cpu max"
+          fi
+          echo "==> accel: $ACCEL"
+          export ACCEL
+          cat > boot.exp <<'EXP'
+          set timeout 1800
+          log_file -noappend boot.log
+          eval spawn qemu-system-aarch64 \
+              -machine virt $env(ACCEL) \
+              -m 4096 -smp 2 \
+              -drive if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd \
+              -drive if=pflash,format=raw,unit=1,file=vars.fd \
+              -drive if=none,id=hd0,format=raw,file=disk.img \
+              -device virtio-blk-device,drive=hd0 \
+              -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+              -device virtio-gpu-pci \
+              -display none -serial stdio
+          # Three accepted forms. Matching only "login:" cost 30 minutes a run once
+          # the image gained /bin/zsh: autologin then succeeds, getty never prints a
+          # prompt, and this sat until `set timeout 1800` expired on a boot that had
+          # been fine for minutes. "login on console as" is the normal shape now that
+          # root is disabled (nextbsd-overlays f9dcd5b) and autologin-user runs.
+          # The shipped image mutes the kernel console: nextbsd-overlays'
+          # /boot/loader.conf.d/nextbsd.conf sets boot_mutemsgs="YES" so a normal
+          # boot has a clean login screen. Nothing then reaches -serial stdio, and
+          # this lane sat until `set timeout 1800` expired on boots that were
+          # fine -- for weeks. The amd64 job never hit it because it delegates to
+          # nextbsd/tests/boot-test.sh, which does this loader dance; this lane
+          # has its own inline expect and never learned it.
+          #
+          # Under AAVMF with -display none the loader's default `efi` console
+          # routes to serial, so we can interrupt autoboot and set the vars.
+          # send -s paces input a char at a time: this emulated UART drops
+          # characters when fed a line at full speed, and the loader then reads
+          # e.g. `bot` and answers "unknown command". Required by send -s below --
+          # without it expect dies with "send_slow has no value".
+          set send_slow {1 .04}
+
+          proc loader_set {cmd} {
+              global timeout
+              set saved $timeout
+              set timeout 20
+              sleep 0.3
+              # Drain the settled prior prompt, THEN send, THEN sync on the fresh
+              # OK. Deliberately not matching the command echo: this emulated UART
+              # drops a char from the ECHO often enough that an exact-echo match
+              # hangs on a cosmetic glitch while the loader took the command fine.
+              expect *
+              send -s -- "$cmd\r"
+              expect {
+                  timeout { puts "\nFAIL: no OK prompt after '$cmd'"; exit 1 }
+                  "OK "
+              }
+              set timeout $saved
+          }
+
+          expect {
+              timeout { puts "\nFAIL: no loader autoboot prompt within 60s"; exit 1 }
+              -re "Hit \\\[Enter\\\]"     { send " " }
+              "Booting"                  { send " " }
+              -re "FreeBSD/\[a-z0-9\]+ EFI" { send " " }
+          }
+          expect {
+              timeout { puts "\nFAIL: no loader OK prompt within 30s"; exit 1 }
+              "OK " { puts "\n==> at loader prompt; enabling the serial console" }
+          }
+          loader_set "set console=comconsole"
+          loader_set "set boot_serial=YES"
+          loader_set "set comconsole_speed=115200"
+          # =NO, not unset: the loader's howto builder tests
+          # `val != NULL && strcasecmp(val, "no") != 0`, so =NO clears RB_MUTEMSGS
+          # while leaving the variable set.
+          loader_set "set boot_mutemsgs=NO"
+
+          # NOT loader_set: that syncs on a fresh "OK " prompt, and a successful
+          # boot LEAVES the prompt, so it would time out on success. Sync on the
+          # kernel starting instead, and resend if the UART garbled the command --
+          # a mangled `boot` gets "unknown command" and sits at OK forever.
+          set timeout 20
+          for {set try 1} {$try <= 5} {incr try} {
+              sleep 0.3
+              expect *
+              send -s -- "boot\r"
+              expect {
+                  "unknown command" {
+                      puts "\n==> loader garbled 'boot' (try $try/5); resending"
+                      continue
+                  }
+                  -re "Booting|/boot/kernel/kernel|Loading kernel|---<<" { break }
+                  "OK " {
+                      puts "\n==> still at OK after 'boot' (try $try/5); resending"
+                      continue
+                  }
+                  timeout {
+                      puts "\n==> no response to 'boot' (try $try/5); resending"
+                      continue
+                  }
+              }
+          }
+          set timeout 1800
+
+          # -device virtio-gpu-pci above: this lane had no display device at
+          # all, so vtgpu0 never attached, vt_allocate() was never called by it,
+          # and the whole virtio-gpu console and takeover path went untested on
+          # the one arch where it is load-bearing. A green arm64 boot proved
+          # nothing about it. `panic:` is matched first so a fault is reported as
+          # a panic instead of as a 30-minute timeout with no cause.
+          expect {
+              -re {panic:[^\r\n]*}       { puts "\nPANIC: $expect_out(0,string)"; exit 1 }
+              -re {login: *$}            { puts "\n==> reached the getty login prompt." }
+              -re {login on console as } { puts "\n==> getty autologin fired." }
+              -re {[#%$] $}              { puts "\n==> reached a shell prompt." }
+              timeout                    { puts "\nTIMEOUT before login or shell."; exit 1 }
+              eof                        { puts "\nqemu exited before login or shell."; exit 1 }
+          }
+
+          # Do NOT exit here. kextd loads the graphics chain a few seconds AFTER
+          # login, so exiting at the prompt killed qemu before the virtio-gpu
+          # takeover ran -- the job went green having tested none of it (run
+          # 36188459898 ends at "login on console as admin" with no kextd line).
+          #
+          # A fault in that window is the thing this lane exists to catch, so keep
+          # reading. Success is any VT: line naming drmfb: with the sole-backend
+          # deallocate fixed, vt(4) drops to NO backend first, so drmfb arrives as
+          # "initialize with new VT driver" rather than "Replacing driver" -- match
+          # either.
+          #
+          # "Switching back from X to X" is deliberately NOT a failure: vt_deallocate()
+          # still prints it, and the fix is in what vt_replace_backend() then does.
+          set timeout 240
+          expect {
+              -re {panic:[^\r\n]*} { puts "\nPANIC after login: $expect_out(0,string)"; exit 1 }
+              -re {VT: [^\r\n]*drmfb} { puts "\nOK: virtio-gpu handed the console to drmfb: $expect_out(0,string)"; exit 0 }
+              timeout { puts "\nOK: booted to login; no drmfb handover seen in 240s (kext may not have loaded)"; exit 0 }
+              eof     { puts "\nOK: booted to login; qemu exited without a panic"; exit 0 }
+          }
+          EXP
+          expect -f boot.exp
+
+      # Gate on the same signal the amd64 job uses: the getty "login:" line in
+      # the SERIAL capture. Separate from the step above so an expect-level
+      # hiccup is distinguishable from "this kernel did not boot".
+      - name: Gate — kernel reached the login prompt
+        run: |
+          # FOUR accepted forms now. The fourth is getty's own issue banner,
+          # "NextBSD/<arch> (<host>) (console)", and it is the deterministic one:
+          # with autologin there is no "login:" prompt, and "login on console as"
+          # is a SYSLOG line, so it only appears if syslogd came up and its output
+          # reached this console. On a self-assembled arm64 image it does not --
+          # run 36187119025 booted perfectly, rendered the banner and reached
+          # `admin@virt-8-2 ~ %`, and this gate still failed with 0 matches.
+          #
+          # The expect block above already accepts a bare shell prompt; the gate
+          # did not, so the two disagreed about what a good boot looks like. getty
+          # prints the banner immediately before login on both arches, so keying on
+          # it makes them agree without depending on userland coming up.
+          if grep -aqE "login: *$|login: root|login on console as |^NextBSD/[a-z0-9]+ \\(.*\\) \\(console\\)" boot.log 2>/dev/null; then
+            echo "OK: this arm64 kernel booted to the getty login prompt."
+          else
+            echo "FAIL: arm64 kernel did not reach the login prompt." >&2
+            echo "--- last 40 serial lines ---" >&2
+            tail -40 boot.log >&2 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Upload arm64 boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log-arm64
+          path: boot.log
+          if-no-files-found: ignore
+
+  # Refresh the rolling `continuous` release from a successful main build, so
+  # downstream consumers ingest a stable, always-present pointer instead of
+  # scraping "latest successful main run" artifacts (which expire and aren't
+  # gated). PRs build (the job above) but never reach here — see the `if`.
+  # Single non-matrix job (not a per-arch step) so the two legs don't race on
+  # release creation; it collects both arches' artifacts and publishes once.
+  publish:
+    name: publish continuous
+    needs: kernel
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # The build job already produced perms-correct .tar.gz files (one per
+      # artifact); just gather them. No re-tar — re-taring the extracted tree
+      # is exactly what stripped the exec bit before.
+      - name: Collect per-arch assets
+        run: |
+          mkdir -p out
+          find artifacts -name 'kernel-obj-*.tar.gz' -exec cp {} out/ \;
+          find artifacts -name 'nextbsd-kernel-*.tar.gz' -exec cp {} out/ \;
+          # The Pi 5 family board kernel, published under a name that says what
+          # it is: kernel.bin wrapped in an arm64 Linux Image header, which the
+          # BCM2712 bootloader loads directly as kernel8.img. It is NOT a
+          # tarball and NOT interchangeable with nextbsd-kernel-arm64.tar.gz
+          # (that ships an ELF the Pi firmware will not enter).
+          #
+          # One kernel, many boards -- NEXTBSD-RPI5 has nothing board-specific
+          # in it. The IMAGES built from it stay per-board, because a boot
+          # partition carries one board's DTB: nextbsd's BOARD=rpi500 lane puts
+          # bcm2712-rpi-500.dtb next to this exact file, and a Pi 5 B lane
+          # would put bcm2712-rpi-5-b.dtb next to the very same one.
+          find artifacts -name 'kernel8.img' -exec cp {} out/rpi5-kernel8-arm64.img \;
+          # Transition alias under the old name, so an nextbsd checkout that
+          # has not yet moved to rpi5-kernel8-arm64.img keeps building. Delete
+          # once nextbsd#414 and its follow-up have landed.
+          cp out/rpi5-kernel8-arm64.img out/rpi500-kernel8-arm64.img
+          ls -lh out/
+
+      # Stable asset names (no datestamp) → each publish overwrites in place, so
+      # the release never accumulates stale assets and needs no delete step.
+      - name: Publish to continuous release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: continuous
+          name: Continuous kernel build
+          body: |
+            Rolling kernel build, refreshed on every successful `main` build.
+            Consumed by nextbsd-kernel-extensions (`kernel-obj-<arch>.tar.gz`) and
+            nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
+            `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
+            `rpi500-kernel8-arm64.img` is a transition alias for the same
+            file).
+
+            Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Commit: ${{ github.sha }}
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: |
+            out/*.tar.gz
+            out/rpi5-kernel8-arm64.img
+            out/rpi500-kernel8-arm64.img
+
+      # Cascade to modules only on a real source/toolchain change
+      # (repository_dispatch), and only AFTER continuous is refreshed above —
+      # so the module build ingests this run's obj tree, not the prior one.
+      # No run_id needed anymore: modules pulls kernel's continuous release.
+      - name: Trigger module build
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          gh api repos/nextbsd/nextbsd-kernel-extensions/dispatches \
+            -f event_type=kernel-updated \
+            -f "client_payload[fbsd_sha]=${{ github.event.client_payload.fbsd_sha }}" \
+            -f "client_payload[sha]=${{ github.sha }}"
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}

@@ -1,0 +1,94 @@
+/*
+ * mach_debug_types.defs -- MIG type definitions for the mach_debug types.
+ *
+ * sys/sys/mach_debug/ipc_info.h says, above these structs:
+ *
+ *     "Remember to update the mig type definitions in mach_debug_types.defs
+ *      when adding/removing fields."
+ *
+ * ...but no such file has ever existed in the tree.  This restores it.
+ *
+ * Every size below was verified field-by-field against our own
+ * src-overlay/sys/sys/mach_debug/ipc_info.h, not copied from Apple:
+ *
+ *   ipc_info_space        6 natural_t  (genno_mask, table_size, table_next,
+ *                                       tree_size, tree_small, tree_hash)
+ *   ipc_info_space_basic  6 natural_t  (genno_mask, table_size, table_next,
+ *                                       table_inuse, reserved[2])
+ *   ipc_info_name         7 natural_t  (name, collision, type, urefs,
+ *                                       object, next, hash)
+ *   ipc_info_tree_name    9 natural_t  (ipc_info_name_t + lchild + rchild)
+ *
+ * These happen to agree with XNU's own mach_debug_types.defs, which is a
+ * useful independent check rather than the source of the numbers.
+ */
+
+#ifndef	_MACH_DEBUG_TYPES_DEFS_
+#define	_MACH_DEBUG_TYPES_DEFS_
+
+#include <mach/std_types.defs>
+
+type ipc_info_space_t		= struct[6] of natural_t;
+type ipc_info_space_basic_t	= struct[6] of natural_t;
+
+type ipc_info_name_t		= struct[7] of natural_t;
+type ipc_info_name_array_t	= array[] of ipc_info_name_t;
+
+type ipc_info_tree_name_t	= struct[9] of natural_t;
+type ipc_info_tree_name_array_t	= array[] of ipc_info_tree_name_t;
+
+
+/*
+ * THREE wire sizes below were stale on LP64 and are now CORRECTED (#137).
+ *
+ * They were inherited verbatim from Apple's vm_map.defs, where they were
+ * right for a 32-bit vm_offset_t. Here vm_offset_t and
+ * memory_object_offset_t are 64-bit, so each of these structs is larger in
+ * C than the wire said, and a client marshalling sizeof(C) against a server
+ * unmarshalling the wire size misaligns every array element after the first:
+ *
+ *   vm_info_object_t      wire 84 (21 natural_t), C 88 -- vm_offset_t
+ *                         vio_last_alloc is 8 bytes
+ *   vm_info_region_64_t   wire 44 (11 natural_t), C 48 -- 64-bit
+ *                         memory_object_offset_t vir_offset pads 12->16
+ *   page_address_array_t  wire 4/element (integer_t), C 8 -- the elements
+ *                         are vm_offset_t
+ *
+ * vm_info_region_64_t is NOT in #137's list; it was found by computing all
+ * four sizes rather than trusting the two the ticket named. vm_info_region_t
+ * (wire 40, C 40) is genuinely correct and is left alone.
+ *
+ * Expressed in uint64_t where the size must be a multiple of 8, so the wire
+ * layout carries the same 8-byte alignment the C struct has -- struct[22] of
+ * natural_t would give the right 88 bytes with the wrong alignment rule.
+ *
+ * This IS an ABI change to mach_vm_region_info, mach_vm_region_info_64 and
+ * vm_mapped_pages_info. It is deliberate (#137 option 1): the previous
+ * agreement between our client and server was an agreement to be wrong
+ * together, and neither routine is exercised today, so this is the cheapest
+ * moment it will ever be to correct.
+ *
+ * The ^ (out-of-line) markers here are load-bearing and NOT cosmetic. migcom
+ * emits the reply count zero-init (WriteInitializeCount, server.c:1258) only
+ * for itMigInLine types, i.e. plain `array[]`. Adding ^ to an array whose
+ * server expects `xCnt = 0` before the kernel call hands the kernel an
+ * UNINITIALISED count, and the reply's OOL size becomes garbage * elemsize.
+ * Both forms emit a MACH_MSG_OOL_DESCRIPTOR, so the descriptor cannot tell
+ * them apart -- only the count-init can. Do not "tidy" these.
+ */
+type mach_zone_name_t		= struct[80] of char;
+type mach_zone_name_array_t	= array[] of mach_zone_name_t;
+type task_zone_info_t		= struct[11] of uint64_t;
+type task_zone_info_array_t	= array[] of task_zone_info_t;
+type vm_info_region_t		= struct[10] of natural_t;
+type vm_info_region_64_t	= struct[6] of uint64_t;	/* 48 = C sizeof */
+type vm_info_object_t		= struct[11] of uint64_t;	/* 88 = C sizeof */
+type vm_info_object_array_t	= ^array[] of vm_info_object_t;
+type page_address_array_t	= ^array[] of uint64_t;	/* vm_offset_t */
+type hash_info_bucket_t		= struct[1] of natural_t;
+type hash_info_bucket_array_t	= array[] of hash_info_bucket_t;
+type mach_zone_info_t		= struct[8] of uint64_t;
+type mach_zone_info_array_t	= array[] of mach_zone_info_t;
+
+
+#endif	/* _MACH_DEBUG_TYPES_DEFS_ */

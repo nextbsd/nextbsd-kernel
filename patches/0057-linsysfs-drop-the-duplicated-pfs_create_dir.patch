@@ -1,0 +1,51 @@
+From cd77003f8b5e37ba6399737cc7efffec6967da91 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Thu, 10 Sep 2026 22:59:11 -0500
+Subject: [PATCH 2/2] linsysfs: drop the duplicated pfs_create_dir for each PCI
+ device (#209)
+
+linsysfs_run_bus() creates each PCI device's directory twice:
+
+	error = pfs_create_dir(dir, &dir, device, NULL, NULL, NULL, 0);
+	if (error != 0)
+		goto out;
+	pfs_create_dir(dir, &dir, device, NULL, NULL, NULL, 0);
+
+The second call is a rebase artifact, not intent. cc70c7989bfb (D52038) added
+one error-checked `dir = pfs_create_dir(...)' under the old pointer-returning
+API; the coccinelle conversion in a2f08d0ddc29 (D52157) converted that call
+and emitted a second copy of it, visible directly in that commit's diff.
+
+Because the first call reassigns dir to the node it just made, the second one
+nests an identically named directory inside it. Every PCI device therefore
+appears as
+
+	/sys/devices/pci0000:00/0000:00:00.0/0000:00:00.0/vendor
+
+instead of one level, children of a bridge nest under the doubled directory,
+and the scsi_host `device' links dangle -- they are built from new_path, which
+appends the device name only once.
+
+This is platform independent; amd64 has been shipping the doubled layout since
+15.0. Removing the stray call restores the pre-D52157 single-level tree. The
+surviving call keeps its error check.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014m6xNAWMJF6p7xPeGJKsJQ
+---
+ sys/compat/linsysfs/linsysfs.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/sys/compat/linsysfs/linsysfs.c b/sys/compat/linsysfs/linsysfs.c
+index 5a41c51..44ac472 100644
+--- a/sys/compat/linsysfs/linsysfs.c
++++ b/sys/compat/linsysfs/linsysfs.c
+@@ -298,8 +298,6 @@ linsysfs_run_bus(device_t dev, struct pfs_node *dir, struct pfs_node *scsi,
+ 				    NULL, NULL, NULL, 0);
+ 				if (error != 0)
+ 					goto out;
+-				pfs_create_dir(dir, &dir, device, NULL, NULL,
+-				    NULL, 0);
+ 				pfs_create_file(dir, &cur_file, "vendor",
+ 				    &linsysfs_fill_vendor, NULL, NULL, NULL,
+ 				    PFS_RD);

@@ -1,0 +1,229 @@
+From 0ad48ad7aef898b3b9e5e567948d08def16ec70e Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 9 Sep 2026 14:13:06 -0500
+Subject: [PATCH] linuxkpi: map scatterlist entries individually
+
+linux_dma_map_sg_attrs() created one busdma map on the first S/G entry and
+loaded every entry into it. That cannot work on a platform whose busdma keeps
+a per-map sync list: alloc_dmamap() sizes the list by the tag's nsegments,
+which linux_dma_tag_init() sets to 1, and bounce_bus_dmamap_load_phys() does
+not reset map->sync_count between loads. The second physically discontiguous
+entry hits
+
+	if (map->sync_count == 0 || curaddr != sl_end) {
+		if (++map->sync_count > dmat->common.nsegments)
+			break;
+
+breaks with buflen != 0, and returns EFBIG. arm64 is such a platform; amd64
+does no cache maintenance for DMA and so never noticed.
+
+Measured on a Raspberry Pi 5 (BCM2712, non-coherent device, 16GB, no
+dma-ranges, 36-bit mask so no bouncing): a 1-entry scatterlist maps, and
+2 entries or more do not. Because the caller has no way to tell -- see the
+separate fix for dma_map_sgtable() -- a DRM driver got back a buffer that was
+never mapped and the GPU faulted on it with "write violation, pte invalid".
+
+Give each entry its own map and load one entry into each. struct scatterlist
+already carries a per-entry dma_map field, and each entry is a single
+physically contiguous run, so every map holds exactly one segment and its
+single-slot sync list is enough.
+
+linux_dma_unmap_sg_attrs() has to match, and its nents argument stops being
+__unused: the old whole-table unmap only ever touched sgl->dma_map, so
+leaving it alone would unload the first entry and leak the rest. Callers
+already pass the right count -- dma_unmap_sgtable() passes sgt->nents and
+dma_unmap_sg() passes its nents.
+
+Cost is N bus_dmamap_create() calls per table instead of 1. Correctness first;
+if that ever matters, the alternative is a larger nsegments on the tag, but
+linux_dma_map_phys_common()'s KASSERT(++nseg == 1) leans on the current
+nsegments semantics, so this is the safer shape.
+
+Refs nextbsd-kernel#206, nextbsd-kernel-extensions#72.
+---
+ sys/compat/linuxkpi/common/src/linux_pci.c | 129 ++++++++++++++-------
+ 1 file changed, 87 insertions(+), 42 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/src/linux_pci.c b/sys/compat/linuxkpi/common/src/linux_pci.c
+index e593f92..d1488f1 100644
+--- a/sys/compat/linuxkpi/common/src/linux_pci.c
++++ b/sys/compat/linuxkpi/common/src/linux_pci.c
+@@ -2017,30 +2017,42 @@ linux_dma_map_sg_attrs(struct device *dev, struct scatterlist *sgl, int nents,
+     enum dma_data_direction direction, unsigned long attrs)
+ {
+ 	struct linux_dma_priv *priv;
+-	struct scatterlist *sg;
+-	int i, nseg;
++	struct scatterlist *sg, *sg2;
++	int i, j, nseg;
+ 	bus_dma_segment_t seg;
+ 
+ 	priv = dev->dma_priv;
+ 
+ 	DMA_PRIV_LOCK(priv);
+ 
+-	/* create common DMA map in the first S/G entry */
+-	if (bus_dmamap_create(priv->dmat, 0, &sgl->dma_map) != 0) {
+-		DMA_PRIV_UNLOCK(priv);
+-		return (0);
+-	}
+-
+-	/* load all S/G list entries */
++	/*
++	 * Give every S/G entry its own map, and load exactly one entry into
++	 * each.
++	 *
++	 * A single shared map cannot hold more than one entry on a platform
++	 * whose busdma keeps a per-map sync list. That list is sized by the
++	 * tag's nsegments -- 1, from linux_dma_tag_init() -- and is not reset
++	 * between loads, so the second physically discontiguous entry
++	 * overflows it and _bus_dmamap_load_phys() returns EFBIG. arm64 is
++	 * such a platform. amd64 does no cache maintenance for DMA and so
++	 * never noticed, which is why this went unseen for so long.
++	 *
++	 * struct scatterlist already carries a per-entry dma_map field.
++	 * linux_dma_unmap_sg_attrs() is updated to match, and the two must
++	 * stay symmetric: the old whole-table unmap only ever touched the
++	 * first entry's map.
++	 */
+ 	for_each_sg(sgl, sg, nents, i) {
++		if (bus_dmamap_create(priv->dmat, 0, &sg->dma_map) != 0)
++			goto fail;
++
+ 		nseg = -1;
+-		if (_bus_dmamap_load_phys(priv->dmat, sgl->dma_map,
++		if (_bus_dmamap_load_phys(priv->dmat, sg->dma_map,
+ 		    sg_phys(sg), sg->length, BUS_DMA_NOWAIT,
+ 		    &seg, &nseg) != 0) {
+-			bus_dmamap_unload(priv->dmat, sgl->dma_map);
+-			bus_dmamap_destroy(priv->dmat, sgl->dma_map);
+-			DMA_PRIV_UNLOCK(priv);
+-			return (0);
++			bus_dmamap_unload(priv->dmat, sg->dma_map);
++			bus_dmamap_destroy(priv->dmat, sg->dma_map);
++			goto fail;
+ 		}
+ 		KASSERT(nseg == 0,
+ 		    ("More than one segment (nseg=%d)", nseg + 1));
+@@ -2051,32 +2063,51 @@ linux_dma_map_sg_attrs(struct device *dev, struct scatterlist *sgl, int nents,
+ 	if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) != 0)
+ 		goto skip_sync;
+ 
+-	switch (direction) {
+-	case DMA_BIDIRECTIONAL:
+-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREWRITE);
+-		break;
+-	case DMA_TO_DEVICE:
+-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREREAD);
+-		break;
+-	case DMA_FROM_DEVICE:
+-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREWRITE);
+-		break;
+-	default:
+-		break;
++	for_each_sg(sgl, sg, nents, i) {
++		switch (direction) {
++		case DMA_BIDIRECTIONAL:
++			bus_dmamap_sync(priv->dmat, sg->dma_map,
++			    BUS_DMASYNC_PREWRITE);
++			break;
++		case DMA_TO_DEVICE:
++			bus_dmamap_sync(priv->dmat, sg->dma_map,
++			    BUS_DMASYNC_PREREAD);
++			break;
++		case DMA_FROM_DEVICE:
++			bus_dmamap_sync(priv->dmat, sg->dma_map,
++			    BUS_DMASYNC_PREWRITE);
++			break;
++		default:
++			break;
++		}
+ 	}
+ skip_sync:
+ 
+ 	DMA_PRIV_UNLOCK(priv);
+ 
+ 	return (nents);
++
++fail:
++	/* Undo the entries mapped before the one that failed. */
++	for_each_sg(sgl, sg2, nents, j) {
++		if (j >= i)
++			break;
++		bus_dmamap_unload(priv->dmat, sg2->dma_map);
++		bus_dmamap_destroy(priv->dmat, sg2->dma_map);
++	}
++	DMA_PRIV_UNLOCK(priv);
++
++	return (0);
+ }
+ 
+ void
+ linux_dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sgl,
+-    int nents __unused, enum dma_data_direction direction,
++    int nents, enum dma_data_direction direction,
+     unsigned long attrs)
+ {
+ 	struct linux_dma_priv *priv;
++	struct scatterlist *sg;
++	int i;
+ 
+ 	priv = dev->dma_priv;
+ 
+@@ -2085,24 +2116,38 @@ linux_dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sgl,
+ 	if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) != 0)
+ 		goto skip_sync;
+ 
+-	switch (direction) {
+-	case DMA_BIDIRECTIONAL:
+-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_POSTREAD);
+-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREREAD);
+-		break;
+-	case DMA_TO_DEVICE:
+-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_POSTWRITE);
+-		break;
+-	case DMA_FROM_DEVICE:
+-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_POSTREAD);
+-		break;
+-	default:
+-		break;
++	/*
++	 * Every entry carries its own map now, so sync and tear down all of
++	 * them. nents is no longer unused: it must be the count returned by
++	 * linux_dma_map_sg_attrs(), which is what dma_unmap_sgtable() and
++	 * dma_unmap_sg() already pass.
++	 */
++	for_each_sg(sgl, sg, nents, i) {
++		switch (direction) {
++		case DMA_BIDIRECTIONAL:
++			bus_dmamap_sync(priv->dmat, sg->dma_map,
++			    BUS_DMASYNC_POSTREAD);
++			bus_dmamap_sync(priv->dmat, sg->dma_map,
++			    BUS_DMASYNC_PREREAD);
++			break;
++		case DMA_TO_DEVICE:
++			bus_dmamap_sync(priv->dmat, sg->dma_map,
++			    BUS_DMASYNC_POSTWRITE);
++			break;
++		case DMA_FROM_DEVICE:
++			bus_dmamap_sync(priv->dmat, sg->dma_map,
++			    BUS_DMASYNC_POSTREAD);
++			break;
++		default:
++			break;
++		}
+ 	}
+ skip_sync:
+ 
+-	bus_dmamap_unload(priv->dmat, sgl->dma_map);
+-	bus_dmamap_destroy(priv->dmat, sgl->dma_map);
++	for_each_sg(sgl, sg, nents, i) {
++		bus_dmamap_unload(priv->dmat, sg->dma_map);
++		bus_dmamap_destroy(priv->dmat, sg->dma_map);
++	}
+ 	DMA_PRIV_UNLOCK(priv);
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

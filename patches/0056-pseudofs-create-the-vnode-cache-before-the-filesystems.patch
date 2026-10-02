@@ -1,0 +1,98 @@
+From 3da5cf1109e66ca86e5296bbbc084aaf0eebb44e Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Thu, 10 Sep 2026 22:59:11 -0500
+Subject: [PATCH 1/2] pseudofs: create the vnode cache before the filesystems
+ that use it (#209)
+
+pfs_purge() walks pfs_vncache_hashtbl[] and locks pfs_vncache_mutex. Both are
+set up by pfs_vncache_load(), called from pseudofs' MOD_LOAD handler, which
+DECLARE_MODULE places at SI_SUB_EXEC (0x7400000). Every statically compiled
+pseudofs filesystem registers from VFS_SET() at SI_SUB_VFS (0x4000000) --
+three subsystems earlier -- and vfs_register() calls vfs_init(), and so
+pfs_init(), eagerly at registration time. MODULE_DEPEND() orders kldload, not
+SYSINITs, so it does not cover the compiled-in case.
+
+Any pfs_create_*() failure during a filesystem's pi_init() therefore reaches
+pfs_destroy() -> pfs_purge() with the hash table still NULL and the mutex
+still zeroed. pfs_vncache_hash is 0 at that point too, so the loop runs
+exactly once and reads *(void **)NULL.
+
+Measured on a Raspberry Pi 500+ (BCM2712) with LINSYSFS compiled in. The board
+has two PCIe host bridges, so linsysfs -- which names every node from a
+hardcoded "0000" domain prefix -- renders both root ports as 0000:00:00.0 and
+pfs_add_node() rejects the second:
+
+  pfs_add_node: homonymous siblings: 'pci0000:00/0000:00:00.0' type 2
+  Fatal data abort:
+    far: 0x0000000000000000
+    esr: 0x0000000096000004
+     lr: 0xffff00000043ecec
+    elr: 0xffff000000440180
+  panic: vm_fault failed: 0xffff000000440180 error 1
+  Uptime: 1s
+
+esr 0x96000004 is a level-0 translation fault on a read (WnR=0), far is zero
+exactly, and elr/lr resolve to the SLIST_FIRST(&pfs_vncache_hashtbl[i]) load
+in pfs_purge() called from pfs_destroy(). This is the boot-panic form of
+FreeBSD PR 278234, which D52038/D52157 turned from a pfs_add_node() panic
+into a graceful EEXIST -- graceful only if the teardown path survives.
+
+Moving the module to SI_SUB_VFS/SI_ORDER_FIRST is the fix: SI_ORDER_FIRST
+sorts before VFS_SET's SI_ORDER_MIDDLE at the same subsystem. Everything
+pfs_vncache_load() touches is ready by then -- hashinit() needs SI_SUB_KMEM
+(0x1800000) and maxproc, which init_param2() sets from initarm()/init386()
+before mi_startup() runs any SYSINIT, and EVENTHANDLER_REGISTER() needs
+SI_SUB_EVENTHANDLER (0x1C00000). Shutdown ordering improves as a side effect:
+module_shutdown runs in reverse registration order, so pfs_vncache_unload()
+now happens after its consumers rather than before them. kldload is unchanged.
+
+The NULL check in pfs_purge() is not redundant with the reordering; it states
+the invariant locally and keeps the teardown path safe for any future caller
+that runs earlier still. It has to precede the mtx_lock(), because the mutex
+is uninitialised on exactly the same paths as the table.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014m6xNAWMJF6p7xPeGJKsJQ
+---
+ sys/fs/pseudofs/pseudofs.c         | 10 +++++++++-
+ sys/fs/pseudofs/pseudofs_vncache.c |  8 ++++++++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/sys/fs/pseudofs/pseudofs.c b/sys/fs/pseudofs/pseudofs.c
+index 7a4e674..4151f73 100644
+--- a/sys/fs/pseudofs/pseudofs.c
++++ b/sys/fs/pseudofs/pseudofs.c
+@@ -550,5 +550,13 @@ static moduledata_t pseudofs_data = {
+ 	pfs_modevent,
+ 	NULL
+ };
+-DECLARE_MODULE(pseudofs, pseudofs_data, SI_SUB_EXEC, SI_ORDER_FIRST);
++/*
++ * The vnode cache must exist before any statically compiled pseudofs
++ * filesystem is registered. VFS_SET() declares those at SI_SUB_VFS /
++ * SI_ORDER_MIDDLE and vfs_register() calls pfs_init() eagerly, so a
++ * pfs_create_*() failure there reaches pfs_destroy() -> pfs_purge()
++ * while pfs_vncache_hashtbl is still NULL. MODULE_DEPEND() orders
++ * kldload, not SYSINITs, so it does not help the compiled-in case.
++ */
++DECLARE_MODULE(pseudofs, pseudofs_data, SI_SUB_VFS, SI_ORDER_FIRST);
+ MODULE_VERSION(pseudofs, 1);
+diff --git a/sys/fs/pseudofs/pseudofs_vncache.c b/sys/fs/pseudofs/pseudofs_vncache.c
+index e58aced..34bccc3 100644
+--- a/sys/fs/pseudofs/pseudofs_vncache.c
++++ b/sys/fs/pseudofs/pseudofs_vncache.c
+@@ -303,6 +303,14 @@ pfs_purge(struct pfs_node *pn)
+ 	struct vnode *vnp;
+ 	u_long i, removed;
+ 
++	/*
++	 * Nothing can be cached before pfs_vncache_load() has run, and
++	 * pfs_vncache_mutex is not initialised yet either -- so this test
++	 * has to come before the lock, not after it.
++	 */
++	if (pfs_vncache_hashtbl == NULL)
++		return;
++
+ 	mtx_lock(&pfs_vncache_mutex);
+ restart:
+ 	removed = 0;

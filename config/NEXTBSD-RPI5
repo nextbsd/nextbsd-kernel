@@ -1,0 +1,84 @@
+#
+# NEXTBSD-RPI5 -- Raspberry Pi 5 family (BCM2712 + RP1).
+#
+# Covers the Pi 5 B, the Pi 500 and 500+, and CM5: same SoC, same southbridge,
+# same debug UART at the same address. Nothing in this file is specific to one
+# of them.
+#
+# COVERAGE: only the Pi 500+ has ever been booted. The rest is claimed on
+# shared silicon and a config with no board-specific content in it, which is a
+# good reason to expect it to work and not the same thing as having seen it.
+# A board that is not the 500+ is worth treating as a first boot: read the
+# serial log, do not assume.
+#
+# Identical to NEXTBSD except that it can talk. These boards have no UEFI and
+# no simple-framebuffer node, so serial is the only console.
+#
+# SOCDEV_PA is UART10, the PL011 inside the BCM2712, reached through the 3-pin
+# JST-SH debug connector on the board. Confirmed on the hardware: Linux reports
+# `107d001000.serial: ttyAMA10 ... is a PL011 rev3`, and the serial10 alias
+# resolves to /soc@107c000000/serial@7d001000 -- soc@, not pcie@.
+#
+# This was 0x1c00030000 (RP1 UART0, the 40-pin header) until that connector was
+# found, and moving it is permanent rather than a bring-up convenience. RP1 is
+# a PCIe endpoint, and console attach happens at cninit(), long before any PCIe
+# host bridge has attached -- so the 40-pin UART can never be a boot console on
+# these boards no matter how complete bcm2712-pcie and rp1 become. It can be a
+# late tty; it cannot be the console. It also dies the moment a driver owns the
+# controller, which during the RP1 work makes a working driver look exactly
+# like a dead one. UART10 is in the SoC, is at the same address on every board
+# in the family, and is audible earlier besides: it carries the boot ROM and
+# SDRAM training, which the header never saw.
+#
+# locore.S maps one 2MB device block at SOCDEV_PA and keeps the offset within
+# it, so the exact register address is the right value to give here.
+#
+include NEXTBSD
+
+ident		NEXTBSD-RPI5
+
+options 	SOCDEV_PA=0x107d001000
+options 	EARLY_PRINTF=pl011
+
+# A real console for the whole boot, not just the early window. SOCDEV_PA above
+# only covers printf before cninit(), and socdev_va stops being valid once the
+# early pagetables go. See config/rpi5.env for why each tag is required.
+env		"rpi5.env"
+
+# Turn off the wrong-SoC Broadcom drivers.
+#
+# arm64 GENERIC includes std.broadcom, which sets SOC_BRCM_BCM2837 and
+# SOC_BRCM_BCM2838 -- the Pi 3 and Pi 4 SoCs. This board is BCM2712, which is
+# neither, but the Pi 500 DTB carries compatible strings close enough that
+# those drivers match anyway and then panic on hardware they do not describe.
+#
+# Measured on the board: bcm2835_fbd attaches, asks the VideoCore mailbox for
+# the framebuffer dimensions, and panics one frame down in the ARM-core to
+# VideoCore bus translation, which is a fixed offset on 2837/2838 and a
+# different one on 2712:
+#
+#   bcm2835_mbox_fb_get_w_h -> bcm2835_mbox_property
+#     -> bcm283x_dmabus_peripheral_lowaddr -> bcm283x_armc_to_vcbus -> panic
+#
+# sys/conf/files.arm64 gates both files on exactly these options:
+#   bcm2835_fbd.c   optional vt soc_brcm_bcm2837 fdt | vt soc_brcm_bcm2838 fdt
+#   bcm2835_mbox.c  optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+#
+# so switching them off is the correct fix rather than a workaround: this
+# board wants a SOC_BRCM_BCM2712 of its own (native-boot plan, phase 3), not
+# the Pi 4's.
+nooptions	SOC_BRCM_BCM2837
+nooptions	SOC_BRCM_BCM2838
+
+# ...but do enable this board's own SoC, which gates the PCIe host bridge.
+#
+# Everything useful on these boards is behind PCIe: the NVMe on pcie1, and RP1 --
+# and therefore both USB controllers, and therefore the keyboard -- on pcie2.
+# Without this the kernel reaches mountroot and `?` lists zero disks.
+#
+# The driver is FreeBSD's own bcm2838_pci, extended to match
+# "brcm,bcm2712-pcie" (patches/0013). It has to be compiled in rather than
+# shipped as a kext: route (a) has no loader, so nothing loads a .ko at boot,
+# and a kext delivering PCIe would have to come off a disk that only exists
+# once PCIe works.
+options 	SOC_BRCM_BCM2712
