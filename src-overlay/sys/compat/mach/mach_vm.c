@@ -423,7 +423,8 @@ mach_vm_read(vm_map_t map, mach_vm_address_t addr, mach_vm_size_t size,
 	}
 #endif
 	if ((error = copyout(tbuf, (void *)dstaddr, size)) != 0) {
-		printf("copyout error = %d\n", error);
+		if (mach_debug_enable)
+			printf("copyout error = %d\n", error);
 		free(tbuf, M_MACH_TMP);
 		return (KERN_PROTECTION_FAILURE);
 	}

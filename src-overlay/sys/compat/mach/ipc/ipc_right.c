@@ -1354,7 +1354,15 @@ ipc_right_copyin_check(
  *		KERN_INVALID_RIGHT	Name doesn't denote correct right.
  */
 
-#define ELOG printf("%s:%d bits: %08x\n", __FILE__, __LINE__, bits)
+/*
+ * ELOG is a diagnostic for the right-type checks in ipc_right_copyin().
+ * The invalid-right path is hit on every send to a dead name, so an
+ * unconditional console flood follows any churn (mass daemon death,
+ * OOM). Gate it on the mach.debug_enable sysctl like the rest of the
+ * COMPAT_MACH diagnostics; default off, zero cost in production.
+ * (nextbsd#327)
+ */
+#define ELOG do { if (mach_debug_enable) printf("%s:%d bits: %08x\n", __FILE__, __LINE__, bits); } while (0)
 
 kern_return_t
 ipc_right_copyin(
