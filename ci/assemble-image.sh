@@ -157,6 +157,9 @@ seed_overlays() {
     fi
     cp -R "$SEED_ROOTFS/." "$ROOTFS/"
     [ -f "$ROOTFS/private/etc/master.passwd" ] && chmod 0600 "$ROOTFS/private/etc/master.passwd"
+    # git can't store sub-0644 modes. sudo refuses a sudoers that is not mode
+    # 0440 ("is mode 0644, should be 0440"), as overlays' seed.sh also fixes up.
+    [ -f "$ROOTFS/private/etc/sudoers" ] && chmod 0440 "$ROOTFS/private/etc/sudoers"
     log "seeded /etc from nextbsd-overlays ($SEED_ROOTFS)"
 
     # /etc/os-release, which nextbsd/build.sh writes and this did not. It is the
