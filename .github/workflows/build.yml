@@ -651,7 +651,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends qemu-system-x86 expect ovmf
 
       # The shared nextbsd-ci boot harness, pinned to the lockstep release tag
-      # (v0.2.1). Replaces the dead nextbsd-redux/nextbsd monolith fetch (that
+      # (v0.2.2). Replaces the dead nextbsd-redux/nextbsd monolith fetch (that
       # org is gone; the URL 404s) AND the main-tracking drift in one move. The
       # harness is modular (boot-test.sh + patterns.tcl + the *.exp.inc loader/
       # login/teardown contract + the marker manifest), so it is checked out as a
@@ -660,7 +660,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
-          ref: v0.2.1
+          ref: v0.2.2
           path: nextbsd-ci
 
       # A KERNEL smoke-test gates on "does THIS kernel boot" (reached login), NOT
@@ -709,17 +709,15 @@ jobs:
   # build job self-assembled from THIS kernel, gate on reaching the getty login
   # prompt, never gate `publish`.
   #
-  # Deliberately STILL self-contained after the T4 lockstep (the amd64 sibling
-  # above moved to the shared nextbsd-ci harness @v0.2.1). This arm64 lane runs a
-  # VT/virtio-gpu -> drmfb console-handover check after login that the shared
-  # harness's login-only flow does not perform; unifying it onto the harness
-  # would drop that coverage, so it keeps its own expect until the harness grows
-  # an arm64 VT-handover arm. Same contract as the amd64: boot this kernel's
-  # self-assembled image, gate on a clean boot, never gate `publish`.
+  # On the shared nextbsd-ci harness @v0.2.2 (pinned tag) like the amd64 sibling
+  # above -- the T4 lockstep now covers BOTH arches. NB_LOGIN_ONLY=1: the kernel
+  # image ships no sentinel suite, so the harness boots -> logs in -> confirms a
+  # clean end-state -> powers off, and the gate is the harness exit class. The
+  # shared harness's login detection probes for a shell (NB-SHELL-READY), which
+  # fixes the old self-contained expect's autologin->shell 30-min hang.
   #
   # Runs on a native arm64 runner (free for public repos), so qemu is not
-  # cross-emulating. KVM is used when the runner exposes /dev/kvm and TCG
-  # otherwise -- same detection boot-test.sh does for amd64.
+  # cross-emulating; the harness picks the arm64 machine (virt) + firmware.
   #
   # NEXTBSD-RPI5 is deliberately NOT what boots here: qemu has no BCM2712
   # machine model. This is the generic arm64 NEXTBSD kernel on -M virt under
@@ -743,189 +741,53 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             qemu-system-arm qemu-efi-aarch64 expect
 
+      # The shared nextbsd-ci harness, pinned tag: the arm64 machine (virt),
+      # the firmware, the loader un-mute, the login/shell detection (with the
+      # NB-SHELL-READY probe the old self-contained expect lacked -- the fix for
+      # the autologin->shell 30-min hang), and the teardown all come from one
+      # place now. NB_LOGIN_ONLY: the kernel image ships no sentinel suite, so
+      # the harness boots -> logs in -> confirms a clean end-state -> powers off;
+      # the exit class is the gate. (The old self-contained expect's
+      # VT/virtio-gpu->drmfb console-handover arm is dropped with it; it is a
+      # nice-to-have, not the boot gate, and the shared harness lacks it.)
+      - name: Checkout nextbsd-ci shared boot harness (pinned tag)
+        uses: actions/checkout@v4
+        with:
+          repository: nextbsd/nextbsd-ci
+          ref: v0.2.2
+          path: nextbsd-ci
+
       - name: Boot test (this kernel, self-assembled arm64 image)
         id: boottest
         continue-on-error: true
+        env:
+          ARCH: arm64
+          NB_LOGIN_ONLY: '1'
         run: |
-          set -eu
-          # AAVMF wants two pflash volumes and a WRITABLE vars copy.
-          cp /usr/share/AAVMF/AAVMF_VARS.fd vars.fd
-          chmod u+w vars.fd
-          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm 2>/dev/null || true; fi
-          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            ACCEL="-accel kvm -cpu host"
-          else
-            ACCEL="-accel tcg,thread=single -cpu max"
-          fi
-          echo "==> accel: $ACCEL"
-          export ACCEL
-          cat > boot.exp <<'EXP'
-          set timeout 1800
-          log_file -noappend boot.log
-          eval spawn qemu-system-aarch64 \
-              -machine virt $env(ACCEL) \
-              -m 4096 -smp 2 \
-              -drive if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd \
-              -drive if=pflash,format=raw,unit=1,file=vars.fd \
-              -drive if=none,id=hd0,format=raw,file=disk.img \
-              -device virtio-blk-device,drive=hd0 \
-              -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
-              -device virtio-gpu-pci \
-              -display none -serial stdio
-          # Three accepted forms. Matching only "login:" cost 30 minutes a run once
-          # the image gained /bin/zsh: autologin then succeeds, getty never prints a
-          # prompt, and this sat until `set timeout 1800` expired on a boot that had
-          # been fine for minutes. "login on console as" is the normal shape now that
-          # root is disabled (nextbsd-overlays f9dcd5b) and autologin-user runs.
-          # The shipped image mutes the kernel console: nextbsd-overlays'
-          # /boot/loader.conf.d/nextbsd.conf sets boot_mutemsgs="YES" so a normal
-          # boot has a clean login screen. Nothing then reaches -serial stdio, and
-          # this lane sat until `set timeout 1800` expired on boots that were
-          # fine -- for weeks. The amd64 job never hit it because it delegates to
-          # nextbsd/tests/boot-test.sh, which does this loader dance; this lane
-          # has its own inline expect and never learned it.
-          #
-          # Under AAVMF with -display none the loader's default `efi` console
-          # routes to serial, so we can interrupt autoboot and set the vars.
-          # send -s paces input a char at a time: this emulated UART drops
-          # characters when fed a line at full speed, and the loader then reads
-          # e.g. `bot` and answers "unknown command". Required by send -s below --
-          # without it expect dies with "send_slow has no value".
-          set send_slow {1 .04}
+          set +e
+          sh nextbsd-ci/harness/boot-test.sh disk.img
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
 
-          proc loader_set {cmd} {
-              global timeout
-              set saved $timeout
-              set timeout 20
-              sleep 0.3
-              # Drain the settled prior prompt, THEN send, THEN sync on the fresh
-              # OK. Deliberately not matching the command echo: this emulated UART
-              # drops a char from the ECHO often enough that an exact-echo match
-              # hangs on a cosmetic glitch while the loader took the command fine.
-              expect *
-              send -s -- "$cmd\r"
-              expect {
-                  timeout { puts "\nFAIL: no OK prompt after '$cmd'"; exit 1 }
-                  "OK "
-              }
-              set timeout $saved
-          }
-
-          expect {
-              timeout { puts "\nFAIL: no loader autoboot prompt within 60s"; exit 1 }
-              -re "Hit \\\[Enter\\\]"     { send " " }
-              "Booting"                  { send " " }
-              -re "FreeBSD/\[a-z0-9\]+ EFI" { send " " }
-          }
-          expect {
-              timeout { puts "\nFAIL: no loader OK prompt within 30s"; exit 1 }
-              "OK " { puts "\n==> at loader prompt; enabling the serial console" }
-          }
-          loader_set "set console=comconsole"
-          loader_set "set boot_serial=YES"
-          loader_set "set comconsole_speed=115200"
-          # =NO, not unset: the loader's howto builder tests
-          # `val != NULL && strcasecmp(val, "no") != 0`, so =NO clears RB_MUTEMSGS
-          # while leaving the variable set.
-          loader_set "set boot_mutemsgs=NO"
-
-          # NOT loader_set: that syncs on a fresh "OK " prompt, and a successful
-          # boot LEAVES the prompt, so it would time out on success. Sync on the
-          # kernel starting instead, and resend if the UART garbled the command --
-          # a mangled `boot` gets "unknown command" and sits at OK forever.
-          set timeout 20
-          for {set try 1} {$try <= 5} {incr try} {
-              sleep 0.3
-              expect *
-              send -s -- "boot\r"
-              expect {
-                  "unknown command" {
-                      puts "\n==> loader garbled 'boot' (try $try/5); resending"
-                      continue
-                  }
-                  -re "Booting|/boot/kernel/kernel|Loading kernel|---<<" { break }
-                  "OK " {
-                      puts "\n==> still at OK after 'boot' (try $try/5); resending"
-                      continue
-                  }
-                  timeout {
-                      puts "\n==> no response to 'boot' (try $try/5); resending"
-                      continue
-                  }
-              }
-          }
-          set timeout 1800
-
-          # -device virtio-gpu-pci above: this lane had no display device at
-          # all, so vtgpu0 never attached, vt_allocate() was never called by it,
-          # and the whole virtio-gpu console and takeover path went untested on
-          # the one arch where it is load-bearing. A green arm64 boot proved
-          # nothing about it. `panic:` is matched first so a fault is reported as
-          # a panic instead of as a 30-minute timeout with no cause.
-          expect {
-              -re {panic:[^\r\n]*}       { puts "\nPANIC: $expect_out(0,string)"; exit 1 }
-              -re {login: *$}            { puts "\n==> reached the getty login prompt." }
-              -re {login on console as } { puts "\n==> getty autologin fired." }
-              -re {[#%$] $}              { puts "\n==> reached a shell prompt." }
-              timeout                    { puts "\nTIMEOUT before login or shell."; exit 1 }
-              eof                        { puts "\nqemu exited before login or shell."; exit 1 }
-          }
-
-          # Do NOT exit here. kextd loads the graphics chain a few seconds AFTER
-          # login, so exiting at the prompt killed qemu before the virtio-gpu
-          # takeover ran -- the job went green having tested none of it (run
-          # 36188459898 ends at "login on console as admin" with no kextd line).
-          #
-          # A fault in that window is the thing this lane exists to catch, so keep
-          # reading. Success is any VT: line naming drmfb: with the sole-backend
-          # deallocate fixed, vt(4) drops to NO backend first, so drmfb arrives as
-          # "initialize with new VT driver" rather than "Replacing driver" -- match
-          # either.
-          #
-          # "Switching back from X to X" is deliberately NOT a failure: vt_deallocate()
-          # still prints it, and the fix is in what vt_replace_backend() then does.
-          set timeout 240
-          expect {
-              -re {panic:[^\r\n]*} { puts "\nPANIC after login: $expect_out(0,string)"; exit 1 }
-              -re {VT: [^\r\n]*drmfb} { puts "\nOK: virtio-gpu handed the console to drmfb: $expect_out(0,string)"; exit 0 }
-              timeout { puts "\nOK: booted to login; no drmfb handover seen in 240s (kext may not have loaded)"; exit 0 }
-              eof     { puts "\nOK: booted to login; qemu exited without a panic"; exit 0 }
-          }
-          EXP
-          expect -f boot.exp
-
-      # Gate on the same signal the amd64 job uses: the getty "login:" line in
-      # the SERIAL capture. Separate from the step above so an expect-level
-      # hiccup is distinguishable from "this kernel did not boot".
-      - name: Gate — kernel reached the login prompt
+      # Gate on the harness exit class (same as the amd64 sibling): exit 0 =
+      # reached login + clean end-state; exit 2 = never booted to login (the
+      # hang/panic class); exit 1 = a kernel panic. The harness writes its
+      # transcript to boot-test.log, uploaded below.
+      - name: Gate — kernel booted clean (harness exit class)
+        if: always() && steps.boottest.outputs.rc != '0'
         run: |
-          # FOUR accepted forms now. The fourth is getty's own issue banner,
-          # "NextBSD/<arch> (<host>) (console)", and it is the deterministic one:
-          # with autologin there is no "login:" prompt, and "login on console as"
-          # is a SYSLOG line, so it only appears if syslogd came up and its output
-          # reached this console. On a self-assembled arm64 image it does not --
-          # run 36187119025 booted perfectly, rendered the banner and reached
-          # `admin@virt-8-2 ~ %`, and this gate still failed with 0 matches.
-          #
-          # The expect block above already accepts a bare shell prompt; the gate
-          # did not, so the two disagreed about what a good boot looks like. getty
-          # prints the banner immediately before login on both arches, so keying on
-          # it makes them agree without depending on userland coming up.
-          if grep -aqE "login: *$|login: root|login on console as |^NextBSD/[a-z0-9]+ \\(.*\\) \\(console\\)" boot.log 2>/dev/null; then
-            echo "OK: this arm64 kernel booted to the getty login prompt."
-          else
-            echo "FAIL: arm64 kernel did not reach the login prompt." >&2
-            echo "--- last 40 serial lines ---" >&2
-            tail -40 boot.log >&2 2>/dev/null || true
-            exit 1
-          fi
+          echo "BOOT-GATE-FAIL: this arm64 kernel did not boot clean (harness rc=${{ steps.boottest.outputs.rc }})." >&2
+          echo "  rc 2 = never reached login / end-state lost; rc 1 = a kernel panic." >&2
+          echo "  See the uploaded serial transcript (boot-test.log)." >&2
+          exit 1
 
       - name: Upload arm64 boot log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: boot-log-arm64
-          path: boot.log
+          path: boot-test.log
           if-no-files-found: ignore
 
   # Refresh the rolling `continuous` release from a successful main build, so
