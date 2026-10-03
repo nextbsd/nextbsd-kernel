@@ -650,77 +650,72 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86 expect ovmf
 
-      # Reuse nextbsd's canonical boot test (the on-image /usr/tests/.../run.sh
-      # marker suite drives the actual assertions). Fetched from nextbsd main to
-      # stay in sync (now carries the un-mute/trace-gate/teardown fixes, #375).
-      # TODO(#376): pull this from the shared tests repo once it exists.
-      - name: Fetch nextbsd boot test
-        run: |
-          mkdir -p tests
-          curl -fsSL https://raw.githubusercontent.com/nextbsd-redux/nextbsd/main/tests/boot-test.sh \
-            -o tests/boot-test.sh
-          chmod +x tests/boot-test.sh
+      # The shared nextbsd-ci boot harness, pinned to the lockstep release tag
+      # (v0.2.1). Replaces the dead nextbsd-redux/nextbsd monolith fetch (that
+      # org is gone; the URL 404s) AND the main-tracking drift in one move. The
+      # harness is modular (boot-test.sh + patterns.tcl + the *.exp.inc loader/
+      # login/teardown contract + the marker manifest), so it is checked out as a
+      # tree, not curled file-by-file.
+      - name: Checkout nextbsd-ci shared boot harness (pinned tag)
+        uses: actions/checkout@v4
+        with:
+          repository: nextbsd/nextbsd-ci
+          ref: v0.2.1
+          path: nextbsd-ci
 
-      # A KERNEL smoke-test gates on "does THIS kernel boot" — reaching the getty
-      # login prompt — NOT on the post-login userland marker suite. SYSLOG-RUN /
-      # NOTIFYD-PROC etc. are known-flaky USERLAND races (#369; userland's own CI
-      # runs them boot_soft/non-gating for the same reason). So run the full boot
-      # test but don't let a post-login userland marker fail the kernel job...
+      # A KERNEL smoke-test gates on "does THIS kernel boot" (reached login), NOT
+      # on the flaky post-login userland markers (#369; userland's own CI runs
+      # them non-gating for the same reason). NB_LOGIN_ONLY=1: the harness boots
+      # -> logs in -> confirms a clean end-state -> powers off, and runs NO on-image
+      # suite (the kernel image ships no sentinel suite). It also skips the marker
+      # absence check (the kernel image runs no suite), so a clean login+poweroff
+      # is exit 0. The harness writes its transcript to boot-test.log.
       - name: Boot test (this kernel, self-assembled image)
         id: boottest
         continue-on-error: true
-        run: ./tests/boot-test.sh disk.img
-      # ...then gate on the kernel actually reaching login. A kernel/config change
-      # that breaks boot never prints this line, so this still catches the real
-      # regression this job exists to catch, without red-flaking on #369.
-      - name: Gate — kernel reached the login prompt
+        env:
+          ARCH: amd64
+          NB_LOGIN_ONLY: '1'
         run: |
-          # Gate on the getty "login:" prompt in the SERIAL capture (boot.log).
-          # NOTE: boot-test.sh's own "OK: boot reached the login prompt" is an
-          # expect `puts` — it goes to the job stdout, NOT boot.log — so we grep
-          # the actual serial line the getty prints ("<host> login:"), which is
-          # the deterministic "this kernel booted to multi-user" signal and is
-          # immune to the flaky post-login SYSLOG-RUN marker (#369).
-          # Three accepted forms, because "this kernel reached multi-user with a
-          # console session" has three shapes now:
-          #   "login:"                  a getty prompt (no autologin, or it failed)
-          #   "login: root"             the historical root login
-          #   "login on console as ..." getty autologin fired (nextbsd-overlays
-          #                             f9dcd5b disabled root; autologin-user logs
-          #                             admin in), in which case NO prompt is ever
-          #                             printed and matching only "login:" fails on
-          #                             a perfectly good boot.
-          # Matching only the prompt made this gate fail *because* the image was
-          # fixed: once /bin/zsh existed, autologin succeeded, the serial ended at
-          # the admin zsh prompt, and no "login:" line was ever emitted.
-          if grep -aqE "login: *$|login: root|login on console as |^NextBSD/[a-z0-9]+ \\(.*\\) \\(console\\)" tests/boot.log 2>/dev/null; then
-            echo "OK: this kernel booted to the getty login prompt."
-            echo "--- on-image markers (informational; SYSLOG-RUN etc. flaky, #369) ---"
-            grep -aoE "[A-Z0-9-]+-(OK|FAIL|SKIP)" tests/boot.log | sort | uniq -c || true
-          else
-            echo "FAIL: kernel did not reach the login prompt — real boot regression." >&2
-            echo "--- last 20 serial lines ---" >&2
-            tail -20 tests/boot.log >&2 2>/dev/null || true
-            exit 1
-          fi
+          set +e
+          sh nextbsd-ci/harness/boot-test.sh disk.img
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+      # Gate on the harness exit class, not a hand-rolled serial grep. The harness's
+      # own login detection (login.exp.inc) reaches the same "this kernel booted to
+      # a console session" conclusion the old grep did, and it also catches the #428
+      # class the grep could not (a login that holds for a moment, then the system
+      # resets: end-state lost, exit 2). Login-only runs no suite, so a non-zero rc
+      # is a real kernel regression (panic / never-reached-login / lost end-state),
+      # not a flaky post-login userland marker.
+      - name: Gate — kernel booted clean (harness exit class)
+        if: always() && steps.boottest.outputs.rc != '0'
+        run: |
+          echo "BOOT-GATE-FAIL: this kernel did not boot clean (harness rc=${{ steps.boottest.outputs.rc }})." >&2
+          echo "  rc 2 = never reached login / end-state lost; rc 1 = a kernel panic." >&2
+          echo "  See the uploaded serial transcript (boot-test.log)." >&2
+          exit 1
 
       - name: Upload boot log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: boot-log
-          path: tests/boot.log
+          path: boot-test.log
           if-no-files-found: ignore
 
   # arm64 counterpart of the job above. Same contract: boot the disk.img the
   # build job self-assembled from THIS kernel, gate on reaching the getty login
   # prompt, never gate `publish`.
   #
-  # Self-contained rather than reusing nextbsd-redux/nextbsd's boot-test.sh,
-  # which is hardcoded amd64 (qemu-system-x86_64, -machine q35, -cpu qemu64,
-  # OVMF paths). Making that script arch-aware is the right long-term fix and
-  # belongs with TODO(#376), the move to a shared tests repo; doing it here
-  # would mean a cross-repo merge before this PR could go green.
+  # Deliberately STILL self-contained after the T4 lockstep (the amd64 sibling
+  # above moved to the shared nextbsd-ci harness @v0.2.1). This arm64 lane runs a
+  # VT/virtio-gpu -> drmfb console-handover check after login that the shared
+  # harness's login-only flow does not perform; unifying it onto the harness
+  # would drop that coverage, so it keeps its own expect until the harness grows
+  # an arm64 VT-handover arm. Same contract as the amd64: boot this kernel's
+  # self-assembled image, gate on a clean boot, never gate `publish`.
   #
   # Runs on a native arm64 runner (free for public repos), so qemu is not
   # cross-emulating. KVM is used when the runner exposes /dev/kvm and TCG
