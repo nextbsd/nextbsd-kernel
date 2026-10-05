@@ -523,7 +523,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
-          ref: v0.3.4
+          ref: v0.3.5
           path: nextbsd-ci
 
       - name: Assemble disk.img (this kernel + component continuous artifacts)
@@ -659,8 +659,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends qemu-system-x86 expect ovmf
 
       # The shared nextbsd-ci boot harness, pinned to the lockstep release tag
-      # (v0.3.4). Replaces the dead nextbsd-redux/nextbsd monolith fetch (that
-      # org is gone; the URL 404s) AND the main-tracking drift in one move. The
+      # (v0.3.5). Replaces the dead nextbsd monolith fetch (its old org is
+      # gone; the URL 404s) AND the main-tracking drift in one move. The
       # harness is modular (boot-test.sh + patterns.tcl + the *.exp.inc loader/
       # login/teardown contract + the marker manifest), so it is checked out as a
       # tree, not curled file-by-file.
@@ -668,7 +668,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
-          ref: v0.3.4
+          ref: v0.3.5
           path: nextbsd-ci
 
       # A KERNEL smoke-test gates on "does THIS kernel boot" (reached login), NOT
@@ -717,7 +717,7 @@ jobs:
   # build job self-assembled from THIS kernel, gate on reaching the getty login
   # prompt, never gate `publish`.
   #
-  # On the shared nextbsd-ci harness @v0.3.4 (pinned tag) like the amd64 sibling
+  # On the shared nextbsd-ci harness @v0.3.5 (pinned tag) like the amd64 sibling
   # above -- the T4 lockstep now covers BOTH arches. NB_LOGIN_ONLY=1: the kernel
   # image ships no sentinel suite, so the harness boots -> logs in -> confirms a
   # clean end-state -> powers off, and the gate is the harness exit class. The
@@ -762,7 +762,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
-          ref: v0.3.4
+          ref: v0.3.5
           path: nextbsd-ci
 
       - name: Boot test (this kernel, self-assembled arm64 image)

@@ -2,7 +2,7 @@
 
 NextBSD kernel: source patches (`patches/`), custom config (`config/NEXTBSD`),
 and the build workflow. Builds run inside the
-[`nextbsd-kernel-toolchain`](https://github.com/nextbsd-redux/nextbsd-kernel-toolchain)
+[`nextbsd-kernel-toolchain`](https://github.com/nextbsd/nextbsd-kernel-toolchain)
 container, which already carries the exact baked `/usr/src`.
 
 ## Layout
