@@ -1,0 +1,54 @@
+From 059cfcc25a7a133fbe841d5e9bf7177c00756c15 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 17 Oct 2026 16:20:01 -0500
+Subject: [PATCH] NextBSD: enable unprivileged chroot by default
+
+Ship the NEXTBSD kernel with unprivileged chroot enabled by default: flip
+the initial value of unprivileged_chroot (backing the
+security.bsd.unprivileged_chroot sysctl) from 0 to 1 in
+sys/kern/vfs_syscalls.c.
+
+Needed so a regular (non-root) user can enter the single /compat/linux
+root as themselves -- landing in their home and running their AppImage /
+portable app -- without `sudo chroot` (nextbsd/nextbsd#529). chroot(1)
+already sets no_new_privs with -n; with this default on, a non-root
+process that has set no_new_privs may call chroot(2).
+
+Same reasoning as 0008 (vfs.usermount) and 0009 (elf64 fallback_brand):
+launchd is PID 1 with no rc.d, so /etc/sysctl.conf is never read, and the
+kernel default is the only persistent mechanism.
+
+The sysctl stays plain CTLFLAG_RW (upstream), rather than 0008's RWTUN:
+the compile-time default is 1, so it is on from boot with no config; an
+admin who wants it off runs `sysctl security.bsd.unprivileged_chroot=0`
+at runtime. There is no persistent loader.conf off-switch without RWTUN;
+that is accepted here.
+
+Safety: chroot(2) is view-confinement, not permission-confinement -- the
+process still needs the DAC rights to touch anything -- and the call is
+additionally gated on PROC_NO_NEW_PRIVS (vfs_syscalls.c:989), which blocks
+privilege escalation via setuid. The intended use is a user jailing
+themselves into /compat/linux; the no_new_privs gate is what makes the
+global default acceptable.
+
+Refs nextbsd/nextbsd#529. Carried out-of-tree for NextBSD.
+---
+ sys/kern/vfs_syscalls.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sys/kern/vfs_syscalls.c b/sys/kern/vfs_syscalls.c
+index 0c4eeb584..8f467593c 100644
+--- a/sys/kern/vfs_syscalls.c
++++ b/sys/kern/vfs_syscalls.c
+@@ -964,7 +964,7 @@ kern_chdir(struct thread *td, const char *path, enum uio_seg pathseg)
+ 	return (0);
+ }
+ 
+-static int unprivileged_chroot = 0;
++static int unprivileged_chroot = 1;
+ SYSCTL_INT(_security_bsd, OID_AUTO, unprivileged_chroot, CTLFLAG_RW,
+     &unprivileged_chroot, 0,
+     "Unprivileged processes can use chroot(2)");
+-- 
+2.47.3
+

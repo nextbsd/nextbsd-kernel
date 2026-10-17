@@ -49,3 +49,4 @@
 0056-pseudofs-create-the-vnode-cache-before-the-filesystems.patch
 0057-linsysfs-drop-the-duplicated-pfs_create_dir.patch
 0058-vt-drop-to-no-backend-when-there-is-nothing-to-downgrade-to.patch
+0059-NextBSD-enable-unprivileged-chroot-by-default.patch
