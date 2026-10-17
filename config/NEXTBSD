@@ -253,3 +253,32 @@ device		snd_uaudio
 # put a virtio-sound device on the bus here anyway (net, gpu, block, console
 # and rng are the only virtio functions present). HDA is the supported path.
 device		snd_hda
+
+# /dev/ptmx for the Linux ABI (#530). New ptys fail in /compat/linux -- zsh zpty,
+# in-chroot script/expect/emacs/python-pty, apt's opq log -- while inherited
+# session ptys work. The gap is one device node, not a missing subsystem:
+#
+#   The pty *implementation* is the pts driver (kern/tty_pts.c, `standard` --
+#   always built) and is already fully Linux-ready: PTS_COMPAT/PTS_LINUX/
+#   PTS_EXTERNAL are all defined, so it has TIOCGPTN, pts_alloc/
+#   pts_alloc_external and the pts/<N> slaves (major 136). BSD apps allocate
+#   ptys via the posix_openpt *syscall* (sys_posix_openpt, tty_pts.c:835) and
+#   never touch /dev/ptmx -- which is exactly why stock GENERIC omits the node.
+#
+#   But glibc's posix_openpt is open("/dev/ptmx") *by path*: Linux has no such
+#   syscall; /dev/ptmx is a magic node glibc requires to exist. The node comes
+#   from dev/pty/pty.c, which is `optional pty` -- and no config enables it
+#   (absent from GENERIC, was absent here) -- so the node never exists. The
+#   linux devfs is a second devfs instance launchctl mounts at $emul/dev; devfs's
+#   lazy population puts a built-in ptmx cdev into it with no linuxulator code,
+#   so the fix is the node, not a linuxulator shim.
+#
+#   Built-in (`device`, not `module` pty) for the same reason as every entry
+#   above -- NextBSD ships no /boot/kernel .ko tree, so a module would be absent
+#   on a shipped image -- plus built-in means the ptmx cdev exists at boot,
+#   *before* launchctl mounts the linux devfs, so population ordering is clean.
+#   dev/pty/pty.c is MI (sys/conf/files:2802) -- one line covers amd64, arm64
+#   and NEXTBSD-RPI5 (which includes NEXTBSD). Purely additive: it only adds the
+#   /dev/ptmx and /dev/ptyXX nodes. Design: the nextbsd-kernel wiki,
+#   "Linuxulator ptys (ptmx / devpts)".
+device		pty
