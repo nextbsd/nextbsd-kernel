@@ -1,0 +1,147 @@
+From fa597851c777086459e9d0189809dec020e7cde4 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sun, 18 Oct 2026 03:40:02 -0500
+Subject: [PATCH] temp: escalation (fixed)
+
+---
+ sys/kern/vfs_syscalls.c | 117 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 116 insertions(+), 1 deletion(-)
+
+diff --git a/sys/kern/vfs_syscalls.c b/sys/kern/vfs_syscalls.c
+index 8f467593c..1ab016926 100644
+--- a/sys/kern/vfs_syscalls.c
++++ b/sys/kern/vfs_syscalls.c
+@@ -969,6 +969,120 @@ SYSCTL_INT(_security_bsd, OID_AUTO, unprivileged_chroot, CTLFLAG_RW,
+     &unprivileged_chroot, 0,
+     "Unprivileged processes can use chroot(2)");
+ 
++/*
++ * security.bsd.unprivileged_chroot_escalate: a whitespace/comma-separated list
++ * of group ids (gids). A non-root process that is a member of any listed group
++ * may call chroot(2) WITHOUT PROC_NO_NEW_PRIVS, and therefore may still use
++ * setuid(2) inside the new root (e.g. `sudo` in /compat/linux). Members of
++ * these groups are already root-capable on the host (wheel, or a
++ * DirectoryServices admin group), so this grants no new privilege; every other
++ * non-privileged process still requires PROC_NO_NEW_PRIVS and stays contained.
++ *
++ * The default is "0" (the wheel/root group) so it works from boot with no
++ * config file: launchd is PID 1 on NextBSD and never reads /etc/sysctl.conf or
++ * loader.conf, so a kernel default is the only persistent mechanism (same
++ * pattern as 0008 vfs.usermount and the unprivileged_chroot default above). A
++ * box whose privileged group is not wheel (e.g. a DirectoryServices admin
++ * group) adds that gid, e.g. "0 5000".
++ */
++#define UNPRIV_CHROOT_ESCALATE_BUFLEN	128
++#define UNPRIV_CHROOT_ESCALATE_MAXGIDS	16
++static char unpriv_chroot_escalate_str[UNPRIV_CHROOT_ESCALATE_BUFLEN] = "0";
++static struct mtx unpriv_chroot_escalate_mtx;
++MTX_SYSINIT(unpriv_chroot_escalate, &unpriv_chroot_escalate_mtx,
++    "unpriv_chroot_escalate_mtx", MTX_DEF);
++
++/*
++ * True if the process's primary or supplementary group is in the
++ * security.bsd.unprivileged_chroot_escalate list. The gid list is read under
++ * its own mutex (a sysctl write can race with this read); the group set is
++ * taken from td->td_ucred, lockless (see body).
++ */
++static boolean_t
++unpriv_chroot_escalated(struct thread *td)
++{
++	struct ucred *cred;
++	gid_t allowed[UNPRIV_CHROOT_ESCALATE_MAXGIDS];
++	char s[UNPRIV_CHROOT_ESCALATE_BUFLEN];
++	char *cp;
++	int na = 0, i, j;
++	boolean_t found = FALSE;
++
++	mtx_lock(&unpriv_chroot_escalate_mtx);
++	strlcpy(s, unpriv_chroot_escalate_str, sizeof(s));
++	mtx_unlock(&unpriv_chroot_escalate_mtx);
++
++	/*
++	 * Split s on whitespace/comma by hand: strtok_r() is
++	 * __POSIX_VISIBLE-gated and unavailable in the kernel. Walking the
++	 * local buffer is reentrant/MP-safe.
++	 */
++	for (cp = s; *cp != '\0' && na < UNPRIV_CHROOT_ESCALATE_MAXGIDS; ) {
++		gid_t g = 0;
++		int nd = 0;
++
++		while (*cp == ' ' || *cp == '\t' || *cp == ',')
++			cp++;
++		if (*cp == '\0')
++			break;
++		while (*cp >= '0' && *cp <= '9') {
++			g = g * 10 + (gid_t)(*cp - '0');
++			cp++;
++			nd++;
++		}
++		if (nd == 0)
++			cp++;   /* defensive: skip a non-digit char */
++		else
++			allowed[na++] = g;
++	}
++	if (na == 0)
++		return (FALSE);
++
++	/*
++	 * td->td_ucred is this thread's own reference-counted credential,
++	 * stable for the duration of the syscall; read it lockless the way
++	 * sys_getgroups() does. kern_chroot() holds a vnode lock here, and
++	 * the proc lock must not be taken under a vnode lock. A non-privileged
++	 * process cannot setgroups() itself into a listed group, so the
++	 * residual read race cannot grant an escalation it does not already
++	 * hold (and setuid consumers such as sudo re-check groups).
++	 */
++	cred = td->td_ucred;
++	for (j = 0; j < na && !found; j++) {
++		if (cred->cr_gid == allowed[j]) {
++			found = TRUE;
++			break;
++		}
++		for (i = 0; i < cred->cr_ngroups; i++) {
++			if (cred->cr_groups[i] == allowed[j]) {
++				found = TRUE;
++				break;
++			}
++		}
++	}
++	return (found);
++}
++
++static int
++unpriv_chroot_escalate(SYSCTL_HANDLER_ARGS)
++{
++	char s[sizeof(unpriv_chroot_escalate_str)];
++	int error;
++
++	mtx_lock(&unpriv_chroot_escalate_mtx);
++	strlcpy(s, unpriv_chroot_escalate_str, sizeof(s));
++	error = sysctl_handle_string(oidp, s, sizeof(s), req);
++	if (error == 0 && req->newptr != NULL)
++		strlcpy(unpriv_chroot_escalate_str, s,
++		    sizeof(unpriv_chroot_escalate_str));
++	mtx_unlock(&unpriv_chroot_escalate_mtx);
++	return (error);
++}
++SYSCTL_PROC(_security_bsd, OID_AUTO, unprivileged_chroot_escalate,
++    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
++    unpriv_chroot_escalate, "A",
++    "gids whose members may chroot(2) without no_new_privs");
++
+ /*
+  * Takes locked vnode, unlocks it before returning.
+  */
+@@ -986,7 +1100,8 @@ kern_chroot(struct thread *td, struct vnode *vp)
+ 		    "security.bsd.unprivileged_chroot sysctl not enabled");
+ 			goto e_vunlock;
+ 		}
+-		if ((p->p_flag2 & P2_NO_NEW_PRIVS) == 0) {
++		if ((p->p_flag2 & P2_NO_NEW_PRIVS) == 0 &&
++		    !unpriv_chroot_escalated(td)) {
+ 			error = EXTERROR(EPERM,
+ 			    "PROC_NO_NEW_PRIVS not enabled");
+ 			goto e_vunlock;
+-- 
+2.47.3
+
