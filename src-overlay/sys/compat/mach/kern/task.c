@@ -100,6 +100,10 @@
 #include <sys/param.h>
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
+#include <sys/proc.h>
+#include <sys/sx.h>
+#include <sys/sysctl.h>
+#include <sys/sysent.h>
 #include <sys/mach/vm_types.h>
 
 #include <sys/mach/task_info.h>
@@ -233,7 +237,13 @@ task_init_internal(
 void
 task_free( register task_t	task )
 {
-	/* tasks are tied to proc structures so should only be freed if proc goes away */
+	/*
+	 * Never freed. The task struct belongs to the proc struct, which is
+	 * type-stable and reused by later processes; per-process state is torn
+	 * down by mach_task_exit() and rebuilt by mach_task_recycle() instead
+	 * (see the lifecycle comment above mach_task_init). The code below is
+	 * the original Mach free path and is unreachable.
+	 */
 	task_unlock(task);
 	return;
 	/*
@@ -1086,7 +1096,159 @@ task_synchronizer_destroy_all(task_t task)
 	}
 }
 
+/*
+ * Mach task lifecycle (nextbsd-kernel#266).
+ *
+ * A task is allocated once per proc *struct*, not once per process. It hangs
+ * off p_machdata, an alias of p_emuldata (compat_shim.h), which lies outside
+ * the parts of struct proc that fork1() zeroes or copies, and struct proc is
+ * type-stable UMA memory. A reused proc struct therefore still carries the
+ * previous owner's task. The struct is kept; its per-process state is not:
+ *
+ *  - mach_task_alloc() creates it the first time a process needs one (the
+ *    fork hook, or mach_task_init_lazy() on the first Mach call);
+ *  - mach_task_exit() tears it down on process_exit: the task port loses its
+ *    kobject, every special-port right is released and the space destroyed.
+ *    itk_self == IP_NULL marks the task terminated;
+ *  - mach_task_recycle() rebuilds it for the next owner: always at fork,
+ *    before anything is inherited, and in mach_task_init_lazy() if a
+ *    terminated task is found.
+ *
+ * A child never gets anything from its parent but itk_bootstrap.
+ *
+ * Linux-ABI processes are skipped throughout: their p_emuldata is a struct
+ * linux_pemuldata, not a task. When the Linux layer takes over a slot that
+ * still holds a dead task, that struct is leaked rather than freed (a
+ * reference to it may still be in flight) and counted in mach.task_orphaned.
+ *
+ * mach_task_init() itself is the original process_init handler. It is not
+ * registered (see task_sysinit).
+ */
 static long task_uniqueid;
+
+SYSCTL_DECL(_mach);
+static u_long mach_task_orphaned;
+SYSCTL_ULONG(_mach, OID_AUTO, task_orphaned, CTLFLAG_RD,
+    &mach_task_orphaned, 0,
+    "dead task structs leaked when the Linux ABI took over p_emuldata");
+
+/* Serialises the (rare) lazy recycle of a terminated task by a live process. */
+static struct sx mach_task_recycle_sx;
+SX_SYSINIT(mach_task_recycle, &mach_task_recycle_sx, "mach task recycle");
+
+/*
+ * Give a new or just-cleared task the per-process state of p: a new empty
+ * space and task port, the TASK_NULL-parent special ports, a new unique id,
+ * and p's audit token.
+ */
+static void
+mach_task_setup(task_t task, struct proc *p)
+{
+
+	task->itk_p = p;
+	queue_init(&task->semaphore_list);
+	task_create_internal(task);
+	task_init_internal(TASK_NULL, task);
+	/* Task #39: task_init_internal(TASK_NULL, ...) leaves
+	 * KERNEL_AUDIT_TOKEN, breaking any MIG call whose handler keys on
+	 * audit_token.val[5]. Stamp p's PID and creds. */
+	set_security_token(task);
+	task->itk_uniqueid = atomic_fetchadd_long(&task_uniqueid, 1) + 1;
+}
+
+static task_t
+mach_task_alloc(struct proc *p, int flags)
+{
+	task_t task;
+
+	task = uma_zalloc(task_zone, flags | M_ZERO);
+	if (task == NULL)
+		return (NULL);
+	mach_mutex_init(&task->lock, "ETAP_THREAD_TASK_NEW");
+	mach_mutex_init(&task->itk_lock_data, "ETAP_THREAD_TASK_ITK");
+	mach_task_setup(task, p);
+	return (task);
+}
+
+/*
+ * mach_task_exit — tear down a task's per-process state.
+ *
+ * Runs on process_exit after the names have been closed (ipc_entry.c), and
+ * defensively before any reuse. The struct stays attached to its proc
+ * struct. Idempotent: a terminated task (itk_self == IP_NULL) is left alone.
+ */
+void
+mach_task_exit(task_t task)
+{
+
+	if (task == TASK_NULL || task->itk_self == IP_NULL)
+		return;
+	task_synchronizer_destroy_all(task);
+	ipc_task_terminate(task);
+}
+
+/*
+ * mach_task_recycle — make a task left behind by a previous owner of the
+ * proc struct into a fresh task for p.
+ */
+static void
+mach_task_recycle(task_t task, struct proc *p)
+{
+	ipc_space_t space;
+
+	mach_task_exit(task);
+
+	/* Drop the reference ipc_space_destroy() leaves for the task. */
+	space = task->itk_space;
+	task->itk_space = IS_NULL;
+	if (space != IS_NULL)
+		is_release(space);
+
+	/*
+	 * Clear what belonged to the previous owner. The two mutexes are left
+	 * alone: they were initialised when the struct was allocated and are
+	 * not held here.
+	 */
+	task->ref_count = 0;
+	task->active = FALSE;
+	task->kernel_loaded = FALSE;
+	task->itk_uniqueid = 0;
+	task->itk_puniqueid = 0;
+	/* exc_actions[] through itk_registered[]: the IPC port slots. */
+	bzero(&task->exc_actions[0], offsetof(struct mach_task, itk_p) -
+	    offsetof(struct mach_task, exc_actions));
+	task->thr_act_count = 0;
+	task->res_act_count = 0;
+	task->priority = 0;
+	task->max_priority = 0;
+	task->sched_data = 0;
+	task->policy = 0;
+	task->processor_set = NULL;
+	bzero(&task->sec_token, sizeof(task->sec_token));
+	bzero(&task->audit_token, sizeof(task->audit_token));
+	task->semaphores_owned = 0;
+	task->messages_received = 0;
+
+	mach_task_setup(task, p);
+}
+
+/*
+ * The Linux layer is about to overwrite p's p_emuldata. Anything there now
+ * is a dead task left by the previous owner of the proc struct: terminate it
+ * (defensive; exit already did) and leak it.
+ */
+static void
+mach_task_orphan(struct proc *p)
+{
+	task_t task;
+
+	task = p->p_machdata;
+	if (task == TASK_NULL)
+		return;
+	mach_task_exit(task);
+	p->p_machdata = NULL;
+	atomic_add_long(&mach_task_orphaned, 1);
+}
 
 static void
 mach_task_init(void *arg __unused, struct proc *p)
@@ -1115,7 +1277,10 @@ mach_task_init(void *arg __unused, struct proc *p)
  * Called by the wired Mach syscall wrappers when p_machdata == NULL —
  * i.e. for any process that pre-existed mach.ko's load (the eventhandler
  * couldn't have run for them) or any process whose Mach state was torn
- * down. Idempotent: if p_machdata is already set, returns 0 immediately.
+ * down. If p_machdata is already set it returns 0, after rebuilding the
+ * task first if it is terminated (nextbsd-kernel#266): a terminated task
+ * carries nobody's space, and must not hand out a stale bootstrap port or
+ * audit token.
  *
  * Concurrency: two threads in the same process racing through the
  * wrappers will both reach here with p_machdata == NULL. Both allocate
@@ -1131,23 +1296,21 @@ mach_task_init_lazy(struct proc *p)
 {
 	task_t task;
 
-	if (p->p_machdata != NULL)
+	task = p->p_machdata;
+	if (task != NULL) {
+		if (SV_PROC_ABI(p) == SV_ABI_FREEBSD &&
+		    task->itk_self == IP_NULL) {
+			sx_xlock(&mach_task_recycle_sx);
+			if (task->itk_self == IP_NULL)
+				mach_task_recycle(task, p);
+			sx_xunlock(&mach_task_recycle_sx);
+		}
 		return (0);
+	}
 
-	task = uma_zalloc(task_zone, M_NOWAIT | M_ZERO);
+	task = mach_task_alloc(p, M_NOWAIT);
 	if (task == NULL)
 		return (ENOMEM);
-	task->itk_p = p;
-	mach_mutex_init(&task->lock, "ETAP_THREAD_TASK_NEW");
-	mach_mutex_init(&task->itk_lock_data, "ETAP_THREAD_TASK_ITK");
-	queue_init(&task->semaphore_list);
-	task_create_internal(task);
-	task_init_internal(TASK_NULL, task);
-	/* Task #39: same audit_token fix as mach_task_fork_bsport — without
-	 * this, lazy-initialized tasks (pre-existing processes that came up
-	 * before mach.ko loaded) carry KERNEL_AUDIT_TOKEN, breaking any
-	 * MIG call whose handler keys on audit_token.val[5]. */
-	set_security_token(task);
 
 	if (atomic_cmpset_ptr((volatile uintptr_t *)&p->p_machdata,
 	    (uintptr_t)NULL, (uintptr_t)task))
@@ -1232,6 +1395,9 @@ uma_task_fini(void *_thread, int a)
  * non-NULL itk_bootstrap, give the child a fresh task with that
  * bootstrap port pre-set. Does NOT call task_init_internal (which is
  * what panicked in 2026-05-11). Threads are still lazy.
+ *
+ * It also resets any task the child's proc struct still carries from a
+ * previous owner, whatever the parent has (nextbsd-kernel#266).
  */
 static eventhandler_tag mach_fork_eh_tag;
 
@@ -1239,9 +1405,31 @@ static void
 mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
     int flags __unused)
 {
-	task_t parent_task = p1->p_machdata;
+	task_t parent_task;
 	task_t child_task;
 
+	/*
+	 * nextbsd-kernel#266: p2 is PRS_NEW, so anything already in its
+	 * p_machdata was left there by the previous owner of the proc struct:
+	 * that process's space, task port and special ports. Never reuse it.
+	 *
+	 * A Linux parent's child gets its p_emuldata from linux_proc_init()
+	 * after this hook returns; the dead task is orphaned.
+	 */
+	if (SV_PROC_ABI(p1) != SV_ABI_FREEBSD) {
+		mach_task_orphan(p2);
+		return;
+	}
+
+	/*
+	 * Otherwise reset it now, before the parent checks below, so the child
+	 * starts with a fresh space and task port even when there is nothing
+	 * to inherit.
+	 */
+	if (p2->p_machdata != NULL)
+		mach_task_recycle(p2->p_machdata, p2);
+
+	parent_task = p1->p_machdata;
 	if (mach_debug_enable)
 		printf("[T39-fork] p1=%s(%d) -> p2=%s(%d) parent_task=%p "
 		    "itk_bootstrap=%p\n",
@@ -1285,31 +1473,19 @@ mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
 
 	/* Child should have p_machdata set up the same way mach_task_init_lazy
 	 * does on first syscall. We pre-create it here so the bootstrap port
-	 * is available immediately. If the child already has a task (race),
-	 * use the existing one. */
+	 * is available immediately. It may already be there, freshly recycled
+	 * above. */
 	if (p2->p_machdata == NULL) {
-		child_task = uma_zalloc(task_zone, M_NOWAIT | M_ZERO);
-		if (child_task == NULL)
-			return; /* OOM; fall back to no inheritance */
-		child_task->itk_p = p2;
-		mach_mutex_init(&child_task->lock, "ETAP_THREAD_TASK_NEW");
-		mach_mutex_init(&child_task->itk_lock_data, "ETAP_THREAD_TASK_ITK");
-		queue_init(&child_task->semaphore_list);
-		task_create_internal(child_task);
 		/* TASK_NULL parent — full inheritance is what tripped the
 		 * earlier panic. Just init the empty task, then patch in
 		 * the bootstrap port below. */
-		task_init_internal(TASK_NULL, child_task);
-
-		if (!atomic_cmpset_ptr((volatile uintptr_t *)&p2->p_machdata,
-		    (uintptr_t)NULL, (uintptr_t)child_task)) {
-			/* lost race; leak our task, fall through to use the
-			 * winner */
-			child_task = p2->p_machdata;
-		}
-	} else {
-		child_task = p2->p_machdata;
+		child_task = mach_task_alloc(p2, M_NOWAIT);
+		if (child_task == NULL)
+			return; /* OOM; fall back to no inheritance */
+		p2->p_machdata = child_task;
 	}
+	child_task = p2->p_machdata;
+	child_task->itk_puniqueid = parent_task->itk_uniqueid;
 
 	/* Task #39: task_init_internal(TASK_NULL, ...) above leaves
 	 * audit_token = KERNEL_AUDIT_TOKEN (val[5]=0). Without this,

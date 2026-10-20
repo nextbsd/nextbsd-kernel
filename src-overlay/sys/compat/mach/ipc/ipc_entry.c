@@ -128,6 +128,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/fcntl.h>
 #include <sys/kernel.h>
 #include <sys/syscallsubr.h>
+#include <sys/sysent.h>
 #include <sys/stat.h>
 #include <sys/syslog.h>
 #include <sys/user.h>
@@ -147,6 +148,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/mach/ipc/ipc_table.h>
 #include <sys/mach/ipc/ipc_port.h>
 #include <sys/mach/ipc/ipc_pset.h>
+#include <sys/mach/task.h>
 #include <sys/mach/thread.h>
 
 #include <security/audit/audit.h>
@@ -870,6 +872,20 @@ ipc_entry_list_close(void *arg __unused, struct proc *p)
 	}
 }
 
+/*
+ * process_exit: close the names, then tear the task down
+ * (nextbsd-kernel#266). The order matters: mach_task_exit() will not destroy
+ * a space that still has entries linked into it, and those only go away as
+ * their fds are closed above.
+ */
+static void
+ipc_entry_exit_hook(void *arg, struct proc *p)
+{
+
+	ipc_entry_list_close(arg, p);
+	if (p->p_machdata != NULL && SV_PROC_ABI(p) == SV_ABI_FREEBSD)
+		mach_task_exit(p->p_machdata);
+}
 
 static void
 ipc_entry_sysinit(void *arg __unused)
@@ -884,7 +900,7 @@ ipc_entry_sysinit(void *arg __unused)
 	 * the original Phase B bisect is guarded inside
 	 * ipc_entry_list_close (the p_machdata == NULL early return).
 	 */
-	EVENTHANDLER_REGISTER(process_exit, ipc_entry_list_close, NULL, EVENTHANDLER_PRI_ANY);
+	EVENTHANDLER_REGISTER(process_exit, ipc_entry_exit_hook, NULL, EVENTHANDLER_PRI_ANY);
 	EVENTHANDLER_REGISTER(process_exec, ipc_entry_list_close, NULL, EVENTHANDLER_PRI_ANY);
 }
 

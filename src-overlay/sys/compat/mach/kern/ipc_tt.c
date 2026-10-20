@@ -256,6 +256,39 @@ ipc_task_disable(
 }
 
 /*
+ * Release one send right held in a task special-port slot and clear the
+ * slot.
+ */
+static void
+ipc_task_release_send(ipc_port_t *portp)
+{
+
+	if (IP_VALID(*portp))
+		ipc_port_release_send(*portp);
+	*portp = IP_NULL;
+}
+
+/*
+ * True when no entry is linked into the space any more, neither on the
+ * per-space entry list nor in the reverse (object -> entry) hash.
+ */
+static boolean_t
+ipc_space_is_empty(ipc_space_t space)
+{
+	ipc_entry_num_t i;
+
+	if (!LIST_EMPTY(&space->is_entry_list))
+		return (FALSE);
+	if (space->is_reverse_hash != NULL)
+		for (i = 0; i < space->is_reverse_size; i++)
+			if (space->is_reverse_hash[i] != NULL)
+				return (FALSE);
+	return (TRUE);
+}
+
+static int ipc_task_space_leak_logged;
+
+/*
  *	Routine:	ipc_task_terminate
  *	Purpose:
  *		Clean up and destroy a task's IPC state.
@@ -280,30 +313,56 @@ ipc_task_terminate(
 		return;
 	}
 
+	/*
+	 * Detach the task from its port first, so a send right held anywhere
+	 * else stops resolving to this task now rather than whenever the port
+	 * is finally freed (ipc_task_disable, inlined under the same lock).
+	 */
+	ipc_kobject_set(kport, IKO_NULL, IKOT_NONE);
 	task->itk_self = IP_NULL;
 	itk_unlock(task);
 
-	/* release the naked send rights */
+	/*
+	 * Release the naked send rights, and NULL each pointer as it goes:
+	 * the task struct outlives this call (it is tied to the proc struct,
+	 * nextbsd-kernel#266), and a pointer left behind here would dangle
+	 * into whoever looks at the slot next. itk_self == IP_NULL above is
+	 * the "terminated" marker.
+	 */
 
-	if (IP_VALID(task->itk_sself))
-		ipc_port_release_send(task->itk_sself);
+	ipc_task_release_send(&task->itk_sself);
 
-	for (i = FIRST_EXCEPTION; i < EXC_TYPES_COUNT; i++) {
-		if (IP_VALID(task->exc_actions[i].port)) {
-			ipc_port_release_send(task->exc_actions[i].port);
-		}
-	}/* for */
-	if (IP_VALID(task->itk_bootstrap))
-		ipc_port_release_send(task->itk_bootstrap);
+	for (i = FIRST_EXCEPTION; i < EXC_TYPES_COUNT; i++)
+		ipc_task_release_send(&task->exc_actions[i].port);
+	ipc_task_release_send(&task->itk_host);
+	ipc_task_release_send(&task->itk_bootstrap);
+	ipc_task_release_send(&task->itk_seatbelt);
+	ipc_task_release_send(&task->itk_task_access);
+	ipc_task_release_send(&task->itk_debug_control);
 
 	for (i = 0; i < TASK_PORT_REGISTER_MAX; i++)
-		if (IP_VALID(task->itk_registered[i]))
-			ipc_port_release_send(task->itk_registered[i]);
+		ipc_task_release_send(&task->itk_registered[i]);
 
-	/* destroy the space, leaving just a reference for it */
+	/*
+	 * Destroy the space, leaving just a reference for it.
+	 *
+	 * ipc_space_destroy() walks the reverse hash and cleans every right
+	 * it still finds. At exit the names were already closed through their
+	 * fds (ipc_entry_list_close), which freed the entries, so anything
+	 * still linked here would be a use-after-free. Refuse and leak the
+	 * space instead; the task stays terminated either way.
+	 */
 
-	if (!task->kernel_loaded)
-		ipc_space_destroy(task->itk_space);
+	if (!task->kernel_loaded && task->itk_space != IS_NULL) {
+		if (ipc_space_is_empty(task->itk_space))
+			ipc_space_destroy(task->itk_space);
+		else if (!ipc_task_space_leak_logged) {
+			ipc_task_space_leak_logged = 1;
+			log(LOG_WARNING, "mach: task %p terminated with a "
+			    "non-empty ipc space %p; leaking the space\n",
+			    task, task->itk_space);
+		}
+	}
 
 	/* destroy the kernel port */
 

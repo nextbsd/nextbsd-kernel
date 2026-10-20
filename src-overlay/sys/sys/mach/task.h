@@ -377,6 +377,12 @@ extern void		task_unfreeze(
 
 extern void		consider_task_collect(void);
 
+struct proc;
+
+/* Tear down a task's per-process state at exit (nextbsd-kernel#266). */
+extern void		mach_task_exit(
+				task_t	task);
+
 extern task_t		kernel_task;
 
 #endif	/* _KERN_TASK_H_ */
