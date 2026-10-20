@@ -228,19 +228,6 @@ extern void ipc_entry_dealloc(
 	mach_port_name_t	name,
 	ipc_entry_t	entry);
 
-extern void ipc_entry_file_destroy(
-	ipc_object_t objectp);
-	
-kern_return_t ipc_entry_file_to_port(
-	ipc_space_t space,
-	mach_port_name_t name,
-	ipc_object_t *objectp);
-
-kern_return_t ipc_entry_port_to_file(
-	ipc_space_t space,
-	mach_port_name_t *namep,
-	ipc_object_t object);
-
 void ipc_entry_close(
 	ipc_space_t space,
 	mach_port_name_t name);
