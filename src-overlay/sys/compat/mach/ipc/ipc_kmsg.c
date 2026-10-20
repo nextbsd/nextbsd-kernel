@@ -642,12 +642,11 @@ ipc_kmsg_clean_body(
 		if (dsc->size == 0) {
 		    assert(dsc->address == (void *) 0);
 		} else {
-		    if (dsc->copy == MACH_MSG_PHYSICAL_COPY &&
-			    dsc->size < MSG_OOL_SIZE_SMALL) {
-			    free(dsc->address, M_MACH_VM);
-		    } else {
-		    	vm_map_copy_discard((vm_map_copy_t) dsc->address);
-		    }
+		    /*
+		     * Copy-in always stores a vm_map_copy_t, whatever
+		     * the copy option or size.
+		     */
+		    vm_map_copy_discard((vm_map_copy_t) dsc->address);
 		}
 		break;
 	    }
@@ -2476,6 +2475,14 @@ ipc_kmsg_copyout_port_descriptor(mach_msg_descriptor_t *dsc,
     return (mach_msg_descriptor_t *)dest_dsc;
 }
 
+/*
+ * Contract: on success the user descriptor's address is the
+ * page-aligned base of a fresh round_page(size) anonymous mapping in
+ * the receiver (vm_map_copyout_kernel_buffer), and size is the payload
+ * length, not the mapping length. munmap(address, size) or
+ * vm_deallocate releases the whole mapping; libmach's mach_ool_unmap()
+ * relies on this. On failure address and size are both 0.
+ */
 static mach_msg_descriptor_t *
 ipc_kmsg_copyout_ool_descriptor(mach_msg_ool_descriptor_t *dsc, mach_msg_descriptor_t *user_dsc, int is_lp64, vm_map_t map, mach_msg_return_t *mr)
 {
