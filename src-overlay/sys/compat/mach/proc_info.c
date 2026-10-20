@@ -65,6 +65,7 @@ __FBSDID("$FreeBSD$");
 
 
 int set_security_token(task_t);
+void mach_audit_token_from_cred(struct ucred *, pid_t, audit_token_t *);
 
 
 static int
@@ -473,6 +474,36 @@ proc_info(int op, pid_t pid, uint32_t flavor, uint64_t arg, void *addr,
 	return (0);
 }
 
+/*
+ * The one mapping from BSD credentials to an audit_token_t (nextbsd#268).
+ * The val[] layout is the one libbsm's audit_token_to_au32() decodes in
+ * userland: auid, euid, egid, ruid, rgid, pid, asid, tid.  launchd's
+ * job_mig_intran resolves callers by val[5], and launchd/notifyd authorise
+ * on val[1] (euid), so the trailer and the stored task copy must agree.
+ */
+void
+mach_audit_token_from_cred(struct ucred *cred, pid_t pid, audit_token_t *tok)
+{
+
+	tok->val[0] = 0; /* wat: cred->cr_au.ai_auid; */
+	tok->val[1] = cred->cr_uid;
+	tok->val[2] = cred->cr_gid;
+	tok->val[3] = cred->cr_ruid;
+	tok->val[4] = cred->cr_rgid;
+	tok->val[5] = pid;
+	tok->val[6] = 0; /* wat: cred->cr_au.ai_asid; */
+	tok->val[7] = 0; /* wat: cred->cr_au.ai_termid.port; */
+}
+
+/*
+ * task->audit_token is a snapshot of the process credentials, taken when the
+ * task is created (fork hook, lazy init, task_init_internal).  Nothing
+ * re-stamps it after setuid()/setgid()/setgroups() or a set-id execve():
+ * FreeBSD fires no hook for those.  The trailer of a user-sent message is
+ * therefore NOT taken from here; ipc_kmsg_get() computes it live from the
+ * sending thread's td_ucred with mach_audit_token_from_cred() (nextbsd#268).
+ * Keep the stored copy for readers of the task itself, with the same layout.
+ */
 int
 set_security_token(task_t task)
 {
@@ -483,14 +514,7 @@ set_security_token(task_t task)
 	p = task->itk_p;
 
 	sec_token.val[0] = sec_token.val[1] = 0;
-	audit_token.val[0] = 0; /* wat: p->p_ucred->cr_au.ai_auid; */
-	audit_token.val[1] = p->p_ucred->cr_uid;
-	audit_token.val[2] = p->p_ucred->cr_gid;
-	audit_token.val[3] = p->p_ucred->cr_ruid;
-	audit_token.val[4] = p->p_ucred->cr_rgid;
-	audit_token.val[5] = p->p_pid;
-	audit_token.val[6] = 0; /* wat: p->p_ucred->cr_au.ai_asid; */
-	audit_token.val[7] = 0; /* wat: p->p_ucred->cr_au.ai_termid.port; */
+	mach_audit_token_from_cred(p->p_ucred, p->p_pid, &audit_token);
 
 	task->audit_token = audit_token;
 	task->sec_token = sec_token;

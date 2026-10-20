@@ -176,6 +176,11 @@ extern mach_port_name_t mach_reply_port(void);
 
 extern void set_security_token(task_t);
 
+/* Build an audit token from a credential and pid (nextbsd#268). */
+struct ucred;
+extern void mach_audit_token_from_cred(struct ucred *, pid_t,
+	audit_token_t *);
+
 
 extern void ipc_thr_act_init(thread_act_t);
 

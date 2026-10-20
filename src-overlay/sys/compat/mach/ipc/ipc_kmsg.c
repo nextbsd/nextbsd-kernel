@@ -281,6 +281,7 @@
 #include <sys/mach/sched_prim.h>
 #include <sys/mach/ipc_kobject.h>
 #include <sys/mach/thread.h>
+#include <sys/mach/ipc_tt.h>
 
 #pragma pack(4)
 
@@ -813,6 +814,7 @@ ipc_kmsg_get(
 	mach_msg_legacy_base_t	    legacy_base;
 	mach_msg_size_t		len_copied;
 	task_t task;
+	audit_token_t audit_token;
 	caddr_t msg_addr = (caddr_t)msg;
 
 	legacy_base.body.msgh_descriptor_count = 0;
@@ -861,7 +863,15 @@ ipc_kmsg_get(
 	trailer->msgh_trailer_type = MACH_MSG_TRAILER_FORMAT_0;
 	trailer->msgh_trailer_size = MACH_MSG_TRAILER_MINIMUM_SIZE;
 	trailer->msgh_sender = task->sec_token;
-	trailer->msgh_audit = task->audit_token;
+	/*
+	 * nextbsd#268: the audit token is the sender's identity at the time of
+	 * the send, not the task's creation-time snapshot (task->audit_token),
+	 * which goes stale after setuid() and friends.  td_ucred is the
+	 * credential FreeBSD itself checks in this syscall.
+	 */
+	mach_audit_token_from_cred(curthread->td_ucred,
+	    curthread->td_proc->p_pid, &audit_token);
+	trailer->msgh_audit = audit_token;
 	*kmsgp = kmsg;
 	return MACH_MSG_SUCCESS;
 }
