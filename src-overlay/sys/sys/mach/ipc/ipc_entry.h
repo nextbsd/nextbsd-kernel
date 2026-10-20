@@ -190,10 +190,6 @@ extern ipc_entry_t ipc_entry_lookup(
 	ipc_space_t	space,
 	mach_port_name_t	name);
 
-/* release a reference to an entry */
-void ipc_entry_release(
-	ipc_entry_t entry);
-
 /* Allocate an entry in a space */
 extern kern_return_t ipc_entry_get(
 	ipc_space_t	space,
@@ -219,15 +215,6 @@ extern void ipc_entry_dealloc(
 	ipc_space_t	space,
 	mach_port_name_t	name,
 	ipc_entry_t	entry);
-
-extern int ipc_entry_refs(
-	ipc_entry_t entry);
-
-extern void ipc_entry_add_refs(
-	ipc_entry_t entry, int delta);
-
-extern void ipc_entry_hold(
-	ipc_entry_t entry);
 
 extern void ipc_entry_file_destroy(
 	ipc_object_t objectp);

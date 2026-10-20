@@ -322,21 +322,6 @@ mach_port_fill_kinfo(struct file *fp, struct kinfo_file *kif,
 #endif
 
 /*
- *	Routine:	ipc_entry_release
- *	Purpose:
- *		Drops a reference to an entry.
- *	Conditions:
- *		The space must be locked.
- */
-
-void
-ipc_entry_release(ipc_entry_t entry)
-{
-
-	fdrop(entry->ie_fp, curthread);
-}
-
-/*
  *	Routine:	ipc_entry_lookup
  *	Purpose:
  *		Searches for an entry, given its name.
@@ -533,6 +518,7 @@ ipc_entry_get(
 	}
 
 	ipc_entry_publish(space, fp, fd, free_entry);
+	/* The fd table's reference; urefs live in ie_bits (#150). */
 	assert(fp->f_count == 1);
 	*namep = fd;
 	*entryp = free_entry;
@@ -697,31 +683,6 @@ ipc_entry_close(
 	kern_fdfree(fdp, fd);
 	FILEDESC_XUNLOCK(fdp);
 	fdrop(fp, td);
-}
-
-int
-ipc_entry_refs(
-	ipc_entry_t entry)
-{
-
-	return (entry->ie_fp->f_count);
-}
-
-void
-ipc_entry_add_refs(
-	ipc_entry_t entry,
-	int delta)
-{
-
-	atomic_add_acq_int(&entry->ie_fp->f_count, delta);
-}
-
-void
-ipc_entry_hold(ipc_entry_t entry)
-{
-	// FIXME: We should handle errors here
-	if (fhold(entry->ie_fp))
-		/*log(LOG_WARNING, "%s:%d ipc_entry_hold failed\n", __FILE__, __LINE__)*/ ;
 }
 
 /*

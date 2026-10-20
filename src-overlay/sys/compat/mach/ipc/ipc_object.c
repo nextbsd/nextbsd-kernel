@@ -291,7 +291,12 @@ ipc_object_alloc(
 	}
 	/* space is write-locked */
 
-	entry->ie_bits |= type;;
+	/*
+	 * Receive rights and port sets carry 0 urefs (the only types
+	 * allocated here), so the type alone is the right ie_bits.
+	 */
+	assert(type == MACH_PORT_TYPE_RECEIVE || type == MACH_PORT_TYPE_PORT_SET);
+	entry->ie_bits |= type;
 	entry->ie_object = object;
 
 	io_lock(object);
@@ -355,6 +360,8 @@ ipc_object_alloc_name(
 		return KERN_NAME_EXISTS;
 	}
 
+	/* 0 urefs: see ipc_object_alloc() */
+	assert(type == MACH_PORT_TYPE_RECEIVE || type == MACH_PORT_TYPE_PORT_SET);
 	entry->ie_bits |= type;
 	entry->ie_object = object;
 
