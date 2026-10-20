@@ -662,8 +662,10 @@ ipc_entry_close(
 
 	audit_sysclose(td, fd, fp);
 
-	/* we deliberately skip closing the knote so that it will
-	 * have the last reference to the fp
+	/* No knote_fdclose(): EVFILT_MACHPORT is not an fd filter (#147),
+	 * its knote holds a port-set reference, not one on this fp. It is
+	 * reaped by kq scan or close, and a recycled name is re-homed by
+	 * filt_machporttouch() (#169).
 	 */
 	kern_fdfree(fdp, fd);
 	FILEDESC_XUNLOCK(fdp);

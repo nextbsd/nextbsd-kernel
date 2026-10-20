@@ -588,6 +588,8 @@ ipc_pset_signal(ipc_pset_t pset)
 static int      filt_machportattach(struct knote *kn);
 static void     filt_machportdetach(struct knote *kn);
 static int      filt_machport(struct knote *kn, long hint);
+static void     filt_machporttouch(struct knote *kn, struct kevent *kev,
+		    u_long type);
 struct filterops machport_filtops = {
 	/*
 	 * NOT an fd filter. The kevent ident is a Mach port-set NAME, resolved
@@ -602,11 +604,18 @@ struct filterops machport_filtops = {
 	 * kq_knhash rather than kq_knlist[fd], knote_fdclose() no longer reaps
 	 * it, and nothing else holds the port set alive -- so the knote takes
 	 * its own reference in attach and drops it in detach.
+	 *
+	 * A knote whose set was destroyed lingers in kq_knhash until the next
+	 * scan or kq close (stock knlist_clear() semantics). If the name is
+	 * recycled for a new set and re-registered first, kqueue_register()
+	 * finds that knote and takes the modify path, never calling f_attach;
+	 * filt_machporttouch() re-homes it onto the new set (#169).
 	 */
 	.f_isfd = 0,
 	.f_attach = filt_machportattach,
 	.f_detach = filt_machportdetach,
 	.f_event = filt_machport,
+	.f_touch = filt_machporttouch,
 };
 
 /*
@@ -647,26 +656,25 @@ filt_mach_state_init(void)
 	return (0);
 }
 
+/*
+ * Resolve the knote's ident to a port set in current_space() and return it
+ * referenced in *psetp. Shared by attach and by the re-home in
+ * filt_machporttouch(). The caller owns the reference on success.
+ */
 static int
-filt_machportattach(struct knote *kn)
+filt_machport_bind(struct knote *kn, ipc_pset_t *psetp)
 {
 	mach_port_name_t	name = (mach_port_name_t)kn->kn_kevent.ident;
 	ipc_pset_t			pset = IPS_NULL;
 	ipc_entry_t			entry;
 	kern_return_t		kr;
-	struct knlist		*note;
-	int			err;
 
-	err = filt_mach_state_init();
-	if (err != 0)
-		return (ENOTSUP);
-
+	/* Seed IPS_NULL so translate takes (and we drop) io_lock. */
 	kr = ipc_object_translate(current_space(), name, MACH_PORT_RIGHT_PORT_SET,
 							  (ipc_object_t *)&pset);
 
 	if (kr != KERN_SUCCESS)
 		return (kr == KERN_INVALID_NAME ? ENOENT : ENOTSUP);
-	note = &pset->ips_note;
 	/*
 	 * Hold a reference across knlist_add (#168 Stage 1b, the #250 UAF fix).
 	 * ips_unlock drops the pset lock, but with no reference a concurrent
@@ -691,8 +699,27 @@ filt_machportattach(struct knote *kn)
 		return (ENOENT);
 	}
 
+	*psetp = pset;
+	return (0);
+}
+
+static int
+filt_machportattach(struct knote *kn)
+{
+	ipc_pset_t			pset;
+	int			err;
+
+	err = filt_mach_state_init();
+	if (err != 0)
+		return (ENOTSUP);
+
+	err = filt_machport_bind(kn, &pset);
+	if (err != 0)
+		return (err);
+
 	/*
-	 * Hand the reference taken above to the knote rather than dropping it.
+	 * Hand the reference taken in filt_machport_bind() to the knote rather
+	 * than dropping it.
 	 *
 	 * Before f_isfd = 0 this reference only had to cover knlist_add(): the
 	 * fp reference kqueue held on our behalf kept the port set alive
@@ -705,7 +732,7 @@ filt_machportattach(struct knote *kn)
 	 * filt_machportdetach() drops it, on every path.
 	 */
 	kn->kn_hook = pset;
-	knlist_add(note, kn, 0);
+	knlist_add(&pset->ips_note, kn, 0);
 	return (0);
 }
 
@@ -720,7 +747,9 @@ filt_machportdetach(struct knote *kn)
 	 * A native EVFILT_MACHPORT knote can outlive the port set it was
 	 * registered on: ipc_pset_destroy() clears the knlist and stamps
 	 * EV_EOF, but the knote itself is not reaped until the kq is scanned
-	 * or closed. That is the normal teardown order, not an error.
+	 * or closed. That is the normal teardown order, not an error. (If the
+	 * name is re-registered first, filt_machporttouch() moves the knote
+	 * and its reference to the new set, so kn_hook is always current.)
 	 *
 	 * Our reference (taken in attach) is what keeps the set's memory alive
 	 * for exactly that window, so nothing here can touch freed memory --
@@ -749,6 +778,76 @@ filt_machportdetach(struct knote *kn)
 
 	kn->kn_hook = NULL;
 	ips_release(pset);
+}
+
+
+/*
+ * f_touch: needed only for EVENT_REGISTER on a knote whose port set is gone.
+ *
+ * In this port a name is recycled (kern_fdalloc() returns the lowest free
+ * fd), so after ipc_pset_destroy() the same (ident, EVFILT_MACHPORT) can be
+ * EV_ADDed for a NEW set while the old knote still sits in kq_knhash.
+ * kqueue_register() then takes the modify path (kern_event.c:1870-1905):
+ * no f_attach, the knote stays bound to the dead set, the new set's
+ * ips_note stays empty and its delivery is lost silently -- and the stale
+ * EV_EOF|EV_ONESHOT is then reported for the ident just added (#169).
+ *
+ * kn_knlist == NULL is the "set destroyed" signal: knlist_clear() in
+ * ipc_pset_destroy() is the only thing that detaches a live knote. In that
+ * case re-resolve the name and, if it is a different active set, move the
+ * knote and its reference there. Everything knlist_add() requires holds:
+ * kqueue_register() has the knote in flux with KN_SCAN, the kq unlocked,
+ * and kn_list_lock() locked nothing because kn_knlist was NULL. A
+ * concurrent ipc_pset_signal() on the new set sees KN_SCAN and activates
+ * the knote, as knote() would (#166). On any failure the knote is left as
+ * it was, i.e. it fails closed exactly as before.
+ *
+ * With kn_knlist != NULL (libdispatch's EV_ADD/EV_ENABLE re-arm on a live
+ * set) only the default runs; the knlist lock is held there.
+ */
+static void
+filt_machporttouch(struct knote *kn, struct kevent *kev, u_long type)
+{
+	ipc_pset_t	old, pset;
+
+	switch (type) {
+	case EVENT_REGISTER:
+		/* kqueue_register()'s default, kern_event.c:1901-1902. */
+		kn->kn_sfflags = kev->fflags;
+		kn->kn_sdata = kev->data;
+
+		old = (ipc_pset_t)kn->kn_hook;
+		if (kn->kn_knlist != NULL || old == NULL)
+			break;
+		if (filt_mach_state_init() != 0)
+			break;
+		if (filt_machport_bind(kn, &pset) != 0)
+			break;
+		if (pset == old || !ips_active(pset)) {
+			ips_release(pset);
+			break;
+		}
+		/* Drop the dead set's EOF unless this kevent asked for one-shot. */
+		kn->kn_flags &= ~EV_EOF;
+		if ((kev->flags & (EV_ONESHOT | EV_FORCEONESHOT)) == 0)
+			kn->kn_flags &= ~EV_ONESHOT;
+		kn->kn_hook = pset;
+		knlist_add(&pset->ips_note, kn, 0);
+		ips_release(old);	/* attach's reference, now replaced */
+		break;
+
+	case EVENT_PROCESS:
+		/* Exactly kqueue_scan()'s no-touch path, kern_event.c:2251-2266. */
+		*kev = kn->kn_kevent;
+		if (kn->kn_flags & EV_CLEAR) {
+			kn->kn_data = 0;
+			kn->kn_fflags = 0;
+		}
+		break;
+
+	default:
+		panic("filt_machporttouch: invalid type (%lu)", type);
+	}
 }
 
 
