@@ -561,17 +561,24 @@ ipc_thr_act_terminate(thread_act_t thr_act)
 		return;
 	}
 
+	/*
+	 * Detach the thread from its port first, so a send right held
+	 * anywhere else stops resolving to a shuttle that is about to be
+	 * freed, and is a dead name once the port is destroyed below
+	 * (nextbsd-kernel#269; the thread analog of ipc_task_terminate).
+	 */
+	ipc_kobject_set(kport, IKO_NULL, IKOT_NONE);
 	thr_act->ith_self = IP_NULL;
 	act_unlock(thr_act);
 
-	/* release the naked send rights */
+	/*
+	 * Release the naked send rights, and NULL each pointer as it goes,
+	 * as ipc_task_terminate does.
+	 */
 
-	if (IP_VALID(thr_act->ith_sself))
-		ipc_port_release_send(thr_act->ith_sself);
-	for (i = FIRST_EXCEPTION; i < EXC_TYPES_COUNT; i++) {
-	    if (IP_VALID(thr_act->exc_actions[i].port))
-		ipc_port_release_send(thr_act->exc_actions[i].port);
-	}
+	ipc_task_release_send(&thr_act->ith_sself);
+	for (i = FIRST_EXCEPTION; i < EXC_TYPES_COUNT; i++)
+		ipc_task_release_send(&thr_act->exc_actions[i].port);
 
 	/* destroy the kernel port */
 	ipc_port_dealloc_kernel(kport);

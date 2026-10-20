@@ -621,11 +621,22 @@ extern void		consider_thread_collect(void);
 
 #define thread_map(thread) (&(thread)->ith_td->td_proc->p_vmspace->vm_map)
 
+/*
+ * td's Mach thread; THREAD_NULL if none or if td's process is not native
+ * ABI (a Linux thread's slot holds a linux_emuldata, nextbsd-kernel#269).
+ */
+extern thread_t		mach_td_thread(
+				struct thread	*td);
+
+/* Tear down td's Mach thread state, if any (the exec hook, #269). */
+extern void		mach_thread_exit(
+				struct thread	*td);
+
 static __inline thread_t
 current_thread(void)
 {
 
-	return (curthread->td_machdata);
+	return (mach_td_thread(curthread));
 }
 
 
