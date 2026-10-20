@@ -419,18 +419,31 @@ struct fileops mach_fileops  = {
 	.fo_flags = 0,
 };
 
-static int
-mach_port_close(struct file *fp, struct thread *td)
+/*
+ *	Routine:	ipc_entry_teardown
+ *	Purpose:
+ *		Take an entry out of its space and free it, destroying
+ *		what it names on the way: a port set is destroyed, a
+ *		port whose receive right `space` holds is destroyed, and
+ *		any other right just drops the entry's port reference.
+ *	Conditions:
+ *		Nothing locked, or only a port lock when the entry is
+ *		already out of the table and holds no object (see
+ *		ipc_entry_dealloc()). Takes the space lock only while the
+ *		entry is still in the table.
+ *
+ *	This was the body of mach_port_close(), the fo_close of a port
+ *	name's fd (#152). Moved here verbatim -- only current_space() became
+ *	`space` -- so the names can stop being fds without changing what
+ *	destroying one does.
+ */
+static void
+ipc_entry_teardown(ipc_space_t space, ipc_entry_t entry)
 {
-	ipc_entry_t entry;
 	ipc_object_t object;
 	ipc_pset_t pset;
 	ipc_port_t port;
-	ipc_space_t space;
-
-	MACH_VERIFY(fp->f_data != NULL, ("expected fp->f_data != NULL - got NULL\n"));
-	if ((entry = fp->f_data) == NULL)
-		return (0);
+	ipc_space_t espace;
 
 	/*
 	 * close(2), dup2(2) and the exit/exec sweep drop an fd whose name is
@@ -442,19 +455,19 @@ mach_port_close(struct file *fp, struct thread *td)
 	 * outlives its linked entries: mach_task_exit() leaks a non-empty
 	 * space rather than destroy it.
 	 */
-	space = entry->ie_space;
-	if (entry->ie_in_table && space != IS_NULL) {
-		is_write_lock(space);
-		ipc_entry_unpublish(space, entry);
+	espace = entry->ie_space;
+	if (entry->ie_in_table && espace != IS_NULL) {
+		is_write_lock(espace);
+		ipc_entry_unpublish(espace, entry);
 		if ((entry->ie_bits & MACH_PORT_TYPE_PORT_SET) == 0)
-			ipc_entry_hash_delete(space, entry);
-		is_write_unlock(space);
+			ipc_entry_hash_delete(espace, entry);
+		is_write_unlock(espace);
 	} else if ((entry->ie_bits & MACH_PORT_TYPE_PORT_SET)  == 0)
 		ipc_entry_hash_delete(entry->ie_space, entry);
 	MPASS(entry->ie_link == NULL);
-	PROC_LOCK(td->td_proc);
+	PROC_LOCK(curproc);
 	LIST_REMOVE(entry, ie_space_link);
-	PROC_UNLOCK(td->td_proc);
+	PROC_UNLOCK(curproc);
 	if ((object = entry->ie_object) != NULL) {
 		if (entry->ie_bits & MACH_PORT_TYPE_PORT_SET) {
 			pset = (ipc_pset_t)object;
@@ -462,7 +475,7 @@ mach_port_close(struct file *fp, struct thread *td)
 			ipc_pset_destroy(pset);
 		} else {
 			port = (ipc_port_t)object;
-			if (port->ip_receiver == current_space()) {
+			if (port->ip_receiver == space) {
 				ip_lock(port);
 				ipc_port_clear_receiver(port);
 				ipc_port_destroy(port);
@@ -473,6 +486,18 @@ mach_port_close(struct file *fp, struct thread *td)
 		entry->ie_object = NULL;
 	}
 	free(entry, M_MACH_IPC_ENTRY);
+}
+
+static int
+mach_port_close(struct file *fp, struct thread *td __unused)
+{
+	ipc_entry_t entry;
+
+	MACH_VERIFY(fp->f_data != NULL, ("expected fp->f_data != NULL - got NULL\n"));
+	if ((entry = fp->f_data) == NULL)
+		return (0);
+
+	ipc_entry_teardown(current_space(), entry);
 	fp->f_data = NULL;
 
 	return (0);
