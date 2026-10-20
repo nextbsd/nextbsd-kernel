@@ -90,6 +90,11 @@
  *	Exported kernel calls.  See mach_debug/mach_debug.defs.
  */
 
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/malloc.h>
+#include <sys/rwlock.h>
 #include <sys/mach/kern_return.h>
 #include <sys/mach/port.h>
 #include <sys/mach/vm_types.h>
@@ -111,6 +116,55 @@
 #include <vm/vm.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_extern.h>
+
+#include <crypto/siphash/siphash.h>
+
+/*
+ * nextbsd-kernel#155: the wire layout of the ipc_info types is all
+ * 32-bit fields on every arch, and must match mach_debug_types.defs
+ * (struct[6]/[6]/[7]/[9] of natural_t) and userland's ipc_info.h.
+ */
+CTASSERT(sizeof(ipc_info_space_t) == 6 * sizeof(natural_t));
+CTASSERT(sizeof(ipc_info_space_basic_t) == 6 * sizeof(natural_t));
+CTASSERT(sizeof(ipc_info_name_t) == 7 * sizeof(natural_t));
+CTASSERT(sizeof(ipc_info_tree_name_t) == 9 * sizeof(natural_t));
+CTASSERT(sizeof(natural_t) == 4);
+/* gen-high name layout (#151): the generation is the top byte */
+CTASSERT(MACH_PORT_NGEN(MACH_PORT_NAME_DEAD) == 0xff000000U);
+
+/*
+ * iin_object is a natural_t, so it cannot carry a 64-bit pointer, and a
+ * kernel address must not leave the kernel anyway. Report a per-boot
+ * keyed SipHash of the object pointer instead: stable within one boot,
+ * so a tool can match a send right to its receive right across tasks,
+ * without revealing the address (the intent of XNU's VM_KERNEL_ADDRPERM).
+ * NULL objects report 0; a hash that folds to 0 reports 1.
+ */
+static uint8_t ipc_info_objid_key[SIPHASH_KEY_LENGTH];
+
+static void
+ipc_info_objid_sysinit(void *arg __unused)
+{
+	arc4random_buf(ipc_info_objid_key, sizeof(ipc_info_objid_key));
+}
+SYSINIT(ipc_info_objid, SI_SUB_KLD, SI_ORDER_ANY, ipc_info_objid_sysinit,
+    NULL);
+
+static natural_t
+ipc_info_objid(const void *obj)
+{
+	SIPHASH_CTX ctx;
+	uintptr_t addr;
+	uint64_t h;
+	natural_t id;
+
+	if (obj == NULL)
+		return (0);
+	addr = (uintptr_t)obj;
+	h = SipHash24(&ctx, ipc_info_objid_key, &addr, sizeof(addr));
+	id = (natural_t)(h ^ (h >> 32));
+	return (id != 0 ? id : 1);
+}
 
 /*
  *	Routine:	mach_port_get_srights [kernel call]
@@ -235,14 +289,24 @@ host_ipc_hash_info(
 /*
  *	Routine:	mach_port_space_info
  *	Purpose:
- *		Returns information about an IPC space.
+ *		Returns information about an IPC space: one
+ *		ipc_info_name_t per name-table slot, and an empty
+ *		tree array (the splay tree is gone).
  *	Conditions:
- *		Nothing locked.  Obeys CountInOut protocol.
+ *		Nothing locked.
  *	Returns:
  *		KERN_SUCCESS		Returned information.
  *		KERN_INVALID_TASK	The space is null.
  *		KERN_INVALID_TASK	The space is dead.
  *		KERN_RESOURCE_SHORTAGE	Couldn't allocate memory.
+ *
+ *	nextbsd-kernel#155: rewritten for the #151 slot table. The old
+ *	body assumed old-MIG in-line CountInOut buffers and ipc_kernel_map
+ *	wired memory, and copied the raw ie_object pointer out. This one
+ *	allocates with the space unlocked (it is an rwlock), retries if the
+ *	table grew, and returns the array the way mach_port_get_set_status
+ *	does: vm_map_copyin(kernel_map, ...), which frees the M_MACH_VM
+ *	source.
  */
 
 kern_return_t
@@ -254,195 +318,91 @@ mach_port_space_info(
 	ipc_info_tree_name_array_t	*treep,
 	mach_msg_type_number_t 		*treeCntp)
 {
-#if 0
 	ipc_info_name_t *table_info;
-	unsigned int table_potential, table_actual;
-	vm_offset_t table_addr;
-	vm_size_t table_size;
-	ipc_info_tree_name_t *tree_info;
-	unsigned int tree_potential, tree_actual;
-	vm_offset_t tree_addr;
-	vm_size_t tree_size;
-	ipc_entry_t *table;
+	ipc_entry_num_t bound;		/* table_info holds this many */
+	struct ipc_entry_slot *table;
 	ipc_entry_num_t tsize;
 	mach_port_index_t index;
+	vm_map_copy_t copy;
 	kern_return_t kr;
 
 	if (space == IS_NULL)
 		return KERN_INVALID_TASK;
 
-	/* start with in-line memory */
-
-	table_info = *tablep;
-	table_potential = *tableCntp;
-	tree_info = *treep;
-	tree_potential = *treeCntp;
-
+	table_info = NULL;
+	bound = 0;
 	for (;;) {
 		is_read_lock(space);
 		if (!space->is_active) {
 			is_read_unlock(space);
-			if (table_info != *tablep)
-				free(table_addr, M_MACH_TMP);
-			if (tree_info != *treep)
-				free(tree_addr, tree_);
+			free(table_info, M_MACH_VM);
 			return KERN_INVALID_TASK;
 		}
-
-		table_actual = space->is_table_size;
-		tree_actual = space->is_tree_total;
-
-		if ((table_actual <= table_potential) &&
-		    (tree_actual <= tree_potential))
+		tsize = space->is_table_size;
+		if (table_info != NULL && tsize <= bound)
 			break;
-
 		is_read_unlock(space);
 
-		if (table_actual > table_potential) {
-			if (table_info != *tablep)
-				kmem_free(ipc_kernel_map,
-					  table_addr, table_size);
-
-			table_size = round_page(table_actual *
-						sizeof *table_info);
-			kr = kmem_alloc(ipc_kernel_map,
-					&table_addr, table_size);
-			if (kr != KERN_SUCCESS) {
-				if (tree_info != *treep)
-					kmem_free(ipc_kernel_map,
-						  tree_addr, tree_size);
-
-				return KERN_RESOURCE_SHORTAGE;
-			}
-
-			table_info = (ipc_info_name_t *) table_addr;
-			table_potential = table_size/sizeof *table_info;
-		}
-
-		if (tree_actual > tree_potential) {
-			if (tree_info != *treep)
-				kmem_free(ipc_kernel_map,
-					  tree_addr, tree_size);
-
-			tree_size = round_page(tree_actual *
-					       sizeof *tree_info);
-			kr = kmem_alloc(ipc_kernel_map,
-					&tree_addr, tree_size);
-			if (kr != KERN_SUCCESS) {
-				if (table_info != *tablep)
-					kmem_free(ipc_kernel_map,
-						  table_addr, table_size);
-
-				return KERN_RESOURCE_SHORTAGE;
-			}
-
-			tree_info = (ipc_info_tree_name_t *) tree_addr;
-			tree_potential = tree_size/sizeof *tree_info;
-		}
+		free(table_info, M_MACH_VM);
+		bound = tsize;
+		table_info = malloc(MAX(bound, 1) * sizeof(*table_info),
+		    M_MACH_VM, M_WAITOK | M_ZERO);
 	}
-	/* space is read-locked and active; we have enough wired memory */
+	/* space is read-locked and active; we have enough memory */
 
+	bzero(infop, sizeof(*infop));
 	infop->iis_genno_mask = MACH_PORT_NGEN(MACH_PORT_NAME_DEAD);
-	infop->iis_table_size = space->is_table_size;
-	infop->iis_table_next = space->is_table_next->its_size;
-	infop->iis_tree_size = space->is_tree_total;
-	infop->iis_tree_small = space->is_tree_small;
-	infop->iis_tree_hash = space->is_tree_hash;
+	infop->iis_table_size = tsize;
+	/*
+	 * The name table doubles up to mach.ipc_space_max_entries (#151);
+	 * is_table_next now sizes only the reverse hash, so there is no
+	 * meaningful "next size" to report.
+	 */
+	infop->iis_table_next = 0;
+	/* iis_tree_size, iis_tree_small, iis_tree_hash: no tree, 0 */
 
 	table = space->is_table;
-	tsize = space->is_table_size;
-
 	for (index = 0; index < tsize; index++) {
 		ipc_info_name_t *iin = &table_info[index];
-		ipc_entry_t entry = table[index];
-		ipc_entry_bits_t bits = entry->ie_bits;
+		ipc_entry_t entry = table[index].ies_entry;
+		ipc_entry_bits_t bits;
 
-		iin->iin_name = MACH_PORT_MAKEB(index, bits);
-		iin->iin_collision = (bits & IE_BITS_COLLISION) ? TRUE : FALSE;
+		if (entry == IE_NULL) {
+			/* empty: the name this slot would issue next */
+			iin->iin_name = MACH_PORT_MAKE(index,
+			    table[index].ies_gen);
+			continue;
+		}
+
+		bits = entry->ie_bits;
+		iin->iin_name = entry->ie_name;
+		iin->iin_collision = 0;
 		iin->iin_type = IE_BITS_TYPE(bits);
+		if ((bits & MACH_PORT_TYPE_PORT_RIGHTS) != MACH_PORT_TYPE_NONE &&
+		    entry->ie_request != 0)
+			iin->iin_type |= MACH_PORT_TYPE_DNREQUEST;
 		iin->iin_urefs = IE_BITS_UREFS(bits);
-		iin->iin_object = (vm_offset_t) entry->ie_object;
+		iin->iin_object = ipc_info_objid(entry->ie_object);
 		iin->iin_next = entry->ie_next;
 		iin->iin_hash = entry->ie_index;
 	}
 	is_read_unlock(space);
 
-	if (table_info == *tablep) {
-		/* data fit in-line; nothing to deallocate */
-
-		*tableCntp = table_actual;
-	} else if (table_actual == 0) {
-		kmem_free(ipc_kernel_map, table_addr, table_size);
-
-		*tableCntp = 0;
+	if (tsize == 0) {
+		free(table_info, M_MACH_VM);
+		copy = VM_MAP_COPY_NULL;
 	} else {
-		vm_size_t size_used, rsize_used;
-		vm_map_copy_t copy = NULL;
-
-		/* kmem_alloc doesn't zero memory */
-
-		size_used = table_actual * sizeof *table_info;
-		rsize_used = round_page(size_used);
-
-		if (rsize_used != table_size)
-			kmem_free(ipc_kernel_map,
-				  table_addr + rsize_used,
-				  table_size - rsize_used);
-
-		if (size_used != rsize_used)
-			bzero((char *) (table_addr + size_used),
-			      rsize_used - size_used);
-
-		kr = vm_map_unwire(ipc_kernel_map, table_addr,
-				   table_addr + rsize_used, FALSE);
-		assert(kr == KERN_SUCCESS);
-
-		kr = vm_map_copyin(ipc_kernel_map, table_addr, rsize_used,
-				   TRUE, &copy);
-		assert(kr == KERN_SUCCESS);
-
-		*tablep = (ipc_info_name_t *) copy;
-		*tableCntp = table_actual;
+		/* frees table_info, on failure too */
+		kr = vm_map_copyin(kernel_map, (vm_offset_t)table_info,
+		    tsize * sizeof(*table_info), FALSE, &copy);
+		if (kr != KERN_SUCCESS)
+			return KERN_RESOURCE_SHORTAGE;
 	}
 
-	if (tree_info == *treep) {
-		/* data fit in-line; nothing to deallocate */
-
-		*treeCntp = tree_actual;
-	} else if (tree_actual == 0) {
-		kmem_free(ipc_kernel_map, tree_addr, tree_size);
-
-		*treeCntp = 0;
-	} else {
-		vm_size_t size_used, rsize_used;
-		vm_map_copy_t copy = NULL;
-
-		/* kmem_alloc doesn't zero memory */
-
-		size_used = tree_actual * sizeof *tree_info;
-		rsize_used = round_page(size_used);
-
-		if (rsize_used != tree_size)
-			kmem_free(ipc_kernel_map,
-				  tree_addr + rsize_used,
-				  tree_size - rsize_used);
-
-		if (size_used != rsize_used)
-			bzero((char *) (tree_addr + size_used),
-			      rsize_used - size_used);
-
-		kr = vm_map_unwire(ipc_kernel_map, tree_addr,
-				   tree_addr + rsize_used, FALSE);
-		assert(kr == KERN_SUCCESS);
-
-		kr = vm_map_copyin(ipc_kernel_map, tree_addr, rsize_used,
-				   TRUE, &copy);
-		assert(kr == KERN_SUCCESS);
-
-		*treep = (ipc_info_tree_name_t *) copy;
-		*treeCntp = tree_actual;
-	}
-#endif
+	*tablep = (ipc_info_name_t *) copy;
+	*tableCntp = tsize;
+	*treep = (ipc_info_tree_name_t *) VM_MAP_COPY_NULL;
+	*treeCntp = 0;
 	return KERN_SUCCESS;
 }
 

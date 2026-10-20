@@ -100,6 +100,9 @@
 
 #include "opt_compat_mach.h"
 
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/malloc.h>
 #include <sys/mach/port.h>
 #include <sys/mach/kern_return.h>
 #include <sys/mach/notify.h>
@@ -232,23 +235,17 @@ mach_port_names(
 	mach_port_type_t	**typesp,
 	mach_msg_type_number_t	*typesCnt)
 {
-	return KERN_NOT_SUPPORTED;
-#ifdef notyet
-	ipc_entry_t *table;
+	struct ipc_entry_slot *table;
 	ipc_entry_num_t tsize;
+	ipc_entry_num_t bound;		/* names and types hold this many */
 	mach_port_index_t index;
 	ipc_entry_num_t actual;	/* this many names */
 	ipc_port_timestamp_t timestamp;	/* logical time of this operation */
 	mach_port_name_t *names;
 	mach_port_type_t *types;
-#ifdef notyet	
 	kern_return_t kr;
-#endif
-	vm_size_t size;		/* size of allocated memory */
-	vm_offset_t addr1 = 0;	/* allocated memory, for names */
-	vm_offset_t addr2 = 0;	/* allocated memory, for types */
-	vm_map_copy_t memory1 = NULL;	/* copied-in memory, for names */
-	vm_map_copy_t memory2 = NULL;	/* copied-in memory, for types */
+	vm_map_copy_t memory1;	/* copied-in memory, for names */
+	vm_map_copy_t memory2;	/* copied-in memory, for types */
 
 	/* safe simplifying assumption */
 	assert_static(sizeof(mach_port_name_t) == sizeof(mach_port_type_t));
@@ -256,134 +253,95 @@ mach_port_names(
 	if (space == IS_NULL)
 		return KERN_INVALID_TASK;
 
-	size = 0;
+	/*
+	 * nextbsd-kernel#155: the space lock is an rwlock, so nothing may
+	 * sleep under it. Size the buffers from is_table_size unlocked,
+	 * allocate, re-lock, and retry if the table grew meanwhile. The
+	 * buffers are M_MACH_VM because vm_map_copyin(kernel_map, ...)
+	 * frees its source with that type, as mach_port_get_set_status
+	 * relies on.
+	 */
+	names = NULL;
+	types = NULL;
+	bound = 0;
 	for (;;) {
-		ipc_entry_num_t bound;
-		vm_size_t size_needed;
-
 		is_read_lock(space);
 		if (!space->is_active) {
 			is_read_unlock(space);
-			if (size != 0) {
-				kmem_free(ipc_kernel_map, addr1, size);
-				kmem_free(ipc_kernel_map, addr2, size);
-			}
+			free(names, M_MACH_VM);
+			free(types, M_MACH_VM);
 			return KERN_INVALID_TASK;
 		}
-
-		/* upper bound on number of names in the space */
-
-		bound = space->is_table_size + space->is_tree_total;
-		size_needed = round_page(bound * sizeof(mach_port_t));
-
-		if (size_needed <= size)
+		/* upper bound on number of names in the space; no tree */
+		tsize = space->is_table_size;
+		if (names != NULL && tsize <= bound)
 			break;
-
 		is_read_unlock(space);
 
-		if (size != 0) {
-			kmem_free(ipc_kernel_map, addr1, size);
-			kmem_free(ipc_kernel_map, addr2, size);
-		}
-		size = size_needed;
-
-		kr = vm_allocate(ipc_kernel_map, &addr1, size, TRUE);
-		if (kr != KERN_SUCCESS)
-			return KERN_RESOURCE_SHORTAGE;
-
-		kr = vm_allocate(ipc_kernel_map, &addr2, size, TRUE);
-		if (kr != KERN_SUCCESS) {
-			kmem_free(ipc_kernel_map, addr1, size);
-			return KERN_RESOURCE_SHORTAGE;
-		}
-
-		/* can't fault while we hold locks */
-
-		kr = vm_map_wire(ipc_kernel_map, addr1, addr1 + size,
-				     VM_PROT_READ|VM_PROT_WRITE, FALSE);
-		assert(kr == KERN_SUCCESS);
-
-		kr = vm_map_wire(ipc_kernel_map, addr2, addr2 + size,
-				     VM_PROT_READ|VM_PROT_WRITE, FALSE);
-		assert(kr == KERN_SUCCESS);
+		free(names, M_MACH_VM);
+		free(types, M_MACH_VM);
+		bound = tsize;
+		names = malloc(MAX(bound, 1) * sizeof(*names), M_MACH_VM,
+		    M_WAITOK);
+		types = malloc(MAX(bound, 1) * sizeof(*types), M_MACH_VM,
+		    M_WAITOK);
 	}
 
 	/* space is read-locked and active */
 
-	names = (mach_port_name_t *) addr1;
-	types = (mach_port_type_t *) addr2;
 	actual = 0;
-
 	timestamp = ipc_port_timestamp();
 
 	table = space->is_table;
-	tsize = space->is_table_size;
-
 	for (index = 0; index < tsize; index++) {
-		ipc_entry_t entry = table[index];
-		ipc_entry_bits_t bits = entry->ie_bits;
+		ipc_entry_t entry = table[index].ies_entry;
 
-		if (IE_BITS_TYPE(bits) != MACH_PORT_TYPE_NONE) {
+		/* empty slots are NULL; type NONE is still being set up */
+		if (entry == IE_NULL ||
+		    IE_BITS_TYPE(entry->ie_bits) == MACH_PORT_TYPE_NONE)
+			continue;
 
-			mach_port_names_helper(timestamp, entry, entry->ie_name,
-					       names, types, &actual);
-		}
+		/* ie_name is the generationed name, not the bare index */
+		mach_port_names_helper(timestamp, entry, entry->ie_name,
+				       names, types, &actual);
 	}
 
 	is_read_unlock(space);
 
-
 	if (actual == 0) {
 		memory1 = VM_MAP_COPY_NULL;
 		memory2 = VM_MAP_COPY_NULL;
-
-		if (size != 0) {
-			kmem_free(ipc_kernel_map, addr1, size);
-			kmem_free(ipc_kernel_map, addr2, size);
-		}
+		free(names, M_MACH_VM);
+		free(types, M_MACH_VM);
 	} else {
-
 		vm_size_t size_used;
-		vm_size_t vm_size_used;
 
-		size_used = actual * sizeof(mach_port_t);
-		vm_size_used = round_page(size_used);
+		size_used = actual * sizeof(mach_port_name_t);
 
 		/*
-		 *	Make used memory pageable and get it into
-		 *	copied-in form.  Free any unused memory.
+		 *	Get the used memory into copied-in form. On
+		 *	success and on failure alike vm_map_copyin()
+		 *	frees the kernel_map source buffer.
 		 */
-
-		kr = vm_map_unwire(ipc_kernel_map,
-				     addr1, addr1 + vm_size_used, FALSE);
-		assert(kr == KERN_SUCCESS);
-
-		kr = vm_map_unwire(ipc_kernel_map,
-				     addr2, addr2 + vm_size_used, FALSE);
-		assert(kr == KERN_SUCCESS);
-
-		kr = vm_map_copyin(ipc_kernel_map, addr1, size_used,
-				   TRUE, &memory1);
-		assert(kr == KERN_SUCCESS);
-
-		kr = vm_map_copyin(ipc_kernel_map, addr2, size_used,
-				   TRUE, &memory2);
-		assert(kr == KERN_SUCCESS);
-
-		if (vm_size_used != size) {
-			kmem_free(ipc_kernel_map,
-				  addr1 + vm_size_used, size - vm_size_used);
-			kmem_free(ipc_kernel_map,
-				  addr2 + vm_size_used, size - vm_size_used);
+		kr = vm_map_copyin(kernel_map, (vm_offset_t)names, size_used,
+				   FALSE, &memory1);
+		if (kr != KERN_SUCCESS) {
+			free(types, M_MACH_VM);
+			return KERN_RESOURCE_SHORTAGE;
 		}
 
+		kr = vm_map_copyin(kernel_map, (vm_offset_t)types, size_used,
+				   FALSE, &memory2);
+		if (kr != KERN_SUCCESS) {
+			vm_map_copy_discard(memory1);
+			return KERN_RESOURCE_SHORTAGE;
+		}
 	}
 	*namesp = (mach_port_name_t *) memory1;
 	*namesCnt = actual;
 	*typesp = (mach_port_type_t *) memory2;
 	*typesCnt = actual;
 	return KERN_SUCCESS;
-#endif
 }
 
 /*
@@ -1767,12 +1725,62 @@ mach_port_set_context(
 	return KERN_SUCCESS;
 }
 
-int
+/*
+ *	Routine:	mach_port_space_basic_info [kernel call]
+ *	Purpose:
+ *		Returns the sizes of an IPC space without the
+ *		per-name table mach_port_space_info copies out.
+ *		Same fields, same meaning (nextbsd-kernel#155).
+ *	Conditions:
+ *		Nothing locked.
+ *	Returns:
+ *		KERN_SUCCESS		Returned information.
+ *		KERN_INVALID_TASK	The space is null.
+ *		KERN_INVALID_TASK	The space is dead.
+ */
+kern_return_t
 mach_port_space_basic_info(
-	ipc_space_t task,
+	ipc_space_t space,
 	ipc_info_space_basic_t *basic_info
 	)
-	UNSUPPORTED;
+{
+	struct ipc_entry_slot *table;
+	ipc_entry_num_t tsize, inuse;
+	mach_port_index_t index;
+
+	if (space == IS_NULL)
+		return KERN_INVALID_TASK;
+
+	is_read_lock(space);
+	if (!space->is_active) {
+		is_read_unlock(space);
+		return KERN_INVALID_TASK;
+	}
+
+	table = space->is_table;
+	tsize = space->is_table_size;
+	inuse = 0;
+	for (index = 0; index < tsize; index++) {
+		ipc_entry_t entry = table[index].ies_entry;
+
+		if (entry != IE_NULL &&
+		    IE_BITS_TYPE(entry->ie_bits) != MACH_PORT_TYPE_NONE)
+			inuse++;
+	}
+	is_read_unlock(space);
+
+	bzero(basic_info, sizeof(*basic_info));
+	basic_info->iisb_genno_mask = MACH_PORT_NGEN(MACH_PORT_NAME_DEAD);
+	basic_info->iisb_table_size = tsize;
+	/*
+	 * The name table doubles up to mach.ipc_space_max_entries (#151);
+	 * it no longer follows the ipc_table_size progression that
+	 * is_table_next describes (that now sizes only the reverse hash).
+	 */
+	basic_info->iisb_table_next = 0;
+	basic_info->iisb_table_inuse = inuse;
+	return KERN_SUCCESS;
+}
 
 int
 mach_port_unguard(
