@@ -542,17 +542,42 @@ ipc_pset_signal(ipc_pset_t pset)
 	}
 	list = &pset->ips_note;
 	kq = kq_prev = NULL;
+	/*
+	 * Activation is open-coded rather than done through knote(): knote()
+	 * calls f_event, and filt_machport() performs the receive into
+	 * current_thread()'s ith_* state -- here that is the SENDER's thread,
+	 * so the message would be delivered into the wrong thread.
+	 *
+	 * What it must keep from knote() is the in-flux rule (kern_event.c:
+	 * 2588): skip a knote that is in flux unless the flux is kqueue_scan()'s
+	 * own (KN_SCAN). The non-KN_SCAN cases are the drop paths -- the
+	 * kqueue_scan() EV_DROP/EV_ONESHOT arms, kqueue_register() EV_DELETE,
+	 * kqueue_drain() -- which clear KN_QUEUED, unlock the kq and free the
+	 * knote; enqueueing one there puts a soon-to-be-freed knote on kq_head
+	 * (#166), and filt_machport() sets EV_ONESHOT itself. The only other
+	 * one is the attach window, which re-runs f_event before leaving flux,
+	 * so skipping loses no activation. The KN_SCAN exception is safe for
+	 * the reason knote() gives: kqueue_scan() holds the knlist lock --
+	 * ips_note_lock, exclusive via kn_sx_lock() -- across f_event, and we
+	 * hold it shared, so the two cannot interleave.
+	 *
+	 * kn_in_flux() is static to kern_event.c; kn_influx is read directly,
+	 * under the kq lock as event.h requires. kq_prev is updated when the
+	 * lock is taken so a skipped knote still hands its kq lock on.
+	 */
 	SLIST_FOREACH(kn, &list->kl_list, kn_selnext) {
 		kq = kn->kn_kq;
 		if (kq != kq_prev) {
-			if (kq_prev)
+			if (kq_prev != NULL)
 				KQ_UNLOCK(kq_prev);
 			KQ_LOCK(kq);
+			kq_prev = kq;
 		}
-		(kn)->kn_status |= KN_ACTIVE;
-		if (((kn)->kn_status & (KN_QUEUED | KN_DISABLED)) == 0)
+		if (kn->kn_influx > 0 && (kn->kn_status & KN_SCAN) == 0)
+			continue;
+		kn->kn_status |= KN_ACTIVE;
+		if ((kn->kn_status & (KN_QUEUED | KN_DISABLED)) == 0)
 			mach_knote_enqueue(kn);
-		kq_prev = kq;
 	}
 	MPASS(kq != NULL);
 	KQ_UNLOCK(kq);
