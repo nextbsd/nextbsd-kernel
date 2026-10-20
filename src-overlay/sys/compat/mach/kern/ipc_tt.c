@@ -380,6 +380,77 @@ ipc_task_terminate(
 }
 
 /*
+ *	Routine:	ipc_task_reset
+ *	Purpose:
+ *		Reset a task's IPC state to protect it when
+ *		it enters an elevated security context (a set-id
+ *		exec), after XNU's ipc_task_reset (nextbsd-kernel#267).
+ *		The task gets a new control port and the old one
+ *		turns into a dead kobject, so a send right taken out
+ *		before the exec no longer controls the task. The
+ *		exception ports and the debug-control port, which
+ *		the unprivileged task could set, are cleared; this
+ *		tree has no privileged exception ports to keep.
+ *		The bootstrap, host, registered, seatbelt and task-
+ *		access ports are left alone: launchd relies on
+ *		bootstrap surviving exec.
+ *	Conditions:
+ *		Nothing locked.
+ */
+
+void
+ipc_task_reset(
+	task_t		task)
+{
+	ipc_port_t old_kport, new_kport;
+	ipc_port_t old_sself;
+	ipc_port_t old_exc_actions[EXC_TYPES_COUNT];
+	ipc_port_t old_debug_control;
+	int i;
+
+	/* allocates, so not under itk_lock */
+	new_kport = ipc_port_alloc_kernel();
+	if (new_kport == IP_NULL)
+		panic("ipc_task_reset");
+
+	itk_lock(task);
+	old_kport = task->itk_self;
+
+	if (old_kport == IP_NULL) {
+		/* the task is already terminated */
+		itk_unlock(task);
+		ipc_port_dealloc_kernel(new_kport);
+		return;
+	}
+
+	old_sself = task->itk_sself;
+	task->itk_self = new_kport;
+	task->itk_sself = ipc_port_make_send(new_kport);
+	ipc_kobject_set(new_kport, (ipc_kobject_t) task, IKOT_TASK);
+	ipc_kobject_set(old_kport, IKO_NULL, IKOT_NONE);
+
+	for (i = FIRST_EXCEPTION; i < EXC_TYPES_COUNT; i++) {
+		old_exc_actions[i] = task->exc_actions[i].port;
+		task->exc_actions[i].port = IP_NULL;
+	}
+
+	old_debug_control = task->itk_debug_control;
+	task->itk_debug_control = IP_NULL;
+
+	itk_unlock(task);
+
+	/* release the naked send rights, then the old port, unlocked */
+
+	if (IP_VALID(old_sself))
+		ipc_port_release_send(old_sself);
+	for (i = FIRST_EXCEPTION; i < EXC_TYPES_COUNT; i++)
+		ipc_task_release_send(&old_exc_actions[i]);
+	ipc_task_release_send(&old_debug_control);
+
+	ipc_port_dealloc_kernel(old_kport);
+}
+
+/*
  *	Routine:	ipc_thread_init
  *	Purpose:
  *		Initialize a thread's IPC state.
@@ -506,6 +577,64 @@ ipc_thr_act_terminate(thread_act_t thr_act)
 	ipc_port_dealloc_kernel(kport);
 }
 
+
+
+/*
+ *	Routine:	ipc_thread_reset
+ *	Purpose:
+ *		The thread half of ipc_task_reset, for the thread
+ *		doing the set-id exec (nextbsd-kernel#267): a new
+ *		thread port, the old one dead, and its exception
+ *		ports cleared.
+ *	Conditions:
+ *		Nothing locked.
+ */
+
+void
+ipc_thread_reset(thread_t thr_act)
+{
+	ipc_port_t old_kport, new_kport;
+	ipc_port_t old_sself;
+	ipc_port_t old_exc_actions[EXC_TYPES_COUNT];
+	int i;
+
+	/* allocates, so not under act_lock */
+	new_kport = ipc_port_alloc_kernel();
+	if (new_kport == IP_NULL)
+		panic("ipc_thread_reset");
+
+	act_lock(thr_act);
+	old_kport = thr_act->ith_self;
+
+	if (old_kport == IP_NULL) {
+		/* the thread is already terminated */
+		act_unlock(thr_act);
+		ipc_port_dealloc_kernel(new_kport);
+		return;
+	}
+
+	old_sself = thr_act->ith_sself;
+	thr_act->ith_self = new_kport;
+	thr_act->ith_sself = ipc_port_make_send(new_kport);
+	ipc_kobject_set(new_kport, (ipc_kobject_t) thr_act, IKOT_ACT);
+	ipc_kobject_set(old_kport, IKO_NULL, IKOT_NONE);
+
+	for (i = FIRST_EXCEPTION; i < EXC_TYPES_COUNT; i++) {
+		old_exc_actions[i] = thr_act->exc_actions[i].port;
+		thr_act->exc_actions[i].port = IP_NULL;
+	}
+
+	act_unlock(thr_act);
+
+	/* release the naked send rights, then the old port, unlocked */
+
+	if (IP_VALID(old_sself))
+		ipc_port_release_send(old_sself);
+	for (i = FIRST_EXCEPTION; i < EXC_TYPES_COUNT; i++)
+		ipc_task_release_send(&old_exc_actions[i]);
+
+	ipc_port_dealloc_kernel(old_kport);
+}
 
 /*
  *	Routine:	retrieve_task_self_fast

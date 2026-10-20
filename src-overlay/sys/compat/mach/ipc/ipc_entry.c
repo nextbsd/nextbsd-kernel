@@ -174,6 +174,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/mach/ipc/ipc_right.h>
 #include <sys/mach/task.h>
 #include <sys/mach/thread.h>
+#include <sys/mach/ipc_tt.h>
 
 static void
 ipc_entry_hash_delete(
@@ -936,18 +937,40 @@ ipc_entry_exit_hook(void *arg __unused, struct proc *p)
  * Linux layer frees it afterwards. Entering one (native -> Linux): the task
  * is torn down and detached now, before linux_on_exec() installs its pem in
  * the same slot.
+ *
+ * A set-id exec is the exception (nextbsd-kernel#267): the task and the
+ * exec'ing thread get new control ports and lose their exception ports and
+ * debug-control port, as XNU's ipc_task_reset / ipc_thread_reset do, so
+ * nothing the unprivileged image held or set still reaches the privileged
+ * one. Bootstrap still carries over. credential_setid is set before the
+ * image activators run, and execve_nosetid() may still clear it afterwards
+ * (sv_setid_allowed, P2_NO_NEW_PRIVS); a reset in that case costs nothing
+ * the new image could rely on, so it fails closed.
  */
 static void
 ipc_entry_exec_hook(void *arg __unused, struct proc *p,
     struct image_params *imgp)
 {
 	task_t task;
+	thread_t thread;
 
 	task = mach_proc_task(p);
 	if (task == TASK_NULL)
 		return;
 
 	ipc_entry_list_close(p);
+
+	if (imgp->credential_setid) {
+		ipc_task_reset(task);
+		/*
+		 * p is single-threaded and native-ABI here (mach_proc_task()
+		 * above), so td_emuldata cannot be a Linux struct. Switch to
+		 * the thread-side ABI-checked accessor (#269) once it lands.
+		 */
+		thread = curthread->td_machdata;
+		if (thread != THREAD_NULL)
+			ipc_thread_reset(thread);
+	}
 
 	if ((imgp->sysent->sv_flags & SV_ABI_MASK) != SV_ABI_FREEBSD)
 		mach_task_orphan(p);
