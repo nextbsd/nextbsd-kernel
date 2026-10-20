@@ -1086,6 +1086,8 @@ ipc_port_lookup_notify(
 	ipc_port_t port;
 	ipc_entry_t entry;
 
+	/* No callers today; the contract is the caller's lock (#149). */
+	is_assert_locked(space);
 	assert(space->is_active);
 
 	entry = ipc_entry_lookup(space, name);

@@ -125,20 +125,41 @@ ipc_object_translate(
 	ipc_entry_t entry;
 	ipc_object_t object;
 
-	if ((entry = ipc_entry_lookup(space, name)) == NULL)
+	if (space == IS_NULL)
+		return KERN_INVALID_TASK;
+
+	/*
+	 * Space lock across the lookup and the io_lock, then drop it, as in
+	 * XNU (#149). Order is space -> io (R1 in ipc_entry.c). This also runs
+	 * from filt_machport() under the knlist lock, which is why nothing
+	 * may take ips_note_lock while holding a space lock (R2).
+	 */
+	is_read_lock(space);
+	if (!space->is_active) {
+		is_read_unlock(space);
+		return KERN_INVALID_TASK;
+	}
+
+	if ((entry = ipc_entry_lookup(space, name)) == NULL) {
+		is_read_unlock(space);
 		return KERN_INVALID_NAME;
+	}
 
 	if ((entry->ie_bits & MACH_PORT_TYPE(right)) == (mach_port_right_t) 0) {
+		is_read_unlock(space);
 		return KERN_INVALID_RIGHT;
 	}
 
 	object = entry->ie_object;
-	if (object == IO_NULL)
+	if (object == IO_NULL) {
+		is_read_unlock(space);
 		return (KERN_TERMINATED);
+	}
 
 	/* caller already holds locked reference */
 	if (*objectp != object)
 		io_lock(object);
+	is_read_unlock(space);
 
 	*objectp = object;
 	return KERN_SUCCESS;
@@ -270,7 +291,12 @@ ipc_object_alloc(
 	}
 	/* space is write-locked */
 
-	entry->ie_bits |= type;;
+	/*
+	 * Receive rights and port sets carry 0 urefs (the only types
+	 * allocated here), so the type alone is the right ie_bits.
+	 */
+	assert(type == MACH_PORT_TYPE_RECEIVE || type == MACH_PORT_TYPE_PORT_SET);
+	entry->ie_bits |= type;
 	entry->ie_object = object;
 
 	io_lock(object);
@@ -334,6 +360,8 @@ ipc_object_alloc_name(
 		return KERN_NAME_EXISTS;
 	}
 
+	/* 0 urefs: see ipc_object_alloc() */
+	assert(type == MACH_PORT_TYPE_RECEIVE || type == MACH_PORT_TYPE_PORT_SET);
 	entry->ie_bits |= type;
 	entry->ie_object = object;
 

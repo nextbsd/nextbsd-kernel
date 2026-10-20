@@ -120,6 +120,7 @@ typedef struct ipc_entry {
 	struct ipc_object *ie_object;
 	struct ipc_entry *ie_link;
 	LIST_ENTRY(ipc_entry) ie_space_link;
+	boolean_t ie_in_table;		/* is_table slot points here; space-locked */
 	union {
 		mach_port_index_t next;
 		ipc_table_index_t /* XXX ipc_port_request_index_t */ request;
@@ -148,12 +149,23 @@ typedef struct ipc_entry {
 #ifndef NO_PORT_GEN
 #define	IE_BITS_GEN_MASK	0xff000000	/* 8 bits for generation */
 #define	IE_BITS_GEN(bits)	((bits) & IE_BITS_GEN_MASK)
-#define	IE_BITS_GEN_ONE		0x04000000	/* low bit of generation */
-#define IE_BITS_NEW_GEN(old)	(((old) + IE_BITS_GEN_ONE) & IE_BITS_GEN_MASK)
+#define	IE_BITS_GEN_ONE		0x01000000	/* low bit of generation */
+/*
+ * Kernel-assigned generations run 1..0x7f per slot (#151): never 0, so a
+ * gen-0 name is always user-chosen or a plain fd; and never bit 31, so a
+ * minted name never reads as a negative int while it is also an fd, and
+ * can never be MACH_PORT_DEAD. A user-chosen generation (alloc_name) may
+ * be anything; the next one after it wraps back into range.
+ */
+#define	IE_BITS_GEN_MAX		0x7f000000
+#define IE_BITS_NEW_GEN(old)						\
+	(IE_BITS_GEN(old) >= IE_BITS_GEN_MAX ? IE_BITS_GEN_ONE :	\
+	    IE_BITS_GEN(old) + IE_BITS_GEN_ONE)
 #else
 #define	IE_BITS_GEN_MASK	0
 #define	IE_BITS_GEN(bits)	0
 #define	IE_BITS_GEN_ONE		0
+#define	IE_BITS_GEN_MAX		0
 #define IE_BITS_NEW_GEN(old)	(old)
 #endif	/* !USE_PORT_GEN */
 
@@ -190,10 +202,6 @@ extern ipc_entry_t ipc_entry_lookup(
 	ipc_space_t	space,
 	mach_port_name_t	name);
 
-/* release a reference to an entry */
-void ipc_entry_release(
-	ipc_entry_t entry);
-
 /* Allocate an entry in a space */
 extern kern_return_t ipc_entry_get(
 	ipc_space_t	space,
@@ -220,15 +228,6 @@ extern void ipc_entry_dealloc(
 	mach_port_name_t	name,
 	ipc_entry_t	entry);
 
-extern int ipc_entry_refs(
-	ipc_entry_t entry);
-
-extern void ipc_entry_add_refs(
-	ipc_entry_t entry, int delta);
-
-extern void ipc_entry_hold(
-	ipc_entry_t entry);
-
 extern void ipc_entry_file_destroy(
 	ipc_object_t objectp);
 	
@@ -243,7 +242,7 @@ kern_return_t ipc_entry_port_to_file(
 	ipc_object_t object);
 
 void ipc_entry_close(
-	ipc_space_t space __unused,
+	ipc_space_t space,
 	mach_port_name_t name);
 
 

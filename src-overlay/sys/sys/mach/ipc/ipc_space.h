@@ -99,16 +99,29 @@
  *	IPC operations like send and receive use this space.
  *	IPC kernel calls manipulate the space of the target task.
  *
- *	Every space has a non-NULL is_table with is_table_size entries.
- *	A space may have a NULL is_tree.  is_tree_small records the
- *	number of entries in the tree that, if the table were to grow
- *	to the next larger size, would move from the tree to the table.
+ *	Every live user space has a non-NULL is_table with is_table_size
+ *	slots, indexed by MACH_PORT_INDEX(name) (nextbsd-kernel#151).
+ *	Special spaces have none. A slot holds a pointer to the entry, not
+ *	the entry itself: entries are passed across lock drops all over
+ *	this tree, so they must not move when the table grows. The slot's
+ *	generation outlives the entry, which is what makes it per-slot.
+ *	While names are still also file descriptors (until #152) the index
+ *	comes from the fd allocator; the table only records it.
  *
  *	is_growing marks when the table is in the process of growing.
  *	When the table is growing, it can't be freed or grown by another
- *	thread, because of krealloc/kmem_realloc's requirements.
+ *	thread; ipc_entry_grow_table() sleeps on the space for it and
+ *	wakes it when done.
  *
  */
+
+struct ipc_entry_slot {
+	ipc_entry_t		ies_entry;	/* entry named at this index, or NULL */
+	ipc_entry_bits_t	ies_gen;	/* generation of its (or the next) name */
+};
+
+/* Initial slot count; the table doubles from here up to the entry cap. */
+#define	IPC_ENTRY_TABLE_MIN	64
 
 typedef natural_t ipc_space_refs_t;
 
@@ -119,8 +132,8 @@ struct ipc_space {
 	struct rwlock is_lock_data;
 	boolean_t is_active;		/* is the space alive? */
 	boolean_t is_growing;		/* is the space growing? */
-	ipc_entry_t *is_table;		/* an array of entries */
-	ipc_entry_num_t is_table_size;	/* current size of table */
+	struct ipc_entry_slot *is_table; /* name index -> entry */
+	ipc_entry_num_t is_table_size;	/* number of slots in is_table */
 	/*
 	 * Reverse map: object pointer -> (name, entry), chained through
 	 * ie_link and bucketed by IH_LOCAL_HASH.
@@ -191,6 +204,14 @@ MACRO_END
 #define is_write_unlock(is)	rw_wunlock(&(is)->is_lock_data)
 
 #define	is_write_to_read_lock(is) rw_downgrade(&(is)->is_lock_data)
+
+/*
+ * ipc_entry_lookup() asserts, never acquires: is_lock_data is not
+ * recursive and callers hold it read or write (#149). Both compile out
+ * without INVARIANTS.
+ */
+#define	is_assert_locked(is)	rw_assert(&(is)->is_lock_data, RA_LOCKED)
+#define	is_assert_wlocked(is)	rw_assert(&(is)->is_lock_data, RA_WLOCKED)
 
 
 /* Take a reference on a space */

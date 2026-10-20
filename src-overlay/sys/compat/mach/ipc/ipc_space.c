@@ -104,8 +104,11 @@
 #include <sys/cdefs.h>
 #include <sys/types.h>
 #include <sys/param.h>
+#include <sys/systm.h>
 #include <sys/lock.h>
+#include <sys/malloc.h>
 #include <sys/mutex.h>
+#include <sys/rwlock.h>
 
 #include <sys/mach/kern_return.h>
 #include <sys/mach/port.h>
@@ -172,7 +175,7 @@ ipc_space_create(
 	ipc_space_t		*spacep)
 {
 	ipc_space_t space;
-	ipc_entry_t *table;
+	struct ipc_entry_slot *table;
 	ipc_entry_t *reverse;
 	ipc_entry_num_t new_size;
 
@@ -180,23 +183,21 @@ ipc_space_create(
 	if (space == IS_NULL)
 		return KERN_RESOURCE_SHORTAGE;
 
-	table = it_entries_alloc(initial);
-	if (table == NULL) {
-		is_free(space);
-		return KERN_RESOURCE_SHORTAGE;
-	}
-
-	new_size = initial->its_size;
-	memset((void *) table, 0, new_size * sizeof(struct ipc_entry *));
+	/*
+	 * The name table (#151): IPC_ENTRY_TABLE_MIN slots to start, grown
+	 * by ipc_entry_grow_table() up to mach.ipc_space_max_entries.
+	 */
+	table = malloc(IPC_ENTRY_TABLE_MIN * sizeof(*table), M_MACH_IPC_TABLE,
+	    M_WAITOK | M_ZERO);
 
 	/*
-	 * The reverse (object -> entry) hash gets its own array, same size and
-	 * allocator as is_table for now. Sizing it independently belongs with
-	 * the change that actually makes is_table a name-indexed table.
+	 * The reverse (object -> entry) hash keeps its own fixed array from
+	 * the ipc_table_size the caller passed; it never grows.
 	 */
+	new_size = initial->its_size;
 	reverse = it_entries_alloc(initial);
 	if (reverse == NULL) {
-		it_entries_free(initial, table);
+		free(table, M_MACH_IPC_TABLE);
 		is_free(space);
 		return KERN_RESOURCE_SHORTAGE;
 	}
@@ -210,7 +211,7 @@ ipc_space_create(
 	space->is_active = TRUE;
 	space->is_growing = FALSE;
 	space->is_table = table;
-	space->is_table_size = new_size;
+	space->is_table_size = IPC_ENTRY_TABLE_MIN;
 	space->is_table_next = initial+1;
 	space->is_reverse_hash = reverse;
 	space->is_reverse_size = new_size;
@@ -275,6 +276,7 @@ ipc_space_destroy(
 	ipc_space_t	space)
 {
 	ipc_entry_t *table;
+	struct ipc_entry_slot *slots;
 	ipc_entry_num_t size;
 	mach_port_index_t index;
 	boolean_t active;
@@ -295,14 +297,15 @@ ipc_space_destroy(
 	 *	out the space died.
 	 */
 
-	is_read_lock(space);
-	while (space->is_growing) {
-		assert_wait((event_t) space, FALSE);
-		is_read_unlock(space);
-		thread_block();
-		is_read_lock(space);
-	}
-	is_read_unlock(space);
+	/*
+	 * ipc_entry_grow_table() clears is_growing and wakeup()s the space
+	 * under the write lock. (This was assert_wait()/thread_block(), and
+	 * assert_wait() is a no-op in this tree.)
+	 */
+	is_write_lock(space);
+	while (space->is_growing)
+		rw_sleep(space, &space->is_lock_data, 0, "ipcsgrw", 0);
+	is_write_unlock(space);
 
 	/*
 	 *	Now we can futz with it	without having it locked.
@@ -331,11 +334,17 @@ ipc_space_destroy(
 	}
 
 	/*
-	 * Both arrays were allocated from the same ipc_table_size entry and
-	 * neither grows today, so is_table_next-1 frees both correctly. When
-	 * is_table starts growing, this needs the reverse array's own size.
+	 * The name table is malloc'd and grows (#151); the reverse hash is
+	 * still the fixed ipc_table_size array from create, freed with the
+	 * size it was allocated with. Detach the table under the lock so a
+	 * late lookup sees no table rather than a freed one.
 	 */
-	it_entries_free(space->is_table_next-1, space->is_table);
+	is_write_lock(space);
+	slots = space->is_table;
+	space->is_table = NULL;
+	space->is_table_size = 0;
+	is_write_unlock(space);
+	free(slots, M_MACH_IPC_TABLE);
 	it_entries_free(space->is_table_next-1, space->is_reverse_hash);
 
 	/*

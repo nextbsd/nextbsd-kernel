@@ -2235,6 +2235,13 @@ ipc_kmsg_copyout_header(
 			kr = ipc_port_dnrequest(reply, reply_name,
 						notify_port, &request);
 			if (kr != KERN_SUCCESS) {
+				/*
+				 * ipc_port_dnrequest() leaves the port locked on
+				 * failure. Drop it first, as XNU does:
+				 * ipc_entry_close() takes the space lock (R1) and
+				 * the port is re-locked just below.
+				 */
+				ip_unlock(reply);
 				is_write_unlock(space);
 
 				ipc_entry_close(space, reply_name);
