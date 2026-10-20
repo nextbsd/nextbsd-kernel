@@ -133,6 +133,12 @@ extern void ipc_right_clean(
 	mach_port_name_t	name,
 	ipc_entry_t	entry);
 
+/* Give up an unreachable entry's port right, sending what is due */
+extern void ipc_right_clean_port(
+	ipc_space_t	space,
+	mach_port_name_t	name,
+	ipc_entry_t	entry);
+
 /* Destroy an entry in a space */
 extern kern_return_t ipc_right_destroy(
 	ipc_space_t	space,
