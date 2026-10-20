@@ -192,6 +192,14 @@ MACRO_END
 
 #define	is_write_to_read_lock(is) rw_downgrade(&(is)->is_lock_data)
 
+/*
+ * ipc_entry_lookup() asserts, never acquires: is_lock_data is not
+ * recursive and callers hold it read or write (#149). Both compile out
+ * without INVARIANTS.
+ */
+#define	is_assert_locked(is)	rw_assert(&(is)->is_lock_data, RA_LOCKED)
+#define	is_assert_wlocked(is)	rw_assert(&(is)->is_lock_data, RA_WLOCKED)
+
 
 /* Take a reference on a space */
 extern void ipc_space_reference(

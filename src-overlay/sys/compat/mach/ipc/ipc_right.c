@@ -136,22 +136,35 @@ ipc_right_lookup(
 	int xlock)
 {
 	ipc_entry_t entry;
+	kern_return_t kr;
 
-
-	assert(space != IS_NULL);
-
-
-	if (!space->is_active)
+	if (space == IS_NULL)
 		return KERN_INVALID_TASK;
-	if ((entry = ipc_entry_lookup(space, name)) == IE_NULL)
-		return KERN_INVALID_NAME;
 
+	/*
+	 * Lock, then look up (#149). This used to look up first and lock
+	 * after, which was not protecting anything -- ipc_entry_lookup() takes
+	 * no lock of its own -- and left the entry unguarded in between.
+	 */
 	if (xlock)
 		is_write_lock(space);
 	else
 		is_read_lock(space);
-	*entryp = entry;
-	return KERN_SUCCESS;
+
+	if (!space->is_active)
+		kr = KERN_INVALID_TASK;
+	else if ((entry = ipc_entry_lookup(space, name)) == IE_NULL)
+		kr = KERN_INVALID_NAME;
+	else {
+		*entryp = entry;
+		return KERN_SUCCESS;
+	}
+
+	if (xlock)
+		is_write_unlock(space);
+	else
+		is_read_unlock(space);
+	return kr;
 }
 
 /*
@@ -610,8 +623,8 @@ ipc_right_destroy(
 		assert(entry->ie_request == 0);
 		assert(entry->ie_object == IO_NULL);
 
+		/* drops the space lock */
 		ipc_entry_dealloc(space, name, entry);
-		is_write_unlock(space);
 		break;
 
 	    case MACH_PORT_TYPE_PORT_SET: {
@@ -656,16 +669,16 @@ ipc_right_destroy(
 
 			entry->ie_request = 0;
 			OBJECT_CLEAR(entry, name);
+			/* drops the space lock */
 			ipc_entry_dealloc(space, name, entry);
-			is_write_unlock(space);
 			break;
 		}
 
 		dnrequest = ipc_right_dncancel_macro(space, port, name, entry);
 
 		OBJECT_CLEAR(entry, name);
+		/* drops the space lock */
 		ipc_entry_dealloc(space, name, entry);
-		is_write_unlock(space);
 
 		if (type & MACH_PORT_TYPE_SEND) {
 			assert(port->ip_srights > 0);

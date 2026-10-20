@@ -113,6 +113,29 @@
  *	Primitive functions to manipulate translation entries.
  */
 
+/*
+ * Lock order (nextbsd-kernel#149, #151):
+ *
+ *  R1. The space rwlock (is_lock_data) comes before io_lock (the port or
+ *      port-set mutex). ipc_object_translate() and ipc_right_reverse() take
+ *      them in that order.
+ *
+ *  R2. ips_note_lock (the port set's knlist sx) comes before the space
+ *      rwlock. kqueue_scan() calls filt_machport() with the knlist lock
+ *      held, and filt_machport() translates the name, which takes the space
+ *      lock. So never take ips_note_lock while holding a space lock: every
+ *      KNOTE() site unlocks the space first (ipc_right_clean,
+ *      ipc_right_destroy, ipc_right_delta), and so does ipc_pset_move()
+ *      before ipc_pset_signal().
+ *
+ *  R3. Never hold a space lock across FILEDESC_XLOCK, fdrop() or an
+ *      M_WAITOK allocation. fdrop() can be the last reference and run
+ *      mach_port_close(), which takes the space lock itself.
+ *
+ * ipc_entry_lookup() asserts the space lock and never takes it; the lock is
+ * not recursive and callers already hold it, read or write.
+ */
+
 
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
@@ -318,7 +341,7 @@ ipc_entry_release(ipc_entry_t entry)
  *	Purpose:
  *		Searches for an entry, given its name.
  *	Conditions:
- *		The space must be active.
+ *		The space must be locked (read or write) and active.
  */
 
 extern void kdb_backtrace(void);
@@ -329,6 +352,7 @@ ipc_entry_lookup(ipc_space_t space, mach_port_name_t name)
 	ipc_entry_t entry;
 	cap_rights_t rights;
 
+	is_assert_locked(space);
 	assert(space->is_active);
 
 	if (curthread->td_proc->p_fd == NULL)

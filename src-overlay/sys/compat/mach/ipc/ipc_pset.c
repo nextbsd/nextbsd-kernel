@@ -665,12 +665,13 @@ static int
 filt_machport_bind(struct knote *kn, ipc_pset_t *psetp)
 {
 	mach_port_name_t	name = (mach_port_name_t)kn->kn_kevent.ident;
+	ipc_space_t			space = current_space();
 	ipc_pset_t			pset = IPS_NULL;
 	ipc_entry_t			entry;
 	kern_return_t		kr;
 
 	/* Seed IPS_NULL so translate takes (and we drop) io_lock. */
-	kr = ipc_object_translate(current_space(), name, MACH_PORT_RIGHT_PORT_SET,
+	kr = ipc_object_translate(space, name, MACH_PORT_RIGHT_PORT_SET,
 							  (ipc_object_t *)&pset);
 
 	if (kr != KERN_SUCCESS)
@@ -689,15 +690,20 @@ filt_machport_bind(struct knote *kn, ipc_pset_t *psetp)
 	ips_reference(pset);
 	ips_unlock(pset);
 
-	/* need the actual entry for knote */
-	if ((entry = ipc_entry_lookup(current_space(), name)) == NULL) {
+	/*
+	 * need the actual entry for knote. The second lookup holds the space
+	 * lock like every other (#149); the pset lock is already dropped, so
+	 * this is not a space-after-io inversion.
+	 */
+	is_read_lock(space);
+	if (!space->is_active ||
+	    (entry = ipc_entry_lookup(space, name)) == NULL ||
+	    entry->ie_object != (ipc_object_t)pset) {
+		is_read_unlock(space);
 		ips_release(pset);
 		return (ENOENT);
 	}
-	if (entry->ie_object != (ipc_object_t)pset) {
-		ips_release(pset);
-		return (ENOENT);
-	}
+	is_read_unlock(space);
 
 	*psetp = pset;
 	return (0);
