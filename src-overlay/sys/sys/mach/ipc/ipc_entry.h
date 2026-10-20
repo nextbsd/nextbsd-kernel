@@ -120,6 +120,7 @@ typedef struct ipc_entry {
 	struct ipc_object *ie_object;
 	struct ipc_entry *ie_link;
 	LIST_ENTRY(ipc_entry) ie_space_link;
+	boolean_t ie_in_table;		/* is_table slot points here; space-locked */
 	union {
 		mach_port_index_t next;
 		ipc_table_index_t /* XXX ipc_port_request_index_t */ request;
@@ -230,7 +231,7 @@ kern_return_t ipc_entry_port_to_file(
 	ipc_object_t object);
 
 void ipc_entry_close(
-	ipc_space_t space __unused,
+	ipc_space_t space,
 	mach_port_name_t name);
 
 
