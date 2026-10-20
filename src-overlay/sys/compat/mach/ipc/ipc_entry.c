@@ -128,9 +128,9 @@
  *      ipc_right_destroy, ipc_right_delta), and so does ipc_pset_move()
  *      before ipc_pset_signal().
  *
- *  R3. Never hold a space lock across FILEDESC_XLOCK, fdrop() or an
- *      M_WAITOK allocation. fdrop() can be the last reference and run
- *      mach_port_close(), which takes the space lock itself.
+ *  R3. Never hold a space lock across an M_WAITOK allocation. Allocate
+ *      first, then lock (ipc_entry_get, ipc_entry_alloc_name), or drop
+ *      the lock around it (ipc_entry_grow_table).
  *
  * ipc_entry_lookup() asserts the space lock and never takes it; the lock is
  * not recursive and callers already hold it, read or write.
@@ -140,28 +140,21 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include "opt_capsicum.h"
-
 #include <sys/types.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/eventhandler.h>
-#include <sys/capsicum.h>
 #include <sys/counter.h>
-#include <sys/file.h>
-#include <sys/filedesc.h>
 #include <sys/imgact.h>
-#include <sys/fcntl.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
+#include <sys/proc.h>
 #include <sys/rwlock.h>
-#include <sys/syscallsubr.h>
 #include <sys/sysctl.h>
 #include <sys/sysent.h>
 #include <sys/time.h>
-#include <sys/stat.h>
 #include <sys/syslog.h>
-#include <sys/user.h>
 #include <sys/limits.h>
 
 #include <sys/mach/mach_types.h>
@@ -180,19 +173,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/mach/ipc/ipc_pset.h>
 #include <sys/mach/task.h>
 #include <sys/mach/thread.h>
-
-#include <security/audit/audit.h>
-
-static void fdunused(struct filedesc *fdp, int fd);
-static int kern_fdalloc(struct thread *td, int minfd, int *result);
-static void kern_fddealloc(struct thread *td, int fd);
-static inline void kern_fdfree(struct filedesc *fdp, int fd);
-static int kern_finstall(struct thread *td, struct file *fp, int *fd, int flags,
-			 struct filecaps *fcaps);
-
-#define MODERN (__FreeBSD_version >= 1100000)
-#define FNOFDALLOC    0x80000000
-#define        fde_change_size (offsetof(struct filedescent, fde_seqc))
 
 static void
 ipc_entry_hash_delete(
@@ -237,10 +217,10 @@ ipc_entry_hash_delete(
 /*
  * Per-space entry cap (#151). It bounds the name INDEX, and with it both
  * the number of names a space can hold and the size of its slot array
- * (16 bytes a slot, so 1 MiB at the default). While the index is also an
- * fd (until #152) the cap shares the fd number space: a process whose fds
- * already run past it cannot get more port names. Lowering it never
- * shrinks a table; it only stops further growth.
+ * (16 bytes a slot, so 1 MiB at the default). Port names are not fds
+ * (#152), so the cap is the only bound on them: they no longer count
+ * against RLIMIT_NOFILE or kern.maxfilesperproc. Lowering it never shrinks
+ * a table; it only stops further growth.
  */
 #define	IPC_SPACE_MAX_ENTRIES_DEFAULT	65536
 #define	IPC_SPACE_MAX_ENTRIES_MIN	1024
@@ -285,21 +265,6 @@ ipc_space_cap_hit(mach_port_index_t index)
 		log(LOG_WARNING, "mach: pid %d (%s): port name index %u is past "
 		    "mach.ipc_space_max_entries (%u)\n", curproc->p_pid,
 		    curproc->p_comm, index, ipc_space_max_entries);
-}
-
-/*
- * Until #152 every entry is backed by an fd in the CALLING process, so a
- * name can only be allocated into the caller's own space. Lookups honour
- * whatever space they are given; allocation into another task's space is
- * refused with KERN_INVALID_TASK (#151 D8). #152 lifts this.
- */
-static boolean_t
-ipc_entry_space_is_curproc(ipc_space_t space)
-{
-	task_t task;
-
-	task = mach_proc_task(curproc);
-	return (task != TASK_NULL && task->itk_space == space);
 }
 
 /*
@@ -404,57 +369,48 @@ ipc_entry_unpublish(ipc_space_t space, ipc_entry_t entry)
 	slot->ies_gen = IE_BITS_NEW_GEN(slot->ies_gen);
 }
 
-static fo_close_t mach_port_close;
-static fo_stat_t mach_port_stat;
-#if MODERN
-static fo_fill_kinfo_t mach_port_fill_kinfo;
-#endif
-
-struct fileops mach_fileops  = {
-	.fo_close = mach_port_close,
-	.fo_stat = mach_port_stat,
-#if MODERN
-	.fo_fill_kinfo = mach_port_fill_kinfo,
-#endif
-	.fo_flags = 0,
-};
-
-static int
-mach_port_close(struct file *fp, struct thread *td)
+/*
+ *	Routine:	ipc_entry_teardown
+ *	Purpose:
+ *		Take an entry out of its space and free it, destroying
+ *		what it names on the way: a port set is destroyed, a
+ *		port whose receive right `space` holds is destroyed, and
+ *		any other right just drops the entry's port reference.
+ *	Conditions:
+ *		Nothing locked, or only a port lock when the entry is
+ *		already out of the table and holds no object (see
+ *		ipc_entry_dealloc()). Takes the space lock only while the
+ *		entry is still in the table.
+ *
+ *	This was the body of mach_port_close(), the fo_close of a port
+ *	name's fd, until names stopped being fds (#152). It is now the one
+ *	place an entry is freed.
+ */
+static void
+ipc_entry_teardown(ipc_space_t space, ipc_entry_t entry)
 {
-	ipc_entry_t entry;
 	ipc_object_t object;
 	ipc_pset_t pset;
 	ipc_port_t port;
-	ipc_space_t space;
 
-	MACH_VERIFY(fp->f_data != NULL, ("expected fp->f_data != NULL - got NULL\n"));
-	if ((entry = fp->f_data) == NULL)
-		return (0);
+	MPASS(entry->ie_space == space);
 
 	/*
-	 * close(2), dup2(2) and the exit/exec sweep drop an fd whose name is
-	 * still in the table; the slot must not outlive the entry freed
-	 * below. ipc_entry_dealloc() and ipc_entry_close() already cleared it
-	 * on their paths -- some with a port lock held, so taking the space
-	 * lock here then would invert R1 -- and say so in ie_in_table, which
-	 * only ever goes TRUE -> FALSE under the space lock. The space itself
-	 * outlives its linked entries: mach_task_exit() leaks a non-empty
-	 * space rather than destroy it.
+	 * ipc_entry_dealloc(), ipc_entry_close() and the exit/exec sweep take
+	 * the entry out of its slot under the space lock before they get
+	 * here -- ipc_entry_dealloc() with a port lock held, so taking the
+	 * space lock here then would invert R1 -- and say so in ie_in_table,
+	 * which only ever goes TRUE -> FALSE under the space lock.
 	 */
-	space = entry->ie_space;
-	if (entry->ie_in_table && space != IS_NULL) {
+	if (entry->ie_in_table) {
 		is_write_lock(space);
 		ipc_entry_unpublish(space, entry);
 		if ((entry->ie_bits & MACH_PORT_TYPE_PORT_SET) == 0)
 			ipc_entry_hash_delete(space, entry);
 		is_write_unlock(space);
 	} else if ((entry->ie_bits & MACH_PORT_TYPE_PORT_SET)  == 0)
-		ipc_entry_hash_delete(entry->ie_space, entry);
+		ipc_entry_hash_delete(space, entry);
 	MPASS(entry->ie_link == NULL);
-	PROC_LOCK(td->td_proc);
-	LIST_REMOVE(entry, ie_space_link);
-	PROC_UNLOCK(td->td_proc);
 	if ((object = entry->ie_object) != NULL) {
 		if (entry->ie_bits & MACH_PORT_TYPE_PORT_SET) {
 			pset = (ipc_pset_t)object;
@@ -462,7 +418,7 @@ mach_port_close(struct file *fp, struct thread *td)
 			ipc_pset_destroy(pset);
 		} else {
 			port = (ipc_port_t)object;
-			if (port->ip_receiver == current_space()) {
+			if (port->ip_receiver == space) {
 				ip_lock(port);
 				ipc_port_clear_receiver(port);
 				ipc_port_destroy(port);
@@ -473,48 +429,7 @@ mach_port_close(struct file *fp, struct thread *td)
 		entry->ie_object = NULL;
 	}
 	free(entry, M_MACH_IPC_ENTRY);
-	fp->f_data = NULL;
-
-	return (0);
 }
-
-static int
-mach_port_stat(struct file *fp __unused, struct stat *sb,
-			   struct ucred *active_cred __unused)
-{
-	ipc_entry_t entry;
-
-	bzero((caddr_t)sb, sizeof(*sb));
-
-	entry = fp->f_data;
-	if (entry->ie_bits & MACH_PORT_TYPE_PORT_SET) {
-		sb->st_mode = S_IFPSET;
-	} else {
-		sb->st_mode = S_IFPORT;
-	}
-	return (0);
-}
-
-#if MODERN
-static int
-mach_port_fill_kinfo(struct file *fp, struct kinfo_file *kif,
-					 struct filedesc *fdp __unused)
-{
-	ipc_entry_t entry;
-
-	/* assume it's a port first */
-	kif->kf_type = KF_TYPE_PORT;
-
-	if ((entry = fp->f_data) == NULL)
-		return (0);
-	/* What else do we want from it? */
-	if (entry->ie_bits & MACH_PORT_TYPE_PORT_SET) {
-		kif->kf_type = KF_TYPE_PORTSET;
-	}
-
-	return (0);
-}
-#endif
 
 /*
  *	Routine:	ipc_entry_lookup
@@ -559,86 +474,72 @@ ipc_entry_lookup(ipc_space_t space, mach_port_name_t name)
 	return (entry);
 }
 
-kern_return_t
-ipc_entry_file_to_port(ipc_space_t space, mach_port_name_t name, ipc_object_t *objectp)
-{
-	struct file *fp;
-	ipc_port_t port;
-	cap_rights_t rights;
+/*
+ * Lowest index ipc_entry_get() hands out. Names are no longer fds (#152),
+ * but they start where the old fd-backed allocator started (the lowest
+ * free fd at or above 16), so kernel-assigned names keep their shape.
+ * Index 0 is never handed out, so no minted name is MACH_PORT_NULL.
+ */
+#define	IPC_ENTRY_INDEX_MIN	16
 
-	assert(space->is_active);
+/*
+ *	Routine:	ipc_entry_publish
+ *	Purpose:
+ *		Initialise an ipc_entry and put it in the empty slot at
+ *		MACH_PORT_INDEX(*namep).
+ *	Conditions:
+ *		The space is write-locked, and the table already covers
+ *		the index (ipc_entry_grow_table).
+ *
+ *		With pick_gen the generation half of *namep is chosen here,
+ *		from the slot, and written back (ipc_entry_get); without it
+ *		*namep is the caller's name and the slot takes its generation
+ *		(ipc_entry_alloc_name).
+ */
+static void
+ipc_entry_publish(
+	ipc_space_t	space,
+	mach_port_name_t	*namep,
+	boolean_t	pick_gen,
+	ipc_entry_t	entry)
+{
+	struct ipc_entry_slot *slot;
+	mach_port_index_t idx;
+
+	is_assert_wlocked(space);
+	idx = MACH_PORT_INDEX(*namep);
+	KASSERT(space->is_table != NULL && idx < space->is_table_size,
+	    ("ipc_entry_publish: index %u outside table of %u", idx,
+	    space->is_table_size));
+	slot = &space->is_table[idx];
+	KASSERT(slot->ies_entry == IE_NULL,
+	    ("ipc_entry_publish: slot %u in use", idx));
+
+	entry->ie_request = 0;
+	entry->ie_index = UINT_MAX;
+	entry->ie_link = NULL;
+	entry->ie_space = space;
+
+	if (pick_gen) {
+		/* Kernel-assigned: never gen 0, never past GEN_MAX. */
+		if (IE_BITS_GEN(slot->ies_gen) == 0 ||
+		    IE_BITS_GEN(slot->ies_gen) > IE_BITS_GEN_MAX)
+			slot->ies_gen = IE_BITS_GEN_ONE;
+		*namep = MACH_PORT_MAKE(idx, slot->ies_gen);
+	} else
+		slot->ies_gen = MACH_PORT_GEN(*namep);
+	slot->ies_entry = entry;
+	entry->ie_in_table = TRUE;
 
 	/*
-	 * A Mach name carries a generation; a plain fd never does. Refuse
-	 * anything with one before touching the fd table, so a Mach name can
-	 * never be wrapped as an implicit fileport (#161, folded into #151).
-	 * Deleting this path is #152's.
+	 * The same generation in the name and in ie_bits, on both the get
+	 * and the alloc_name path. #160 and #163 left ie_bits at gen 0 while
+	 * the name carried one. MACH_PORT_GEN() and IE_BITS_GEN_MASK are the
+	 * same bits in the same positions (gen-high layout), so the name's
+	 * generation half is the ie_bits value.
 	 */
-	if (MACH_PORT_GEN(name) != 0)
-		return (KERN_INVALID_ARGUMENT);
-
-	if (curthread->td_proc->p_fd == NULL)
-		return (KERN_INVALID_ARGUMENT);
-
-	if (fget(curthread, name, cap_rights_init(&rights, CAP_ALL1), &fp) != 0) {
-		log(LOG_DEBUG, "%s:%d entry for port name: %d not found\n", curproc->p_comm, curproc->p_pid, name);
-		return (KERN_INVALID_ARGUMENT);
-	}
-	if (fp->f_type == DTYPE_MACH_IPC) {
-		fdrop(fp, curthread);
-		return (KERN_INVALID_ARGUMENT);
-	}
-	if ((port = ipc_port_alloc_special(space)) == NULL)
-		return (KERN_RESOURCE_SHORTAGE);
-
-	port->ip_context = (mach_vm_address_t) fp;
-	port->ip_flags = IP_CONTEXT_FILE;
-	port->ip_receiver = space;
-	port->ip_receiver_name = name;
-
-	*objectp = (ipc_object_t)port;
-	return (KERN_SUCCESS);
-}
-
-void
-ipc_entry_file_destroy(ipc_object_t objectp)
-{
-	ipc_port_t port;
-	struct file *fp;
-
-	if (curthread->td_proc->p_fd == NULL)
-		return;
-
-	port = (ipc_port_t)objectp;
-	fp = (void *)port->ip_context;
-	ipc_port_dealloc_special(port, current_space());
-	fdrop(fp, curthread);
-}
-
-kern_return_t
-ipc_entry_port_to_file(ipc_space_t space, mach_port_name_t *namep, ipc_object_t object)
-{
-	ipc_port_t port;
-	struct file *fp;
-
-	port = (ipc_port_t)object;
-	MPASS(object != NULL);
-	MPASS(port->ip_flags & IP_CONTEXT_FILE);
-	fp = (void *)port->ip_context;
-	/* the receiver will have been set by the sender of the port */
-	port->ip_receiver = space;
-	ipc_port_dealloc_special(port, space);
-
-	/* Are sent file O_CLOEXEC? */
-	if (kern_finstall(curthread, fp, namep, 0, NULL) != 0) {
-		fdrop(fp, curthread);
-		if (mach_debug_enable)
-			printf("finstall failed\n");
-		return (KERN_RESOURCE_SHORTAGE);
-	}
-	if (mach_debug_enable)
-		printf(" installing received file *fp=%p at %d\n", fp, *namep);
-	return (KERN_SUCCESS);
+	entry->ie_name = *namep;
+	entry->ie_bits = IE_BITS_GEN(MACH_PORT_GEN(*namep));
 }
 
 /*
@@ -649,168 +550,55 @@ ipc_entry_port_to_file(ipc_space_t space, mach_port_name_t *namep, ipc_object_t 
  *		The space is active throughout. Nothing locked: this
  *		takes the space lock, so no object lock may be held (R1).
  *		Will try to allocate memory.
+ *
+ *		Takes the lowest free index at or above IPC_ENTRY_INDEX_MIN,
+ *		growing the table when every slot is in use. The slot's
+ *		generation has moved on since its last name was freed
+ *		(ipc_entry_unpublish), so a reused index never reissues a
+ *		name unchanged.
  *	Returns:
  *		KERN_SUCCESS		A free entry was found.
- *		KERN_NO_SPACE		Index at or past the entry cap.
- *		KERN_INVALID_TASK	Not the caller's own space (D8),
- *					or the space died.
- *		KERN_RESOURCE_SHORTAGE	No fd or memory.
+ *		KERN_NO_SPACE		Every index below the entry cap is
+ *					in use.
+ *		KERN_INVALID_TASK	The space died.
+ *		KERN_RESOURCE_SHORTAGE	No memory.
  */
-
-/*
- *	Routine:	ipc_entry_publish
- *	Purpose:
- *		Initialise an ipc_entry for a struct file already installed at
- *		the fd MACH_PORT_INDEX(*namep), wire the two together, and put
- *		the entry in the space's table and entry list.
- *	Conditions:
- *		Nothing locked. The fd is allocated, `fp` is installed at it,
- *		and the table already covers the index (ipc_entry_grow_table).
- *		Consumes the caller's reference on fp.
- *
- *		With pick_gen the generation half of *namep is chosen here,
- *		from the slot, and written back (ipc_entry_get); without it
- *		*namep is the caller's name and the slot takes its generation
- *		(ipc_entry_alloc_name).
- *
- *	Shared by ipc_entry_get(), which allocates the fd itself, and
- *	ipc_entry_alloc_name(), which is handed a specific one. Factored out
- *	because alloc_name used to call ipc_entry_get() to do this -- and
- *	ipc_entry_get() allocates its OWN fd, which is the bug.
- */
-static void
-ipc_entry_publish(
-	ipc_space_t	space,
-	struct file	*fp,
-	mach_port_name_t	*namep,
-	boolean_t	pick_gen,
-	ipc_entry_t	entry)
-{
-	struct thread *td = curthread;
-	struct ipc_entry_slot *slot;
-	mach_port_index_t idx;
-	ipc_entry_t stale;
-
-	idx = MACH_PORT_INDEX(*namep);
-	entry->ie_request = 0;
-	entry->ie_fp = fp;
-	entry->ie_index = UINT_MAX;
-	entry->ie_link = NULL;
-	entry->ie_space = space;
-	entry->ie_in_table = FALSE;
-
-	is_write_lock(space);
-	KASSERT(space->is_table != NULL && idx < space->is_table_size,
-	    ("ipc_entry_publish: index %u outside table of %u", idx,
-	    space->is_table_size));
-	if (space->is_table != NULL && idx < space->is_table_size) {
-		slot = &space->is_table[idx];
-		/*
-		 * We hold the fd at idx, so anything still in the slot lost
-		 * its fd to close(2)/dup2(2) and has not reached
-		 * mach_port_close() yet. Retire it as that would have: its
-		 * name must not be reissued, and its reverse-hash link must
-		 * not dangle.
-		 */
-		if ((stale = slot->ies_entry) != IE_NULL) {
-			stale->ie_in_table = FALSE;
-			ipc_entry_hash_delete(space, stale);
-			slot->ies_gen = IE_BITS_NEW_GEN(slot->ies_gen);
-		}
-		if (pick_gen) {
-			/* Kernel-assigned: never gen 0, never past GEN_MAX. */
-			if (IE_BITS_GEN(slot->ies_gen) == 0 ||
-			    IE_BITS_GEN(slot->ies_gen) > IE_BITS_GEN_MAX)
-				slot->ies_gen = IE_BITS_GEN_ONE;
-			*namep = MACH_PORT_MAKE(idx, slot->ies_gen);
-		} else
-			slot->ies_gen = MACH_PORT_GEN(*namep);
-		slot->ies_entry = entry;
-		entry->ie_in_table = TRUE;
-	}
-	/*
-	 * The same generation in the name and in ie_bits, on both the get
-	 * and the alloc_name path. #160 and #163 left ie_bits at gen 0 while
-	 * the name carried one. MACH_PORT_GEN() and IE_BITS_GEN_MASK are the
-	 * same bits in the same positions (gen-high layout), so the name's
-	 * generation half is the ie_bits value.
-	 */
-	entry->ie_name = *namep;
-	entry->ie_bits = IE_BITS_GEN(MACH_PORT_GEN(*namep));
-	is_write_unlock(space);
-
-	PROC_LOCK(curproc);
-	LIST_INSERT_HEAD(&space->is_entry_list, entry, ie_space_link);
-	PROC_UNLOCK(curproc);
-	finit(fp, 0, DTYPE_MACH_IPC, entry, &mach_fileops);
-	fdrop(fp, td);
-}
-
 kern_return_t
 ipc_entry_get(
 	ipc_space_t	space,
 	boolean_t	is_send_once,
 	mach_port_name_t	*namep,
 	ipc_entry_t	*entryp)
-{	
+{
 	ipc_entry_t free_entry;
+	mach_port_index_t idx;
 	mach_port_name_t name;
 	kern_return_t kr;
-	int fd;
-	struct file *fp;
-	struct thread *td;
 
 	assert(space->is_active);
 
-	if (!ipc_entry_space_is_curproc(space))
-		return (KERN_INVALID_TASK);	/* D8, until #152 */
-
-	td  = curthread;
+	/* M_WAITOK, so before the space lock (R3). */
 	if ((free_entry = malloc(sizeof(*free_entry), M_MACH_IPC_ENTRY, M_WAITOK|M_ZERO)) == NULL)
 		return KERN_RESOURCE_SHORTAGE;
 
-	/*
-	 * fd work happens unlocked (R3). Every failure frees free_entry,
-	 * which used to leak on each of these returns.
-	 */
-	if (kern_fdalloc(td, 16, &fd)) {
-		log(LOG_WARNING, "%s:%d failed to allocate fd\n", __FILE__, __LINE__);
-		free(free_entry, M_MACH_IPC_ENTRY);
-		return (KERN_RESOURCE_SHORTAGE);
-	}
-	if ((u_int)fd >= ipc_space_max_entries) {
-		kern_fddealloc(td, fd);
-		free(free_entry, M_MACH_IPC_ENTRY);
-		ipc_space_cap_hit(fd);
-		return (KERN_NO_SPACE);
-	}
 	is_write_lock(space);
-	if ((kr = ipc_entry_grow_table(space, fd)) != KERN_SUCCESS) {
-		/* space is unlocked */
-		kern_fddealloc(td, fd);
-		free(free_entry, M_MACH_IPC_ENTRY);
-		return (kr);
+	for (idx = IPC_ENTRY_INDEX_MIN;; idx++) {
+		/*
+		 * A no-op while idx is inside the table; at its end, grow it
+		 * or fail at the cap. Checks is_active either way, and
+		 * unlocks the space on failure.
+		 */
+		if ((kr = ipc_entry_grow_table(space, idx)) != KERN_SUCCESS) {
+			free(free_entry, M_MACH_IPC_ENTRY);
+			return (kr);
+		}
+		if (space->is_table[idx].ies_entry == IE_NULL)
+			break;
 	}
+
+	name = idx;	/* the index; publish adds the slot's generation */
+	ipc_entry_publish(space, &name, TRUE, free_entry);
 	is_write_unlock(space);
-
-	if (falloc_noinstall(td, &fp)) {
-		kern_fddealloc(td, fd);
-		free(free_entry, M_MACH_IPC_ENTRY);
-		log(LOG_WARNING, "%s:%d failed to allocate fp\n", __FILE__, __LINE__);
-		return (KERN_RESOURCE_SHORTAGE);
-	}
-	if (kern_finstall(td, fp, &fd, FNOFDALLOC, NULL)) {
-		log(LOG_WARNING, "%s:%d failed to allocate fp:%p at fd:%d \n", __FILE__, __LINE__, fp, fd);
-		kern_fddealloc(td, fd);
-		fdrop(fp, td);
-		free(free_entry, M_MACH_IPC_ENTRY);
-		return (KERN_RESOURCE_SHORTAGE);
-	}
-
-	name = fd;	/* the index; publish adds the slot's generation */
-	ipc_entry_publish(space, fp, &name, TRUE, free_entry);
-	/* The fd table's reference; urefs live in ie_bits (#150). */
-	assert(fp->f_count == 1);
 	*namep = name;
 	*entryp = free_entry;
 
@@ -862,10 +650,9 @@ ipc_entry_alloc(
  *	Returns:
  *		KERN_SUCCESS		Found existing entry with same name.
  *		KERN_SUCCESS		Allocated a new entry.
- *		KERN_INVALID_TASK	The space is dead, or is not the
- *					caller's own space (D8, until #152).
+ *		KERN_INVALID_TASK	The space is dead.
  *		KERN_NAME_EXISTS	The index is in use under another
- *					generation, or by a non-Mach fd.
+ *					generation, or is index 0.
  *		KERN_NO_SPACE		Index at or past the entry cap.
  *		KERN_RESOURCE_SHORTAGE	Couldn't allocate memory.
  */
@@ -877,30 +664,34 @@ ipc_entry_alloc_name(
 	ipc_entry_t	*entryp)
 {
 	mach_port_index_t idx;
-	int fd, newfd;
-	struct file *fp;
-	ipc_entry_t entry;
+	ipc_entry_t entry, new_entry;
 	kern_return_t kr;
-	struct thread *td = curthread;
 
 	if (!space->is_active) {
 		return (KERN_INVALID_TASK);
 	}
 	assert(MACH_PORT_NAME_VALID(name));
 
-	/* The cap, before any fd reservation or growth. */
+	/* The cap, before any allocation or growth. */
 	idx = MACH_PORT_INDEX(name);
 	if (idx >= ipc_space_max_entries) {
 		ipc_space_cap_hit(idx);
 		return (KERN_NO_SPACE);
 	}
-	if (!ipc_entry_space_is_curproc(space))
-		return (KERN_INVALID_TASK);	/* D8, until #152 */
+	/* Never handed out by ipc_entry_get(); reserved, as in XNU. */
+	if (idx == 0)
+		return (KERN_NAME_EXISTS);
+
+	/* M_WAITOK, so before the space lock (R3); freed if not needed. */
+	if ((new_entry = malloc(sizeof(*new_entry), M_MACH_IPC_ENTRY,
+	    M_WAITOK | M_ZERO)) == NULL)
+		return (KERN_RESOURCE_SHORTAGE);
 
 	is_write_lock(space);
-	if (!space->is_active) {
-		is_write_unlock(space);
-		return (KERN_INVALID_TASK);
+	/* Checks is_active; unlocks the space on failure. */
+	if ((kr = ipc_entry_grow_table(space, idx)) != KERN_SUCCESS) {
+		free(new_entry, M_MACH_IPC_ENTRY);
+		return (kr);
 	}
 	/*
 	 * Inspect the slot itself rather than ipc_entry_lookup(), which
@@ -908,8 +699,8 @@ ipc_entry_alloc_name(
 	 * a right is that entry; anything else at this index -- another
 	 * generation, or an allocation in flight -- owns the index.
 	 */
-	if (idx < space->is_table_size &&
-	    (entry = space->is_table[idx].ies_entry) != IE_NULL) {
+	if ((entry = space->is_table[idx].ies_entry) != IE_NULL) {
+		free(new_entry, M_MACH_IPC_ENTRY);
 		if (entry->ie_name == name &&
 		    IE_BITS_TYPE(entry->ie_bits) != MACH_PORT_TYPE_NONE) {
 			*entryp = entry;
@@ -918,114 +709,17 @@ ipc_entry_alloc_name(
 		is_write_unlock(space);
 		return (KERN_NAME_EXISTS);
 	}
-	if ((kr = ipc_entry_grow_table(space, idx)) != KERN_SUCCESS)
-		return (kr);	/* space is unlocked */
-	is_write_unlock(space);
-	fd = idx;
 
-	/*
-	 * Allocate the entry before touching the fd table, exactly as
-	 * ipc_entry_get() does. Once kern_finstall() has installed the fp
-	 * there is no clean undo with the primitives available here --
-	 * kern_fddealloc() does not unwind an installed file -- so every
-	 * failure that can happen must happen before that point.
-	 */
-	if ((entry = malloc(sizeof(*entry), M_MACH_IPC_ENTRY,
-	    M_WAITOK | M_ZERO)) == NULL)
-		return (KERN_RESOURCE_SHORTAGE);
-
-	/* The fd is the index half of the name, never the whole name. */
-	if (kern_fdalloc(td, fd, &newfd)) {
-		log(LOG_WARNING, "%s:%d failed to allocate %d\n", __FILE__, __LINE__, fd);
-		free(entry, M_MACH_IPC_ENTRY);
-		return (KERN_RESOURCE_SHORTAGE);
-	}
-	if (newfd != fd) {
-		kern_fddealloc(td, newfd);
-		free(entry, M_MACH_IPC_ENTRY);
-		return (KERN_NAME_EXISTS);
-	}
-	if (falloc_noinstall(td, &fp)) {
-		kern_fddealloc(td, newfd);
-		free(entry, M_MACH_IPC_ENTRY);
-		return (KERN_RESOURCE_SHORTAGE);
-	}
-	if (kern_finstall(td, fp, &fd, FNOFDALLOC, NULL)) {
-		kern_fddealloc(td, newfd);
-		fdrop(fp, td);
-		free(entry, M_MACH_IPC_ENTRY);
-		return (KERN_RESOURCE_SHORTAGE);
-	}
-	/*
-	 * Build the entry AT the fd we just reserved.
-	 *
-	 * This used to call ipc_entry_get(), which allocates its own fd from
-	 * kern_fdalloc(td, 16, ...) and overwrites `name` with it. The result
-	 * was that the caller asked for a specific name and got an entry
-	 * carrying a different one, while the fd actually reserved here kept
-	 * a bare falloc_noinstall() file -- never finit()'d, so badfileops,
-	 * so ipc_entry_lookup() rejected it (f_type != DTYPE_MACH_IPC) and it
-	 * was never reclaimed until process exit.
-	 *
-	 * Every caller was affected. ipc_object_alloc_name() set ie_object on
-	 * the wrong-named entry; ipc_object_copyout_name() -- which is on the
-	 * live mach_msg path -- passed the REQUESTED name to
-	 * ipc_right_copyout(), which stamped it into port->ip_receiver_name,
-	 * a name that then never resolved; and ipc_object_rename() could not
-	 * work at all.
-	 */
-	ipc_entry_publish(space, fp, &name, FALSE, entry);
-	*entryp = entry;
-
-	is_write_lock(space);
+	ipc_entry_publish(space, &name, FALSE, new_entry);
+	*entryp = new_entry;
 	return (KERN_SUCCESS);
-}
-
-/*
- * Close the fd backing `name` in the calling process. Refuses an fd that
- * does not hold this name's entry, so a stale name never closes whatever
- * reused its index. Nothing locked (R3).
- */
-static void
-ipc_entry_close_fd(mach_port_name_t name)
-{
-	struct filedesc *fdp;
-	struct file *fp;
-	struct thread *td;
-	int fd;
-
-	td = curthread;
-	fdp = td->td_proc->p_fd;
-	fd = MACH_PORT_INDEX(name);
-
-	FILEDESC_XLOCK(fdp);
-	if ((fp = fget_noref(fdp, fd)) == NULL) {
-		FILEDESC_XUNLOCK(fdp);
-		audit_sysclose(td, fd, NULL);
-		return;
-	}
-	if (fp->f_type != DTYPE_MACH_IPC || fp->f_data == NULL ||
-	    ((ipc_entry_t)fp->f_data)->ie_name != name) {
-		FILEDESC_XUNLOCK(fdp);
-		return;
-	}
-
-	audit_sysclose(td, fd, fp);
-
-	/* No knote_fdclose(): EVFILT_MACHPORT is not an fd filter (#147),
-	 * its knote holds a port-set reference, not one on this fp. It is
-	 * reaped by kq scan or close, and a recycled name is re-homed by
-	 * filt_machporttouch() (#169).
-	 */
-	kern_fdfree(fdp, fd);
-	FILEDESC_XUNLOCK(fdp);
-	fdrop(fp, td);
 }
 
 /*
  *	Routine:	ipc_entry_close
  *	Purpose:
- *		Destroy a name: take it out of the table, then close its fd.
+ *		Destroy a name: take it out of the table, then tear the
+ *		entry down (ipc_entry_teardown).
  *	Conditions:
  *		Nothing locked; no port lock held (takes the space lock).
  *		Reads the slot directly, not through ipc_entry_lookup():
@@ -1043,11 +737,16 @@ ipc_entry_close(
 	is_write_lock(space);
 	if (space->is_table != NULL && idx < space->is_table_size &&
 	    (entry = space->is_table[idx].ies_entry) != IE_NULL &&
-	    entry->ie_name == name)
+	    entry->ie_name == name) {
 		ipc_entry_unpublish(space, entry);
+		if ((entry->ie_bits & MACH_PORT_TYPE_PORT_SET) == 0)
+			ipc_entry_hash_delete(space, entry);
+	} else
+		entry = IE_NULL;
 	is_write_unlock(space);
 
-	ipc_entry_close_fd(name);
+	if (entry != IE_NULL)
+		ipc_entry_teardown(space, entry);
 }
 
 /*
@@ -1072,10 +771,6 @@ ipc_entry_dealloc(
 	assert(space->is_active);
 	assert(entry->ie_object == IO_NULL);
 	assert(entry->ie_request == 0);
-	/*
-	 * Entries only ever live in the caller's own space until #152 (D8);
-	 * this used to swap to entry->ie_space's lock when they differed.
-	 */
 	MPASS(space == entry->ie_space);
 
 	ipc_entry_hash_delete(space, entry);
@@ -1083,100 +778,8 @@ ipc_entry_dealloc(
 	is_write_unlock(space);
 	MPASS(entry->ie_link == NULL);
 
-	ipc_entry_close_fd(name);
-}
-
-static void
-kern_last_close(struct thread *td, struct file *fp, struct filedesc *fdp, int fd)
-{
-
-	FILEDESC_XLOCK(fdp);
-	knote_fdclose(td, fd);
-	kern_fdfree(fdp, fd);
-	FILEDESC_XUNLOCK(fdp);
-	fdrop(fp, td);
-}
-
-/*
- * Close every Mach name p holds through its fd table: port sets first, then
- * ports. Kept apart so that #152 (names stop being fds) can delete it in one
- * hunk.
- */
-static void
-ipc_entry_close_fd_names(struct proc *p)
-{
-	struct filedesc *fdp;
-	struct filedescent *fde;
-	struct file *fp;
-	struct thread *td;
-	ipc_entry_t entry;
-	int i, lastfile;
-
-	fdp = p->p_fd;
-	td = curthread;
-
-	FILEDESC_SLOCK(fdp);
-	lastfile = fdlastfile(fdp);
-	FILEDESC_SUNLOCK(fdp);
-	for (i = 0; i <= lastfile; i++) {
-		fde = &fdp->fd_ofiles[i];
-		fp = fde->fde_file;
-		if (fp == NULL || (fp->f_type != DTYPE_MACH_IPC))
-			continue;
-		MPASS(fp->f_count > 0);
-
-		if (fp->f_data == NULL) {
-			log(LOG_WARNING, "%s:%d fd: %d has NULL f_data\n", p->p_comm, p->p_pid, i);
-			kern_last_close(td, fp, fdp, i);
-			continue;
-		}
-		entry = fp->f_data;
-		MPASS(entry->ie_bits != 0xdeadc0de);
-		if ((entry->ie_bits & MACH_PORT_TYPE_PORT_SET) == 0)
-			continue;
-		kern_last_close(td, fp, fdp, i);
-
-		FILEDESC_SLOCK(fdp);
-		lastfile = fdlastfile(fdp);
-		FILEDESC_SUNLOCK(fdp);
-	}
-
-	FILEDESC_SLOCK(fdp);
-	lastfile = fdlastfile(fdp);
-	FILEDESC_SUNLOCK(fdp);
-	for (i = 0; i <= lastfile; i++) {
-
-		fde = &fdp->fd_ofiles[i];
-		fp = fde->fde_file;
-		if (fp == NULL || (fp->f_type != DTYPE_MACH_IPC))
-			continue;
-		MPASS(fp->f_count > 0);
-
-		entry = fp->f_data;
-#if 0
-		if (fp->f_count > 1) {
-			int ispset = (entry->ie_bits & MACH_PORT_TYPE_PORT_SET);
-			log(LOG_WARNING, "%s:%d fd: %d %s refcount: %d\n", p->p_comm, p->p_pid, i,
-				ispset ? "pset" : "port", fp->f_count);
-		}
-#endif
-		kern_last_close(td, fp, fdp, i);
-
-		FILEDESC_SLOCK(fdp);
-		lastfile = fdlastfile(fdp);
-		FILEDESC_SUNLOCK(fdp);
-	}
-
-#ifdef INVARIANTS
-	FILEDESC_SLOCK(fdp);
-	for (i = 0; i <= fdlastfile(fdp); i++) {
-		fde = &fdp->fd_ofiles[i];
-		fp = fde->fde_file;
-		if (fp != NULL)
-			MPASS(fp->f_type != DTYPE_MACH_IPC);
-	}
-	FILEDESC_SUNLOCK(fdp);
-#endif
+	/* Out of the table and holding no object: only frees it. */
+	ipc_entry_teardown(space, entry);
 }
 
 /*
@@ -1185,13 +788,10 @@ ipc_entry_close_fd_names(struct proc *p)
 static void
 ipc_entry_list_close(struct proc *p)
 {
-	struct filedesc *fdp;
-	struct file *fp;
-	struct thread *td;
 	ipc_entry_t entry;
 	ipc_space_t space;
-	int i;
-	static int shared_logged;
+	mach_port_index_t i;
+	int pass;
 
 	/*
 	 * Out-of-tree fix: this event handler is registered for every
@@ -1208,64 +808,57 @@ ipc_entry_list_close(struct proc *p)
 	    mach_proc_task(curthread->td_proc) == TASK_NULL)
 		return;
 
-	fdp = p->p_fd;
-	td = curthread;
 	space = current_space();
-
-	/*
-	 * A shared fd table (rfork(2) without RFFDG) also holds the names of
-	 * every other process sharing it; closing all of its Mach fds would
-	 * destroy their ports. This used to be KASSERT(fd_refcnt == 1), which
-	 * compiles out without INVARIANTS. Leave the names alone instead: the
-	 * entries still belong to files the table holds, so the drain below
-	 * must not run either, and mach_task_exit() leaks the non-empty space
-	 * rather than destroying it.
-	 */
-	if (fdp->fd_refcnt > 1) {
-		if (!shared_logged) {
-			shared_logged = 1;
-			log(LOG_WARNING, "%s:%d: shared fd table, Mach port "
-			    "names not closed\n", p->p_comm, p->p_pid);
-		}
-		return;
-	}
-
-	ipc_entry_close_fd_names(p);
 
 	/*
 	 * Out-of-tree fix (nextbsd-kernel#63): p_machdata being set does NOT
 	 * imply the task owns an IPC space. A process whose ABI never allocates
 	 * one -- a Linux binary under COMPAT_LINUX acquires a mach task lazily
 	 * but no itk_space -- reaches here with current_space() == NULL, and the
-	 * walk below then reads NULL + offsetof(struct ipc_space, is_entry_list)
-	 * == 0x28 and panics in exit1(). Every Linux process died on exit(2).
-	 *
-	 * The descriptor loops above stay: such a process can still have
-	 * inherited DTYPE_MACH_IPC descriptors that must be closed. It is only
-	 * the space-owned entry list that has nothing to free.
+	 * walk below then dereferences NULL and panics in exit1(). Every Linux
+	 * process died on exit(2).
 	 */
 	if (space == NULL)
 		return;
+	KASSERT(space == mach_proc_task(p)->itk_space,
+	    ("ipc_entry_list_close: %p is not pid %d's space", space,
+	    p->p_pid));
 
-	/* free unreferenced ipc_entrys */
-	i = 0;
-	while(!LIST_EMPTY(&space->is_entry_list)) {
-		entry = LIST_FIRST(&space->is_entry_list);
-		/* mach_port_close removes the entry */
-		fp = entry->ie_fp;
-		MPASS(fp->f_count > 0);
-		fp->f_count = 1;
-		fdrop(fp, td);
-		/* ensure no infinite loop */
-		MPASS(i++ < 10000);
+	/*
+	 * Port sets first, then everything else, as the fd-table walks this
+	 * replaces did (#152). Each entry leaves its slot and the reverse
+	 * hash before the lock drops, so nothing else can reach it while it
+	 * is torn down unlocked (R1, R2). An entry still of type NONE is an
+	 * allocation in flight -- only another task can be making one, the
+	 * process is single-threaded here -- and its allocator owns it.
+	 */
+	for (pass = 0; pass < 2; pass++) {
+		is_write_lock(space);
+		for (i = 0; space->is_table != NULL &&
+		    i < space->is_table_size; i++) {
+			entry = space->is_table[i].ies_entry;
+			if (entry == IE_NULL ||
+			    IE_BITS_TYPE(entry->ie_bits) == MACH_PORT_TYPE_NONE)
+				continue;
+			if (pass == 0 &&
+			    (entry->ie_bits & MACH_PORT_TYPE_PORT_SET) == 0)
+				continue;
+			ipc_entry_unpublish(space, entry);
+			if ((entry->ie_bits & MACH_PORT_TYPE_PORT_SET) == 0)
+				ipc_entry_hash_delete(space, entry);
+			is_write_unlock(space);
+			ipc_entry_teardown(space, entry);
+			is_write_lock(space);
+		}
+		is_write_unlock(space);
 	}
 }
 
 /*
  * process_exit: close the names, then tear the task down
  * (nextbsd-kernel#266). The order matters: mach_task_exit() will not destroy
- * a space that still has entries linked into it, and those only go away as
- * their fds are closed above.
+ * a space that still has entries in it, and those only go away as the names
+ * are closed above.
  */
 static void
 ipc_entry_exit_hook(void *arg __unused, struct proc *p)
@@ -1322,159 +915,6 @@ ipc_entry_sysinit(void *arg __unused)
 
 SYSINIT(ipc_entry, SI_SUB_KLD, SI_ORDER_ANY, ipc_entry_sysinit, NULL);
 
-
-#define NDFILE		20
-#define NDSLOTSIZE	sizeof(NDSLOTTYPE)
-#define	NDENTRIES	(NDSLOTSIZE * __CHAR_BIT)
-#define NDSLOT(x)	((x) / NDENTRIES)
-#define NDBIT(x)	((NDSLOTTYPE)1 << ((x) % NDENTRIES))
-#define	NDSLOTS(x)	(((x) + NDENTRIES - 1) / NDENTRIES)
-
-
-/*
- * Find the highest non-zero bit in the given bitmap, starting at 0 and
- * not exceeding size - 1. Return -1 if not found.
- */
-static int
-fd_last_used(struct filedesc *fdp, int size)
-{
-	NDSLOTTYPE *map = fdp->fd_map;
-	NDSLOTTYPE mask;
-	int off, minoff;
-
-	off = NDSLOT(size);
-	if (size % NDENTRIES) {
-		mask = ~(~(NDSLOTTYPE)0 << (size % NDENTRIES));
-		if ((mask &= map[off]) != 0)
-			return (off * NDENTRIES + flsl(mask) - 1);
-		--off;
-	}
-	for (minoff = NDSLOT(0); off >= minoff; --off)
-		if (map[off] != 0)
-			return (off * NDENTRIES + flsl(map[off]) - 1);
-	return (-1);
-}
-
-static int
-fdisused(struct filedesc *fdp, int fd)
-{
-
-	FILEDESC_LOCK_ASSERT(fdp);
-
-	KASSERT(fd >= 0 && fd < fdp->fd_nfiles,
-	    ("file descriptor %d out of range (0, %d)", fd, fdp->fd_nfiles));
-
-	return ((fdp->fd_map[NDSLOT(fd)] & NDBIT(fd)) != 0);
-}
-
-/*
- * Mark a file descriptor as unused.
- */
-static void
-fdunused(struct filedesc *fdp, int fd)
-{
-
-	FILEDESC_XLOCK_ASSERT(fdp);
-
-	KASSERT(fdisused(fdp, fd), ("fd=%d is already unused", fd));
-	KASSERT(fdp->fd_ofiles[fd].fde_file == NULL,
-	    ("fd=%d is still in use", fd));
-
-	fdp->fd_map[NDSLOT(fd)] &= ~NDBIT(fd);
-	if (fd < fdp->fd_freefile)
-		fdp->fd_freefile = fd;
-}
-
-static int
-kern_fdalloc(struct thread *td, int minfd, int *result)
-{
-	struct proc *p = td->td_proc;
-	struct filedesc *fdp = p->p_fd;
-	int rc;
-	FILEDESC_XLOCK(fdp);
-	rc = fdalloc(td, minfd, result);
-	FILEDESC_XUNLOCK(fdp);
-	return (rc);
-}
-
-static void
-kern_fddealloc(struct thread *td, int fd)
-{
-	struct proc *p = td->td_proc;
-	struct filedesc *fdp = p->p_fd;
-	FILEDESC_XLOCK(fdp);
-	fdunused(fdp, fd);
-	FILEDESC_XUNLOCK(fdp);
-}
-
-static inline void
-kern_fdfree(struct filedesc *fdp, int fd)
-{
-	struct filedescent *fde;
-
-	fde = &fdp->fd_ofiles[fd];
-#ifdef CAPABILITIES
-	seqc_write_begin(&fde->fde_seqc);
-#endif
-	bzero(fde, fde_change_size);
-	fdunused(fdp, fd);
-#ifdef CAPABILITIES
-	seqc_write_end(&fde->fde_seqc);
-#endif
-}
-
-static void
-filecaps_fill(struct filecaps *fcaps)
-{
-
-	CAP_ALL(&fcaps->fc_rights);
-	fcaps->fc_ioctls = NULL;
-	fcaps->fc_nioctls = -1;
-	fcaps->fc_fcntls = CAP_FCNTL_ALL;
-}
-
-/*
- * Install a file in a file descriptor table.
- */
-static int
-kern_finstall(struct thread *td, struct file *fp, int *fd, int flags,
-    struct filecaps *fcaps)
-{
-	struct filedesc *fdp = td->td_proc->p_fd;
-	struct filedescent *fde;
-	int error, min;
-
-	KASSERT(fd != NULL, ("%s: fd == NULL", __func__));
-	KASSERT(fp != NULL, ("%s: fp == NULL", __func__));
-
-	min = 16;
-
-	FILEDESC_XLOCK(fdp);
-	if (!(flags & FNOFDALLOC)) {
-		if ((error = fdalloc(td, min, fd))) {
-			FILEDESC_XUNLOCK(fdp);
-			return (error);
-		}
-	}
-	if (!fhold(fp)) {
-		FILEDESC_XUNLOCK(fdp);
-		return (1); // Caller will fddealloc and fdrop
-	}
-	fde = &fdp->fd_ofiles[*fd];
-#ifdef CAPABILITIES
-	seqc_write_begin(&fde->fde_seqc);
-#endif
-	fde->fde_file = fp;
-	if ((flags & O_CLOEXEC) != 0)
-		fde->fde_flags |= UF_EXCLOSE;
-	filecaps_fill(&fde->fde_caps);
-#ifdef CAPABILITIES
-	seqc_write_end(&fde->fde_seqc);
-#endif
-	FILEDESC_XUNLOCK(fdp);
-	return (0);
-}
- 
 #if	MACH_KDB
 #include <ddb/db_output.h>
 #define	printf	kdbprintf

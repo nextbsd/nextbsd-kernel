@@ -218,10 +218,11 @@ typedef mach_port_t			*mach_port_array_t;
 
 /*
  * nextbsd-kernel#151: generation in the HIGH byte, index in the low 24
- * bits -- the reverse of Apple's (index << 8 | gen). Until #152 the index
- * is also the file descriptor backing the name, which Apple's layout could
- * not be, and published libmach (nextbsd-userland#131) decodes exactly
- * this layout, so it stays (#152 keeps it for good). The generation half
+ * bits -- the reverse of Apple's (index << 8 | gen). It was chosen while
+ * the index was also the file descriptor backing the name, which Apple's
+ * layout could not be. Names are no longer fds (#152), but published
+ * libmach (nextbsd-userland#131) decodes exactly this layout, so it stays
+ * for good. The generation half
  * occupies the same bits as IE_BITS_GEN_MASK, so a name's generation and
  * its entry's ie_bits generation compare directly.
  */

@@ -116,10 +116,8 @@ typedef struct ipc_entry {
 	ipc_entry_bits_t ie_bits;
 	mach_port_name_t ie_name;
 	struct ipc_space *ie_space;
-	struct file		*ie_fp;
 	struct ipc_object *ie_object;
 	struct ipc_entry *ie_link;
-	LIST_ENTRY(ipc_entry) ie_space_link;
 	boolean_t ie_in_table;		/* is_table slot points here; space-locked */
 	union {
 		mach_port_index_t next;
@@ -152,10 +150,10 @@ typedef struct ipc_entry {
 #define	IE_BITS_GEN_ONE		0x01000000	/* low bit of generation */
 /*
  * Kernel-assigned generations run 1..0x7f per slot (#151): never 0, so a
- * gen-0 name is always user-chosen or a plain fd; and never bit 31, so a
- * minted name never reads as a negative int while it is also an fd, and
- * can never be MACH_PORT_DEAD. A user-chosen generation (alloc_name) may
- * be anything; the next one after it wraps back into range.
+ * gen-0 name is always user-chosen; and never bit 31, so a minted name
+ * never reads as a negative int and can never be MACH_PORT_DEAD. A
+ * user-chosen generation (alloc_name) may be anything; the next one after
+ * it wraps back into range.
  */
 #define	IE_BITS_GEN_MAX		0x7f000000
 #define IE_BITS_NEW_GEN(old)						\
@@ -227,19 +225,6 @@ extern void ipc_entry_dealloc(
 	ipc_space_t	space,
 	mach_port_name_t	name,
 	ipc_entry_t	entry);
-
-extern void ipc_entry_file_destroy(
-	ipc_object_t objectp);
-	
-kern_return_t ipc_entry_file_to_port(
-	ipc_space_t space,
-	mach_port_name_t name,
-	ipc_object_t *objectp);
-
-kern_return_t ipc_entry_port_to_file(
-	ipc_space_t space,
-	mach_port_name_t *namep,
-	ipc_object_t object);
 
 void ipc_entry_close(
 	ipc_space_t space,

@@ -269,15 +269,25 @@ ipc_task_release_send(ipc_port_t *portp)
 }
 
 /*
- * True when no entry is linked into the space any more, neither on the
- * per-space entry list nor in the reverse (object -> entry) hash.
+ * True when no entry is linked into the space any more, neither in its
+ * name table nor in the reverse (object -> entry) hash.
  */
 static boolean_t
 ipc_space_is_empty(ipc_space_t space)
 {
 	ipc_entry_num_t i;
+	boolean_t empty;
 
-	if (!LIST_EMPTY(&space->is_entry_list))
+	empty = TRUE;
+	is_read_lock(space);
+	if (space->is_table != NULL)
+		for (i = 0; i < space->is_table_size; i++)
+			if (space->is_table[i].ies_entry != IE_NULL) {
+				empty = FALSE;
+				break;
+			}
+	is_read_unlock(space);
+	if (!empty)
 		return (FALSE);
 	if (space->is_reverse_hash != NULL)
 		for (i = 0; i < space->is_reverse_size; i++)
@@ -347,8 +357,8 @@ ipc_task_terminate(
 	 * Destroy the space, leaving just a reference for it.
 	 *
 	 * ipc_space_destroy() walks the reverse hash and cleans every right
-	 * it still finds. At exit the names were already closed through their
-	 * fds (ipc_entry_list_close), which freed the entries, so anything
+	 * it still finds. At exit the names were already closed
+	 * (ipc_entry_list_close), which freed the entries, so anything
 	 * still linked here would be a use-after-free. Refuse and leak the
 	 * space instead; the task stays terminated either way.
 	 */

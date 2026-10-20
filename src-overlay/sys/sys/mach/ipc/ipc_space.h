@@ -105,8 +105,8 @@
  *	the entry itself: entries are passed across lock drops all over
  *	this tree, so they must not move when the table grows. The slot's
  *	generation outlives the entry, which is what makes it per-slot.
- *	While names are still also file descriptors (until #152) the index
- *	comes from the fd allocator; the table only records it.
+ *	The table is also the only record of a space's entries: names are
+ *	not file descriptors (#152), and there is no separate entry list.
  *
  *	is_growing marks when the table is in the process of growing.
  *	When the table is growing, it can't be freed or grown by another
@@ -128,7 +128,6 @@ typedef natural_t ipc_space_refs_t;
 struct ipc_space {
 	decl_mutex_data(,is_ref_lock_data)
 	ipc_space_refs_t is_references;
-	LIST_HEAD(, ipc_entry) is_entry_list;
 	struct rwlock is_lock_data;
 	boolean_t is_active;		/* is the space alive? */
 	boolean_t is_growing;		/* is the space growing? */

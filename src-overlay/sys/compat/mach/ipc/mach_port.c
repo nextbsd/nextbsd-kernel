@@ -1106,7 +1106,7 @@ task_set_port_space(
  	int		table_entries)
 {
 
-	/* file descriptor code handles all of this */
+	/* the name table grows on demand (ipc_entry_grow_table) */
 	return KERN_SUCCESS;
 }
 
