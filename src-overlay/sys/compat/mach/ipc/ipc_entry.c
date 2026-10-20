@@ -171,6 +171,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/mach/ipc/ipc_table.h>
 #include <sys/mach/ipc/ipc_port.h>
 #include <sys/mach/ipc/ipc_pset.h>
+#include <sys/mach/ipc/ipc_right.h>
 #include <sys/mach/task.h>
 #include <sys/mach/thread.h>
 
@@ -373,14 +374,20 @@ ipc_entry_unpublish(ipc_space_t space, ipc_entry_t entry)
  *	Routine:	ipc_entry_teardown
  *	Purpose:
  *		Take an entry out of its space and free it, destroying
- *		what it names on the way: a port set is destroyed, a
- *		port whose receive right `space` holds is destroyed, and
- *		any other right just drops the entry's port reference.
+ *		what it names on the way: a port set is destroyed, and a
+ *		port right is given up as a dying space gives it up
+ *		(ipc_right_clean_port): a receive right destroys the
+ *		port, a send right drops its share of ip_srights and may
+ *		fire no-more-senders, a send-once right is consumed with
+ *		a send-once notification, and a dead-name request is
+ *		cancelled.
  *	Conditions:
  *		Nothing locked, or only a port lock when the entry is
  *		already out of the table and holds no object (see
  *		ipc_entry_dealloc()). Takes the space lock only while the
- *		entry is still in the table.
+ *		entry is still in the table. An entry that holds a port
+ *		right sends notifications, so it must come in with
+ *		nothing locked; only the exit/exec sweep passes one.
  *
  *	This was the body of mach_port_close(), the fo_close of a port
  *	name's fd, until names stopped being fds (#152). It is now the one
@@ -389,9 +396,13 @@ ipc_entry_unpublish(ipc_space_t space, ipc_entry_t entry)
 static void
 ipc_entry_teardown(ipc_space_t space, ipc_entry_t entry)
 {
+	static struct timeval lasttime;
+	static int curpps;
 	ipc_object_t object;
 	ipc_pset_t pset;
 	ipc_port_t port;
+	mach_port_type_t type;
+	boolean_t bad_receive;
 
 	MPASS(entry->ie_space == space);
 
@@ -418,7 +429,53 @@ ipc_entry_teardown(ipc_space_t space, ipc_entry_t entry)
 			ipc_pset_destroy(pset);
 		} else {
 			port = (ipc_port_t)object;
-			if (port->ip_receiver == space) {
+			type = IE_BITS_TYPE(entry->ie_bits);
+			/*
+			 * A dying task's rights go the way XNU's
+			 * ipc_right_clean takes them (#265). Dropping just
+			 * the port reference, as this did, left ip_srights
+			 * and ip_sorights counting a right nobody held, so
+			 * the receiver never got no-more-senders or the
+			 * send-once notification when a client died, and a
+			 * dead-name request the task had armed stayed in
+			 * the port's ip_dnrequests, holding a slot.
+			 *
+			 * The entry is out of its slot and the reverse hash,
+			 * so nothing else can reach it; that stands in for
+			 * the space write lock ipc_right_dncancel wants, as
+			 * a dead space does for ipc_right_clean. Nothing is
+			 * locked here: ipc_entry_dealloc(), the one caller
+			 * that may hold a port lock, has cleared ie_object
+			 * already, and ipc_entry_close()'s callers hand over
+			 * entries already of type NONE, so in practice this
+			 * is the exit/exec sweep, which drops the space lock
+			 * around each entry.
+			 *
+			 * Anything else keeps the old handling below: a type
+			 * with no port right that still has an object, or a
+			 * receive right the port does not agree `space` holds
+			 * under this name (logged; INVARIANTS is off, so the
+			 * helper's asserts would not catch it).
+			 */
+			bad_receive = (type & MACH_PORT_TYPE_RECEIVE) != 0 &&
+			    (port->ip_receiver != space ||
+			    port->ip_receiver_name != entry->ie_name);
+			if (__predict_false(bad_receive) &&
+			    ppsratecheck(&lasttime, &curpps, 1))
+				log(LOG_WARNING, "mach: %s: name 0x%x holds "
+				    "the receive right to port %p, which "
+				    "names 0x%x in space %p, not space %p\n",
+				    __func__, entry->ie_name, port,
+				    port->ip_receiver_name, port->ip_receiver,
+				    space);
+			if (__predict_true(!bad_receive &&
+			    (type == MACH_PORT_TYPE_SEND ||
+			    type == MACH_PORT_TYPE_SEND_ONCE ||
+			    type == MACH_PORT_TYPE_RECEIVE ||
+			    type == MACH_PORT_TYPE_SEND_RECEIVE))) {
+				ipc_right_clean_port(space, entry->ie_name,
+				    entry);
+			} else if (port->ip_receiver == space) {
 				ip_lock(port);
 				ipc_port_clear_receiver(port);
 				ipc_port_destroy(port);

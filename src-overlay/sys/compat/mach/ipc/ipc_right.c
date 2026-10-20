@@ -496,6 +496,97 @@ ipc_right_check(
 }
 
 /*
+ *	Routine:	ipc_right_clean_port
+ *	Purpose:
+ *		The port half of ipc_right_clean: give up the send,
+ *		receive or send-once right an entry holds, as a dying
+ *		space does. Cancels the entry's dead-name request,
+ *		drops the entry's share of ip_srights (one per entry,
+ *		whatever its urefs), destroys a receive right, consumes
+ *		a send-once right with a send-once notification, and
+ *		sends the no-senders and port-deleted notifications
+ *		that are then due. The entry isn't deallocated or
+ *		removed from reverse hash tables.
+ *	Conditions:
+ *		Nothing locked: this sends notifications, so no space
+ *		lock, ips_note_lock or port lock may be held (R1-R2 in
+ *		ipc_entry.c). The entry must be unreachable -- its space
+ *		dead (ipc_right_clean), or the entry already out of its
+ *		slot and the reverse hash (ipc_entry_teardown) -- which
+ *		is what lets ipc_right_dncancel run without the space
+ *		write lock it otherwise wants. The type bits in ie_bits
+ *		and ie_object are still those of the right.
+ *
+ *	Split out of ipc_right_clean so the exit/exec teardown, which runs
+ *	while the space is still active, uses the same code
+ *	(nextbsd-kernel#265).
+ */
+
+void
+ipc_right_clean_port(
+	ipc_space_t	space,
+	mach_port_name_t	name,
+	ipc_entry_t	entry)
+{
+	mach_port_type_t type = IE_BITS_TYPE(entry->ie_bits);
+	ipc_port_t port = (ipc_port_t) entry->ie_object;
+	ipc_port_t dnrequest;
+	ipc_port_t nsrequest = IP_NULL;
+	mach_port_mscount_t mscount;
+
+	assert(type == MACH_PORT_TYPE_SEND ||
+	    type == MACH_PORT_TYPE_RECEIVE ||
+	    type == MACH_PORT_TYPE_SEND_RECEIVE ||
+	    type == MACH_PORT_TYPE_SEND_ONCE);
+	assert(port != IP_NULL);
+	ip_lock(port);
+
+	if (!ip_active(port)) {
+		ip_unlock(port);
+		ip_release(port);
+		return;
+	}
+
+	dnrequest = ipc_right_dncancel_macro(space, port, name, entry);
+
+	if (type & MACH_PORT_TYPE_SEND) {
+		assert(port->ip_srights > 0);
+		if (--port->ip_srights == 0
+		    ) {
+			nsrequest = port->ip_nsrequest;
+			if (nsrequest != IP_NULL) {
+				port->ip_nsrequest = IP_NULL;
+				mscount = port->ip_mscount;
+			}
+		}
+	}
+
+	if (type & MACH_PORT_TYPE_RECEIVE) {
+		assert(port->ip_receiver_name == name);
+		assert(port->ip_receiver == space);
+
+		ipc_port_clear_receiver(port);
+		ipc_port_destroy(port); /* consumes our ref, unlocks */
+	} else if (type & MACH_PORT_TYPE_SEND_ONCE) {
+		assert(port->ip_sorights > 0);
+		ip_unlock(port);
+
+		ipc_notify_send_once(port); /* consumes our ref */
+	} else {
+		assert(port->ip_receiver != space);
+
+		ip_unlock(port); /* port is active */
+		ip_release(port);
+	}
+
+	if (nsrequest != IP_NULL)
+		ipc_notify_no_senders(nsrequest, mscount);
+
+	if (dnrequest != IP_NULL)
+		ipc_notify_port_deleted(dnrequest, name);
+}
+
+/*
  *	Routine:	ipc_right_clean
  *	Purpose:
  *		Cleans up an entry in a dead space.
@@ -548,60 +639,9 @@ ipc_right_clean(
 	    case MACH_PORT_TYPE_SEND:
 	    case MACH_PORT_TYPE_RECEIVE:
 	    case MACH_PORT_TYPE_SEND_RECEIVE:
-	    case MACH_PORT_TYPE_SEND_ONCE: {
-		ipc_port_t port = (ipc_port_t) entry->ie_object;
-		ipc_port_t dnrequest;
-		ipc_port_t nsrequest = IP_NULL;
-		mach_port_mscount_t mscount;
-
-		assert(port != IP_NULL);
-		ip_lock(port);
-
-		if (!ip_active(port)) {
-			ip_unlock(port);
-			ip_release(port);
-			break;
-		}
-
-		dnrequest = ipc_right_dncancel_macro(space, port, name, entry);
-
-		if (type & MACH_PORT_TYPE_SEND) {
-			assert(port->ip_srights > 0);
-			if (--port->ip_srights == 0
-			    ) {
-				nsrequest = port->ip_nsrequest;
-				if (nsrequest != IP_NULL) {
-					port->ip_nsrequest = IP_NULL;
-					mscount = port->ip_mscount;
-				}
-			}
-		}
-
-		if (type & MACH_PORT_TYPE_RECEIVE) {
-			assert(port->ip_receiver_name == name);
-			assert(port->ip_receiver == space);
-
-			ipc_port_clear_receiver(port);
-			ipc_port_destroy(port); /* consumes our ref, unlocks */
-		} else if (type & MACH_PORT_TYPE_SEND_ONCE) {
-			assert(port->ip_sorights > 0);
-			ip_unlock(port);
-
-			ipc_notify_send_once(port); /* consumes our ref */
-		} else {
-			assert(port->ip_receiver != space);
-
-			ip_unlock(port); /* port is active */
-			ip_release(port);
-		}
-
-		if (nsrequest != IP_NULL)
-			ipc_notify_no_senders(nsrequest, mscount);
-
-		if (dnrequest != IP_NULL)
-			ipc_notify_port_deleted(dnrequest, name);
+	    case MACH_PORT_TYPE_SEND_ONCE:
+		ipc_right_clean_port(space, name, entry);
 		break;
-	    }
 
 	    default:
 		panic("ipc_right_clean: strange type");
