@@ -244,7 +244,7 @@ ipc_entry_hash_delete(
  */
 #define	IPC_SPACE_MAX_ENTRIES_DEFAULT	65536
 #define	IPC_SPACE_MAX_ENTRIES_MIN	1024
-#define	IPC_SPACE_MAX_ENTRIES_MAX	(1U << 24)	/* the name's index field */
+#define	IPC_SPACE_MAX_ENTRIES_MAX	(MACH_PORT_INDEX_MASK + 1)
 
 static u_int ipc_space_max_entries = IPC_SPACE_MAX_ENTRIES_DEFAULT;
 static COUNTER_U64_DEFINE_EARLY(ipc_space_cap_hits);
@@ -522,37 +522,40 @@ mach_port_fill_kinfo(struct file *fp, struct kinfo_file *kif,
  *		Searches for an entry, given its name.
  *	Conditions:
  *		The space must be locked (read or write) and active.
+ *
+ *	Resolves through space->is_table only (#149, #151): this used to
+ *	fget() the name in curthread's fd table, ignoring `space`, so a
+ *	mach_port_* call on another task's space searched the caller's.
+ *	XNU semantics: a name past the table, an empty slot, a stale
+ *	generation (the slot's entry carries a different name) and an entry
+ *	with no rights yet (type NONE) all fail. No fget(), so no Capsicum
+ *	CAP_KQUEUE_* check on ports any more.
  */
 
-extern void kdb_backtrace(void);
 ipc_entry_t
 ipc_entry_lookup(ipc_space_t space, mach_port_name_t name)
 {
-	struct file *fp;
+	mach_port_index_t idx;
 	ipc_entry_t entry;
-	cap_rights_t rights;
 
 	is_assert_locked(space);
 	assert(space->is_active);
 
-	if (curthread->td_proc->p_fd == NULL)
-		return (NULL);
-
-	if (fget(curthread, name, cap_rights_init(&rights, CAP_KQUEUE_EVENT|CAP_KQUEUE_CHANGE), &fp) != 0) {
+	idx = MACH_PORT_INDEX(name);
+	if (space->is_table == NULL || idx >= space->is_table_size)
+		return (IE_NULL);
+	entry = space->is_table[idx].ies_entry;
+	if (entry == IE_NULL)
+		return (IE_NULL);
+	if (entry->ie_name != name) {
 		if (mach_debug_enable)
-			log(LOG_DEBUG, "%s:%d entry for port name: %d not found\n", curproc->p_comm, curproc->p_pid, name);
-		return (NULL);
+			log(LOG_DEBUG, "%s:%d stale port name 0x%x (slot holds "
+			    "0x%x)\n", curproc->p_comm, curproc->p_pid, name,
+			    entry->ie_name);
+		return (IE_NULL);
 	}
-	if (fp->f_type != DTYPE_MACH_IPC) {
-		if (mach_debug_enable) {
-			kdb_backtrace();
-			log(LOG_DEBUG, "%s:%d port name: %d is not MACH\n", curproc->p_comm, curproc->p_pid, name);
-		}
-		fdrop(fp, curthread);
-		return (NULL);
-	}
-	entry = fp->f_data;
-	fdrop(fp, curthread);
+	if (IE_BITS_TYPE(entry->ie_bits) == MACH_PORT_TYPE_NONE)
+		return (IE_NULL);
 	return (entry);
 }
 
@@ -564,6 +567,15 @@ ipc_entry_file_to_port(ipc_space_t space, mach_port_name_t name, ipc_object_t *o
 	cap_rights_t rights;
 
 	assert(space->is_active);
+
+	/*
+	 * A Mach name carries a generation; a plain fd never does. Refuse
+	 * anything with one before touching the fd table, so a Mach name can
+	 * never be wrapped as an implicit fileport (#161, folded into #151).
+	 * Deleting this path is #152's.
+	 */
+	if (MACH_PORT_GEN(name) != 0)
+		return (KERN_INVALID_ARGUMENT);
 
 	if (curthread->td_proc->p_fd == NULL)
 		return (KERN_INVALID_ARGUMENT);
@@ -706,7 +718,9 @@ ipc_entry_publish(
 			slot->ies_gen = IE_BITS_NEW_GEN(slot->ies_gen);
 		}
 		if (pick_gen) {
-			if (IE_BITS_GEN(slot->ies_gen) == 0)
+			/* Kernel-assigned: never gen 0, never past GEN_MAX. */
+			if (IE_BITS_GEN(slot->ies_gen) == 0 ||
+			    IE_BITS_GEN(slot->ies_gen) > IE_BITS_GEN_MAX)
 				slot->ies_gen = IE_BITS_GEN_ONE;
 			*namep = MACH_PORT_MAKE(idx, slot->ies_gen);
 		} else
