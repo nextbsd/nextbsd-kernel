@@ -766,9 +766,12 @@ ipc_entry_list_close(void *arg __unused, struct proc *p)
 	 * set (via mach_task_init). Without that guard, ipc_entry_list_close
 	 * was page-faulting on current_space() -> p_machdata->itk_space
 	 * for any non-Mach process, including kldload itself right after
-	 * loading mach.ko. Skip processes that never picked up Mach state.
+	 * loading mach.ko. Skip processes that never picked up Mach state,
+	 * and non-native ABI ones, whose p_machdata is not a task at all
+	 * (see mach_proc_task(), nextbsd-kernel#63/#66).
 	 */
-	if (p->p_machdata == NULL || curthread->td_proc->p_machdata == NULL)
+	if (mach_proc_task(p) == TASK_NULL ||
+	    mach_proc_task(curthread->td_proc) == TASK_NULL)
 		return;
 
 	fdp = p->p_fd;
@@ -883,8 +886,7 @@ ipc_entry_exit_hook(void *arg, struct proc *p)
 {
 
 	ipc_entry_list_close(arg, p);
-	if (p->p_machdata != NULL && SV_PROC_ABI(p) == SV_ABI_FREEBSD)
-		mach_task_exit(p->p_machdata);
+	mach_task_exit(mach_proc_task(p));
 }
 
 static void

@@ -104,6 +104,7 @@
 #include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <sys/sysent.h>
+#include <sys/systm.h>
 #include <sys/mach/vm_types.h>
 
 #include <sys/mach/task_info.h>
@@ -1132,6 +1133,37 @@ SYSCTL_ULONG(_mach, OID_AUTO, task_orphaned, CTLFLAG_RD,
     &mach_task_orphaned, 0,
     "dead task structs leaked when the Linux ABI took over p_emuldata");
 
+/*
+ * mach_proc_task — p's Mach task, or TASK_NULL if it has none.
+ *
+ * p_machdata is #defined to p_emuldata (compat_shim.h), and for a Linux-ABI
+ * process the Linuxulator keeps its struct linux_pemuldata there (60 bytes,
+ * a malloc(64) allocation). Read as a task, that struct puts itk_space (at
+ * offset 48 on LP64) on top of pem->oom_score_adj and pem->so_timestamp
+ * (offsets 48 and 52), and itk_lock_data and itk_bootstrap past the end of
+ * the allocation. That was the real cause of nextbsd-kernel#63 and #66: the
+ * "itk_space == NULL" guards only held while both Linux fields were zero,
+ * and writing /proc/self/oom_score_adj or setting SO_TIMESTAMP defeated
+ * them. So nothing may dereference another process's (or the exiting
+ * process's) p_machdata without checking the ABI first; this does both.
+ *
+ * Mach traps need no such check: only the FreeBSD sysent reaches them, so
+ * current_task() is left alone.
+ */
+task_t
+mach_proc_task(struct proc *p)
+{
+
+	if (p->p_machdata == NULL || SV_PROC_ABI(p) != SV_ABI_FREEBSD)
+		return (TASK_NULL);
+	return ((task_t)p->p_machdata);
+}
+
+#ifdef __LP64__
+/* The overlay described above; keep it in view if the layout changes. */
+CTASSERT(offsetof(struct mach_task, itk_space) == 48);
+#endif
+
 /* Serialises the (rare) lazy recycle of a terminated task by a live process. */
 static struct sx mach_task_recycle_sx;
 SX_SYSINIT(mach_task_recycle, &mach_task_recycle_sx, "mach task recycle");
@@ -1296,10 +1328,9 @@ mach_task_init_lazy(struct proc *p)
 {
 	task_t task;
 
-	task = p->p_machdata;
-	if (task != NULL) {
-		if (SV_PROC_ABI(p) == SV_ABI_FREEBSD &&
-		    task->itk_self == IP_NULL) {
+	if (p->p_machdata != NULL) {
+		task = mach_proc_task(p);
+		if (task != TASK_NULL && task->itk_self == IP_NULL) {
 			sx_xlock(&mach_task_recycle_sx);
 			if (task->itk_self == IP_NULL)
 				mach_task_recycle(task, p);
@@ -1420,16 +1451,17 @@ mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
 		mach_task_orphan(p2);
 		return;
 	}
+	/* From here on both p1 and p2 are native (p2 has p1's sysent). */
 
 	/*
 	 * Otherwise reset it now, before the parent checks below, so the child
 	 * starts with a fresh space and task port even when there is nothing
 	 * to inherit.
 	 */
-	if (p2->p_machdata != NULL)
-		mach_task_recycle(p2->p_machdata, p2);
+	if ((child_task = mach_proc_task(p2)) != TASK_NULL)
+		mach_task_recycle(child_task, p2);
 
-	parent_task = p1->p_machdata;
+	parent_task = mach_proc_task(p1);
 	if (mach_debug_enable)
 		printf("[T39-fork] p1=%s(%d) -> p2=%s(%d) parent_task=%p "
 		    "itk_bootstrap=%p\n",
@@ -1464,6 +1496,9 @@ mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
 	 * launchd-spawned daemons — the reason this hook exists (Task #39) — is
 	 * unaffected. A Linux process has no space and cannot use Mach IPC at
 	 * all, so there is genuinely nothing to inherit.
+	 *
+	 * (The true cause: a Linux process's p_machdata is its linux_pemuldata,
+	 * see mach_proc_task(). The ABI check above now catches it first.)
 	 */
 	if (parent_task->itk_space == NULL)
 		return;
@@ -1475,7 +1510,7 @@ mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
 	 * does on first syscall. We pre-create it here so the bootstrap port
 	 * is available immediately. It may already be there, freshly recycled
 	 * above. */
-	if (p2->p_machdata == NULL) {
+	if ((child_task = mach_proc_task(p2)) == TASK_NULL) {
 		/* TASK_NULL parent — full inheritance is what tripped the
 		 * earlier panic. Just init the empty task, then patch in
 		 * the bootstrap port below. */
@@ -1484,7 +1519,6 @@ mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
 			return; /* OOM; fall back to no inheritance */
 		p2->p_machdata = child_task;
 	}
-	child_task = p2->p_machdata;
 	child_task->itk_puniqueid = parent_task->itk_uniqueid;
 
 	/* Task #39: task_init_internal(TASK_NULL, ...) above leaves
