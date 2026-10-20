@@ -125,6 +125,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/capsicum.h>
 #include <sys/file.h>
 #include <sys/filedesc.h>
+#include <sys/imgact.h>
 #include <sys/fcntl.h>
 #include <sys/kernel.h>
 #include <sys/syscallsubr.h>
@@ -743,48 +744,26 @@ kern_last_close(struct thread *td, struct file *fp, struct filedesc *fdp, int fd
 	fdrop(fp, td);
 }
 
+/*
+ * Close every Mach name p holds through its fd table: port sets first, then
+ * ports. Kept apart so that #152 (names stop being fds) can delete it in one
+ * hunk.
+ */
 static void
-ipc_entry_list_close(void *arg __unused, struct proc *p)
+ipc_entry_close_fd_names(struct proc *p)
 {
 	struct filedesc *fdp;
 	struct filedescent *fde;
 	struct file *fp;
 	struct thread *td;
-#if 0
-	ipc_port_t port;
-	ipc_pset_t pset;
-	ipc_entry_t entry_tmp;
-#endif
 	ipc_entry_t entry;
-	ipc_space_t space;
-	int i;
-
-	/*
-	 * Out-of-tree fix: this event handler is registered for every
-	 * process_exit / process_exec in the kernel, but only processes
-	 * that have been initialized with a Mach task have p_machdata
-	 * set (via mach_task_init). Without that guard, ipc_entry_list_close
-	 * was page-faulting on current_space() -> p_machdata->itk_space
-	 * for any non-Mach process, including kldload itself right after
-	 * loading mach.ko. Skip processes that never picked up Mach state,
-	 * and non-native ABI ones, whose p_machdata is not a task at all
-	 * (see mach_proc_task(), nextbsd-kernel#63/#66).
-	 */
-	if (mach_proc_task(p) == TASK_NULL ||
-	    mach_proc_task(curthread->td_proc) == TASK_NULL)
-		return;
+	int i, lastfile;
 
 	fdp = p->p_fd;
 	td = curthread;
-	space = current_space();
-
-	/* do we want to just return if the refcount is > 1 or should we
-	 * bar this from happening in the first place?
-	 **/
-	KASSERT(fdp->fd_refcnt == 1, ("the fdtable should not be shared"));
 
 	FILEDESC_SLOCK(fdp);
-	int lastfile = fdlastfile(fdp);
+	lastfile = fdlastfile(fdp);
 	FILEDESC_SUNLOCK(fdp);
 	for (i = 0; i <= lastfile; i++) {
 		fde = &fdp->fd_ofiles[i];
@@ -845,6 +824,60 @@ ipc_entry_list_close(void *arg __unused, struct proc *p)
 	}
 	FILEDESC_SUNLOCK(fdp);
 #endif
+}
+
+/*
+ * Destroy all of p's port names. Shared by the exit and exec hooks.
+ */
+static void
+ipc_entry_list_close(struct proc *p)
+{
+	struct filedesc *fdp;
+	struct file *fp;
+	struct thread *td;
+	ipc_entry_t entry;
+	ipc_space_t space;
+	int i;
+	static int shared_logged;
+
+	/*
+	 * Out-of-tree fix: this event handler is registered for every
+	 * process_exit / process_exec in the kernel, but only processes
+	 * that have been initialized with a Mach task have p_machdata
+	 * set (via mach_task_init). Without that guard, ipc_entry_list_close
+	 * was page-faulting on current_space() -> p_machdata->itk_space
+	 * for any non-Mach process, including kldload itself right after
+	 * loading mach.ko. Skip processes that never picked up Mach state,
+	 * and non-native ABI ones, whose p_machdata is not a task at all
+	 * (see mach_proc_task(), nextbsd-kernel#63/#66).
+	 */
+	if (mach_proc_task(p) == TASK_NULL ||
+	    mach_proc_task(curthread->td_proc) == TASK_NULL)
+		return;
+
+	fdp = p->p_fd;
+	td = curthread;
+	space = current_space();
+
+	/*
+	 * A shared fd table (rfork(2) without RFFDG) also holds the names of
+	 * every other process sharing it; closing all of its Mach fds would
+	 * destroy their ports. This used to be KASSERT(fd_refcnt == 1), which
+	 * compiles out without INVARIANTS. Leave the names alone instead: the
+	 * entries still belong to files the table holds, so the drain below
+	 * must not run either, and mach_task_exit() leaks the non-empty space
+	 * rather than destroying it.
+	 */
+	if (fdp->fd_refcnt > 1) {
+		if (!shared_logged) {
+			shared_logged = 1;
+			log(LOG_WARNING, "%s:%d: shared fd table, Mach port "
+			    "names not closed\n", p->p_comm, p->p_pid);
+		}
+		return;
+	}
+
+	ipc_entry_close_fd_names(p);
 
 	/*
 	 * Out-of-tree fix (nextbsd-kernel#63): p_machdata being set does NOT
@@ -882,11 +915,39 @@ ipc_entry_list_close(void *arg __unused, struct proc *p)
  * their fds are closed above.
  */
 static void
-ipc_entry_exit_hook(void *arg, struct proc *p)
+ipc_entry_exit_hook(void *arg __unused, struct proc *p)
 {
 
-	ipc_entry_list_close(arg, p);
+	ipc_entry_list_close(p);
 	mach_task_exit(mach_proc_task(p));
+}
+
+/*
+ * process_exec: names die with exec; the task, its space and its special
+ * ports (bootstrap above all, which launchd sets before fork and expects the
+ * child to keep across execve) carry over, as in XNU.
+ *
+ * This runs before sv_onexec, so p->p_sysent is still the old ABI and
+ * imgp->sysent the new one. Leaving a Linux image (Linux -> native): the old
+ * p_emuldata is a linux_pemuldata, which mach_proc_task() refuses, and the
+ * Linux layer frees it afterwards. Entering one (native -> Linux): the task
+ * is torn down and detached now, before linux_on_exec() installs its pem in
+ * the same slot.
+ */
+static void
+ipc_entry_exec_hook(void *arg __unused, struct proc *p,
+    struct image_params *imgp)
+{
+	task_t task;
+
+	task = mach_proc_task(p);
+	if (task == TASK_NULL)
+		return;
+
+	ipc_entry_list_close(p);
+
+	if ((imgp->sysent->sv_flags & SV_ABI_MASK) != SV_ABI_FREEBSD)
+		mach_task_orphan(p);
 }
 
 static void
@@ -903,7 +964,7 @@ ipc_entry_sysinit(void *arg __unused)
 	 * ipc_entry_list_close (the p_machdata == NULL early return).
 	 */
 	EVENTHANDLER_REGISTER(process_exit, ipc_entry_exit_hook, NULL, EVENTHANDLER_PRI_ANY);
-	EVENTHANDLER_REGISTER(process_exec, ipc_entry_list_close, NULL, EVENTHANDLER_PRI_ANY);
+	EVENTHANDLER_REGISTER(process_exec, ipc_entry_exec_hook, NULL, EVENTHANDLER_PRI_ANY);
 }
 
 SYSINIT(ipc_entry, SI_SUB_KLD, SI_ORDER_ANY, ipc_entry_sysinit, NULL);

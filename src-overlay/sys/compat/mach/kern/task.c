@@ -1122,8 +1122,8 @@ task_synchronizer_destroy_all(task_t task)
  * still holds a dead task, that struct is leaked rather than freed (a
  * reference to it may still be in flight) and counted in mach.task_orphaned.
  *
- * mach_task_init() itself is the original process_init handler. It is not
- * registered (see task_sysinit).
+ * mach_task_init() below is the original process_init handler. It was never
+ * registered (see task_sysinit) and is compiled out.
  */
 static long task_uniqueid;
 
@@ -1265,11 +1265,12 @@ mach_task_recycle(task_t task, struct proc *p)
 }
 
 /*
- * The Linux layer is about to overwrite p's p_emuldata. Anything there now
- * is a dead task left by the previous owner of the proc struct: terminate it
- * (defensive; exit already did) and leak it.
+ * The Linux layer is about to overwrite p's p_emuldata: at fork, where the
+ * slot can only hold a dead task left by the previous owner of the proc
+ * struct, and at a native -> Linux exec, where it holds p's own task.
+ * Terminate the task (a no-op if already terminated), detach it and leak it.
  */
-static void
+void
 mach_task_orphan(struct proc *p)
 {
 	task_t task;
@@ -1282,6 +1283,12 @@ mach_task_orphan(struct proc *p)
 	atomic_add_long(&mach_task_orphaned, 1);
 }
 
+#if 0
+/*
+ * Never registered (see task_sysinit); kept for reference only. The live
+ * paths are mach_task_alloc/mach_task_recycle above and the fork hook below
+ * (nextbsd-kernel#153).
+ */
 static void
 mach_task_init(void *arg __unused, struct proc *p)
 {
@@ -1302,6 +1309,7 @@ mach_task_init(void *arg __unused, struct proc *p)
 		task_create_internal(task);
 	}
 }
+#endif
 
 /*
  * mach_task_init_lazy — give a process a Mach task on demand.
@@ -1355,6 +1363,8 @@ mach_task_init_lazy(struct proc *p)
 	return (0);
 }
 
+#if 0
+/* Never registered either; superseded by mach_task_fork_bsport (#153). */
 static void
 mach_task_fork(void *arg __unused, struct proc *p1, struct proc *p2, int flags __unused)
 {
@@ -1392,6 +1402,7 @@ mach_task_fork(void *arg __unused, struct proc *p1, struct proc *p2, int flags _
 	task->itk_puniqueid = parent_task->itk_uniqueid;
 	task_init_internal(parent_task, task);
 }
+#endif
 
 static int
 uma_task_init(void *_thread, int a, int b)

@@ -387,6 +387,10 @@ extern task_t		mach_proc_task(
 extern void		mach_task_exit(
 				task_t	task);
 
+/* Terminate, detach and leak p's task before the Linux ABI takes the slot. */
+extern void		mach_task_orphan(
+				struct proc	*p);
+
 extern task_t		kernel_task;
 
 #endif	/* _KERN_TASK_H_ */
