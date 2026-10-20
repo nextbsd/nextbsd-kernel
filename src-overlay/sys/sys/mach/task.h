@@ -377,6 +377,20 @@ extern void		task_unfreeze(
 
 extern void		consider_task_collect(void);
 
+struct proc;
+
+/* p's Mach task; TASK_NULL if none or if p is not native ABI. */
+extern task_t		mach_proc_task(
+				struct proc	*p);
+
+/* Tear down a task's per-process state at exit (nextbsd-kernel#266). */
+extern void		mach_task_exit(
+				task_t	task);
+
+/* Terminate, detach and leak p's task before the Linux ABI takes the slot. */
+extern void		mach_task_orphan(
+				struct proc	*p);
+
 extern task_t		kernel_task;
 
 #endif	/* _KERN_TASK_H_ */

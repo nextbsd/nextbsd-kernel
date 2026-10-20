@@ -109,7 +109,7 @@ mach_space_to_proc(ipc_space_t space)
 	if (space == NULL)
 		return (NULL);
 	FOREACH_PROC_IN_SYSTEM(q) {
-		t = (task_t)q->p_machdata;
+		t = mach_proc_task(q);
 		if (t != NULL && t->itk_space == space)
 			return (q);
 	}
@@ -140,7 +140,7 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 	found = 0;
 	sx_slock(&allproc_lock);
 	FOREACH_PROC_IN_SYSTEM(p) {
-		task = (task_t)p->p_machdata;
+		task = mach_proc_task(p);
 		if (task == NULL)
 			continue;
 		space = task->itk_space;

@@ -57,6 +57,7 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm_param.h>
 
 #include <sys/mach/mach_types.h>
+#include <sys/mach/task.h>
 #include <sys/mach/ipc/ipc_kmsg.h>
 #include <sys/mach/thread.h>
 #define PRIVATE
@@ -324,8 +325,8 @@ proc_puniqueid(struct proc *p)
 {
 	task_t task;
 	
-	task = p->p_machdata;
-	return (task->itk_puniqueid);
+	task = mach_proc_task(p);
+	return (task != TASK_NULL ? task->itk_puniqueid : 0);
 }
 
 static uint64_t
@@ -333,8 +334,8 @@ proc_uniqueid(struct proc *p)
 {
 	task_t task;
 
-	task = p->p_machdata;
-	return (task->itk_uniqueid);
+	task = mach_proc_task(p);
+	return (task != TASK_NULL ? task->itk_uniqueid : 0);
 }
 
 static void
