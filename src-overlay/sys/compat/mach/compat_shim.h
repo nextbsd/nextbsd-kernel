@@ -104,22 +104,10 @@ enum {
 #define	kn_ext		kn_kevent.ext
 
 /*
- * Apple-shape file-descriptor type tags ravynOS adds to FreeBSD headers
- * so Mach ports can be wrapped as file descriptors visible to procstat,
- * fstat, etc. Stock FreeBSD has none of these defined. Values match
- * ravynOS's sys/sys/stat.h, sys/sys/file.h, sys/sys/user.h.
- */
-#define	S_IFPORT	0150000		/* mach port */
-#define	S_IFPSET	0160000		/* mach portset */
-#define	DTYPE_MACH_IPC	32		/* port or portset */
-#define	KF_TYPE_PORT	253
-#define	KF_TYPE_PORTSET	254
-
-/*
- * ipc_entry.c calls audit_sysclose, which IS in stock FreeBSD with the
- * same signature — just declared in <security/audit/audit.h>, which
- * ipc_entry.c doesn't include directly. Pull it in here so the
- * prototype is visible.
+ * <security/audit/audit.h> was pulled in here for ipc_entry.c's
+ * audit_sysclose(), from when port names were fds (gone since #152). Kept
+ * so nothing that picked up the audit declarations through this header
+ * loses them.
  */
 #include <security/audit/audit.h>
 

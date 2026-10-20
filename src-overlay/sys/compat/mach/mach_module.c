@@ -123,6 +123,7 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 	struct proc *p;
 	ipc_space_t space;
 	ipc_entry_t entry;
+	ipc_entry_num_t i;
 	ipc_port_t port;
 	task_t task;
 	struct proc *owner;
@@ -146,8 +147,12 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 		space = task->itk_space;
 		if (space == NULL)
 			continue;
-		PROC_LOCK(p);
-		LIST_FOREACH(entry, &space->is_entry_list, ie_space_link) {
+		is_read_lock(space);
+		for (i = 0; space->is_table != NULL &&
+		    i < space->is_table_size; i++) {
+			entry = space->is_table[i].ies_entry;
+			if (entry == IE_NULL)
+				continue;
 			if (entry->ie_bits & MACH_PORT_TYPE_PORT_SET)
 				continue;
 			port = (ipc_port_t)entry->ie_object;
@@ -206,10 +211,10 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 			 * registered on the stranded set and that it is EV_CLEAR,
 			 * which is what identified nextbsd-userland#135. Anything
 			 * needing it again should take ip_lock(port) first, which
-			 * this handler cannot do while holding PROC_LOCK.
+			 * R1 allows under the space lock this walk holds.
 			 */
 		}
-		PROC_UNLOCK(p);
+		is_read_unlock(space);
 	}
 	sx_sunlock(&allproc_lock);
 

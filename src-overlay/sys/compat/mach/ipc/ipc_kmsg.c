@@ -566,8 +566,8 @@ ipc_kmsg_destroy(ipc_kmsg_t	kmsg)
 
 	/*
 	 *	DispatchWorker (libdispatch pthread-workqueue) threads reach here
-	 *	on exit — when the kernel walks their fd table to close Mach ports
-	 *	(mach_port_close -> ipc_port_destroy) — without ever having gone
+	 *	on exit — when the kernel walks their space to close Mach ports
+	 *	(ipc_entry_teardown -> ipc_port_destroy) — without ever having gone
 	 *	through mach.ko's thread-init path.  Their td_machdata is NULL, so
 	 *	the current_thread()->ith_messages deref in ipc_kmsg_delayed_destroy
 	 *	page-faults (#148; mirrors the #252 filt_machport fix).  Give the
