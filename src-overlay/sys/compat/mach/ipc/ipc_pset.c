@@ -596,9 +596,10 @@ struct filterops machport_filtops = {
 	 * through the calling task's ipc_space (see filt_machportattach). With
 	 * f_isfd = 1 the kqueue core called fget(kev.ident) before attach and
 	 * held an fp reference for the knote's whole life -- which worked only
-	 * because port names happen to be file descriptors in this port. XNU
+	 * because port names used to be file descriptors in this port. XNU
 	 * resolves EVFILT_MACHPORT idents through ipc_space and its names are
-	 * never fds; this is that shape.
+	 * never fds; this is that shape, and since #152 names are not fds here
+	 * either.
 	 *
 	 * Consequences of the flip, all handled below: the knote is stored in
 	 * kq_knhash rather than kq_knlist[fd], knote_fdclose() no longer reaps
@@ -790,9 +791,12 @@ filt_machportdetach(struct knote *kn)
 /*
  * f_touch: needed only for EVENT_REGISTER on a knote whose port set is gone.
  *
- * In this port a name is recycled (kern_fdalloc() returns the lowest free
- * fd), so after ipc_pset_destroy() the same (ident, EVFILT_MACHPORT) can be
- * EV_ADDed for a NEW set while the old knote still sits in kq_knhash.
+ * A name can be reused, so after ipc_pset_destroy() the same (ident,
+ * EVFILT_MACHPORT) can be EV_ADDed for a NEW set while the old knote still
+ * sits in kq_knhash. Lowest-free fd recycling made that routine; since
+ * #151/#152 a reused slot carries a new generation, so it takes an exact
+ * name reuse: mach_port_allocate_name(), mach_port_rename(), or a
+ * generation wrap.
  * kqueue_register() then takes the modify path (kern_event.c:1870-1905):
  * no f_attach, the knote stays bound to the dead set, the new set's
  * ips_note stays empty and its delivery is lost silently -- and the stale
@@ -925,7 +929,7 @@ filt_machport(struct knote *kn, long hint)
 			 * true. #147 changed the seed to kn->kn_hook, a snapshot
 			 * taken at attach time, which genuinely diverges -- a kq
 			 * scanned in a different process than the registering
-			 * task, or a recycled port-set fd.
+			 * task, or a reused port-set name.
 			 */
 			if (pset != cached)
 				ips_unlock(pset);
