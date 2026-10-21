@@ -58,6 +58,7 @@ struct mach_wait_quiet_args;
 struct task_for_pid_args;
 struct task_name_for_pid_args;
 struct task_set_importance_watchports_np_args;
+struct task_importance_assertion_np_args;
 
 SYSCTL_DECL(_mach);
 static SYSCTL_NODE(_mach, OID_AUTO, syscall, CTLFLAG_RW, 0,
@@ -94,6 +95,8 @@ int sys_task_for_pid(struct thread *, struct task_for_pid_args *);
 int sys_task_name_for_pid(struct thread *, struct task_name_for_pid_args *);
 int sys_task_set_importance_watchports_np(struct thread *,
     struct task_set_importance_watchports_np_args *);
+int sys_task_importance_assertion_np(struct thread *,
+    struct task_importance_assertion_np_args *);
 
 /*
  * Phase C2: lazy Mach init. If the calling process/thread has no
@@ -473,6 +476,20 @@ static struct sysent task_name_for_pid_sysent = {
 	.sy_flags	= 0,
 };
 
+/*
+ * task_importance_assertion_np sysent (nextbsd#539 part G). 1 arg:
+ * (action). No lazy-init guard: a process with no Mach state has no
+ * task to hold an assertion on, and the trap handles that itself
+ * (success while mach.importance is 0, EINVAL otherwise, as for any
+ * task that is not an importance receiver).
+ */
+static struct sysent task_importance_assertion_np_sysent = {
+	.sy_narg	= 1,
+	.sy_call	= (sy_call_t *)sys_task_importance_assertion_np,
+	.sy_auevent	= AUE_NULL,
+	.sy_flags	= 0,
+};
+
 static int mach_reply_port_offset = NO_SYSCALL;
 static struct sysent mach_reply_port_old_sysent;
 
@@ -514,6 +531,9 @@ static struct sysent task_set_importance_watchports_np_old_sysent;
 
 static int task_name_for_pid_offset = NO_SYSCALL;
 static struct sysent task_name_for_pid_old_sysent;
+
+static int task_importance_assertion_np_offset = NO_SYSCALL;
+static struct sysent task_importance_assertion_np_old_sysent;
 
 SYSCTL_INT(_mach_syscall, OID_AUTO, mach_reply_port, CTLFLAG_RD,
     &mach_reply_port_offset, 0,
@@ -597,6 +617,12 @@ SYSCTL_INT(_mach_syscall, OID_AUTO, task_name_for_pid, CTLFLAG_RD,
     &task_name_for_pid_offset, 0,
     "Dynamically-allocated FreeBSD syscall number for task_name_for_pid "
     "(3-arg syscall; -1 if registration failed)");
+
+SYSCTL_INT(_mach_syscall, OID_AUTO, task_importance_assertion_np,
+    CTLFLAG_RD, &task_importance_assertion_np_offset, 0,
+    "Dynamically-allocated FreeBSD syscall number for "
+    "task_importance_assertion_np (1-arg syscall; -1 if registration "
+    "failed)");
 
 static void
 wire_one(const char *name, int *offset, struct sysent *sy,
@@ -699,12 +725,19 @@ mach_syscall_wire_register(void *arg __unused)
 	    &task_set_importance_watchports_np_old_sysent);
 	wire_one("task_name_for_pid", &task_name_for_pid_offset,
 	    &task_name_for_pid_sysent, &task_name_for_pid_old_sysent);
+	wire_one("task_importance_assertion_np",
+	    &task_importance_assertion_np_offset,
+	    &task_importance_assertion_np_sysent,
+	    &task_importance_assertion_np_old_sysent);
 }
 
 static void
 mach_syscall_wire_deregister(void *arg __unused)
 {
 
+	unwire_one("task_importance_assertion_np",
+	    &task_importance_assertion_np_offset,
+	    &task_importance_assertion_np_old_sysent);
 	unwire_one("task_name_for_pid", &task_name_for_pid_offset,
 	    &task_name_for_pid_old_sysent);
 	unwire_one("task_set_importance_watchports_np",

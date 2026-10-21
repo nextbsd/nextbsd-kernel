@@ -442,6 +442,63 @@ out:
 	return (0);
 }
 
+/*
+ * task_importance_assertion_np (nextbsd#539 part G): hold or drop one
+ * external (userspace-managed) importance assertion on the caller's own
+ * task.
+ *
+ * This is NextBSD's form of xnu-2422's process_policy(PROC_POLICY_SCOPE_
+ * PROCESS, PROC_POLICY_ACTION_HOLD/DROP, PROC_POLICY_BOOST,
+ * PROC_POLICY_IMP_IMPORTANT, ..., getpid()), which libproc's
+ * proc_importance_assertion_begin_with_msg() and
+ * proc_importance_assertion_complete() call (bsd/kern/process_policy.c,
+ * handle_boost()).  action takes xnu-2422's values,
+ * PROC_POLICY_ACTION_HOLD (14) and PROC_POLICY_ACTION_DROP (15).  There
+ * is no target argument: like handle_boost(), it only ever acts on the
+ * calling task.
+ *
+ * Returns 0, or an errno as process_policy does:
+ *   EINVAL     an unknown action, or the task is not an importance
+ *              receiver (xnu-2422 checks task_is_importance_receiver());
+ *   EOVERFLOW  a hold while the task holds no external assertion, or a
+ *              drop of more than it holds (the part D helpers; the counts
+ *              are clamped at zero, never wrapped).
+ *
+ * While mach.importance is 0 it always succeeds: a hold does nothing, and
+ * a drop only drains a count left over from when the sysctl was 1 (part D
+ * keeps that promise for ports, too), with its error ignored.
+ */
+#define	XNU_PROC_POLICY_ACTION_HOLD	14
+#define	XNU_PROC_POLICY_ACTION_DROP	15
+
+int
+sys_task_importance_assertion_np(struct thread *td,
+    struct task_importance_assertion_np_args *uap)
+{
+	task_t self;
+	int error;
+
+	if (uap->action != XNU_PROC_POLICY_ACTION_HOLD &&
+	    uap->action != XNU_PROC_POLICY_ACTION_DROP)
+		return (EINVAL);
+
+	self = mach_proc_task(td->td_proc);
+	if (mach_importance == 0) {
+		if (uap->action == XNU_PROC_POLICY_ACTION_DROP &&
+		    self != TASK_NULL)
+			(void)task_importance_drop_external_assertion(self, 1);
+		return (0);
+	}
+
+	if (!task_is_importance_receiver(self))
+		return (EINVAL);
+	if (uap->action == XNU_PROC_POLICY_ACTION_HOLD)
+		error = task_importance_hold_external_assertion(self, 1);
+	else
+		error = task_importance_drop_external_assertion(self, 1);
+	return (error);
+}
+
 int
 sys_thread_switch(struct thread *td __unused, struct thread_switch_args *uap)
 {
