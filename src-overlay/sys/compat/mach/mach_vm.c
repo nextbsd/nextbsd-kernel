@@ -312,12 +312,15 @@ mach_make_memory_entry_64(vm_map_t target_task, memory_object_size_t *size,
 
 
 int
-mach_vm_msync(vm_map_t target_task __unused, mach_vm_address_t addr, mach_vm_size_t size,
+mach_vm_msync(vm_map_t target_task, mach_vm_address_t addr, mach_vm_size_t size,
 		vm_sync_t flags)
 {
 	struct msync_args cup;
 	int error;
 
+	/* convert_port_to_map() gives VM_MAP_NULL for a bad port (#300). */
+	if (target_task == VM_MAP_NULL)
+		return (KERN_INVALID_ARGUMENT);
 	cup.addr = (void *)addr;
 	cup.len = size;
 	cup.flags = 0;
@@ -343,6 +346,9 @@ mach_vm_copy(vm_map_t target_task, mach_vm_address_t src, mach_vm_size_t size,
 	char *tmpbuf;
 	int error;
 
+	/* convert_port_to_map() gives VM_MAP_NULL for a bad port (#300). */
+	if (target_task == VM_MAP_NULL)
+		return (KERN_INVALID_ARGUMENT);
 #ifdef DEBUG_MACH_VM
 	printf("mach_vm_copy: src = 0x%08lx, size = 0x%08lx, addr = 0x%08lx\n",
 	    (long)req->req_src, (long)req->req_size, (long)req->req_addr);
@@ -384,6 +390,9 @@ mach_vm_read(vm_map_t map, mach_vm_address_t addr, mach_vm_size_t size,
 	vm_offset_t dstaddr;
 	int error;
 
+	/* convert_port_to_map() gives VM_MAP_NULL for a bad port (#300). */
+	if (map == VM_MAP_NULL)
+		return (KERN_INVALID_ARGUMENT);
 	size = round_page(size);
 
 	if ((error = mach_vm_allocate(map, &dstaddr, size, 0)))
@@ -439,7 +448,9 @@ mach_vm_machine_attribute(vm_map_t target_task, mach_vm_address_t addr, mach_vm_
 	int error = 0;
 	vm_machine_attribute_val_t value;
 
-	
+	/* convert_port_to_map() gives VM_MAP_NULL for a bad port (#300). */
+	if (target_task == VM_MAP_NULL)
+		return (KERN_INVALID_ARGUMENT);
 	if ((error = copyin(valuep, &value, sizeof(value))))
 		return (KERN_PROTECTION_FAILURE);
 

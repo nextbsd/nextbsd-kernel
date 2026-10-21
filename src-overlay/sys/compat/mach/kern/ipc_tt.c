@@ -814,6 +814,18 @@ task_get_special_port(
 	if (task == TASK_NULL)
 		return KERN_INVALID_ARGUMENT;
 
+	/*
+	 * nextbsd-kernel#300: task may be another process's, so read its
+	 * ports under itk_lock and refuse a terminated task, as XNU does:
+	 * ipc_task_terminate() clears itk_self under itk_lock before it
+	 * releases the special ports.
+	 */
+	itk_lock(task);
+	if (task->itk_self == IP_NULL) {
+		itk_unlock(task);
+		return KERN_FAILURE;
+	}
+
 	switch (which) {
 	case TASK_KERNEL_PORT:
 		port = ipc_port_copy_send(task->itk_sself);
@@ -829,23 +841,7 @@ task_get_special_port(
 
 	    case TASK_BOOTSTRAP_PORT:
 			port = ipc_port_copy_send(task->itk_bootstrap);
-		/*
-		 * freebsd-launchd-mach extension: if this task's
-		 * itk_bootstrap is unset (no launchd-as-PID-1 to inherit
-		 * from yet), fall back to the host-wide bootstrap port
-		 * registered by the bootstrap server via
-		 * host_set_special_port(HOST_BOOTSTRAP_PORT, ...). This
-		 * is the cross-task discovery path G2b adds: any
-		 * process can find the bootstrap server's port without
-		 * needing the per-task slot to be populated first.
-		 */
-		if (port == IP_NULL) {
-			host_lock(&realhost);
-			if (IP_VALID(realhost.special[HOST_BOOTSTRAP_PORT]))
-				port = ipc_port_copy_send(
-				    realhost.special[HOST_BOOTSTRAP_PORT]);
-			host_unlock(&realhost);
-		}
+		/* The host-wide fallback is taken below, after itk_unlock. */
 		break;
 
 	    case TASK_SEATBELT_PORT:
@@ -860,7 +856,27 @@ task_get_special_port(
 		port = ipc_port_copy_send(task->itk_debug_control);
 		break;
 	    default:
+		itk_unlock(task);
 		return KERN_INVALID_ARGUMENT;
+	}
+	itk_unlock(task);
+
+	/*
+	 * freebsd-launchd-mach extension: if this task's
+	 * itk_bootstrap is unset (no launchd-as-PID-1 to inherit
+	 * from yet), fall back to the host-wide bootstrap port
+	 * registered by the bootstrap server via
+	 * host_set_special_port(HOST_BOOTSTRAP_PORT, ...). This
+	 * is the cross-task discovery path G2b adds: any
+	 * process can find the bootstrap server's port without
+	 * needing the per-task slot to be populated first.
+	 */
+	if (which == TASK_BOOTSTRAP_PORT && port == IP_NULL) {
+		host_lock(&realhost);
+		if (IP_VALID(realhost.special[HOST_BOOTSTRAP_PORT]))
+			port = ipc_port_copy_send(
+			    realhost.special[HOST_BOOTSTRAP_PORT]);
+		host_unlock(&realhost);
 	}
 
 	*portp = port;
@@ -894,7 +910,6 @@ task_set_special_port(
 #if VERBOSE_DEBUGGING
 	printf("task_set_special_port(task=%p, which=%d, port=%p)\n",task, which, port);
 #endif
-	/* we only support the current task */
 	if (task == TASK_NULL)
 		return KERN_INVALID_ARGUMENT;
 
@@ -921,15 +936,16 @@ task_set_special_port(
 		return KERN_INVALID_ARGUMENT;
 	}/* switch */
 
-	if ((TASK_SEATBELT_PORT == which  || TASK_ACCESS_PORT == which) 
-		&& IP_VALID(*whichp)) {
-			itk_unlock(task);
-			return KERN_NO_ACCESS;
-	}
 	itk_lock(task);
 	if (task->itk_self == IP_NULL) {
 		itk_unlock(task);
 		return KERN_FAILURE;
+	}
+	/* Do not allow overwrite of seatbelt or task access ports (XNU). */
+	if ((TASK_SEATBELT_PORT == which  || TASK_ACCESS_PORT == which) 
+		&& IP_VALID(*whichp)) {
+			itk_unlock(task);
+			return KERN_NO_ACCESS;
 	}
 
 	old = *whichp;
@@ -1087,6 +1103,17 @@ mach_ports_lookup(
  *		which may be null.
  *	Conditions:
  *		Nothing locked.
+ *
+ *	As XNU's: the port must be an active IKOT_TASK port, and the task
+ *	reference is taken under the port lock (ref_task_port_locked).
+ *	Anything else -- a dead port, a name port, a thread or host port --
+ *	gives TASK_NULL, which every task routine answers with
+ *	KERN_INVALID_ARGUMENT. The MIG stubs drop the reference with the
+ *	task_t destructor, task_deallocate() (nextbsd-kernel#300).
+ *
+ *	Task structs are never freed (see the lifecycle comment in task.c),
+ *	so a reference that outlives the task's process is harmless; the
+ *	routines that touch IPC state check itk_self under itk_lock.
  */
 
 task_t
@@ -1095,9 +1122,6 @@ convert_port_to_task(
 {
 	boolean_t r;
 	task_t task = TASK_NULL;
-
-	/* currently only handle current task */
-	return (current_task());
 
 	r = FALSE;
 	while (!r && IP_VALID(port)) {
@@ -1200,6 +1224,15 @@ ref_space_port_locked( ipc_port_t port, ipc_space_t *pspace )
  *		Nothing locked.
  */
 
+/*
+ *	NextBSD: only the caller's own map is handed out (nextbsd-kernel#300).
+ *	The Mach VM routines here work on the calling process (they call
+ *	sys_munmap(curthread, ...), copyout() and the like), and no vmspace
+ *	reference is taken, so another process's map could be freed under
+ *	the caller. A live task port for another task therefore gives
+ *	VM_MAP_NULL, as a dead or non-task port does, rather than silently
+ *	acting on the caller. vm_map_deallocate() is a no-op.
+ */
 vm_map_t
 convert_port_to_map(
 	ipc_port_t	port)
@@ -1212,7 +1245,7 @@ convert_port_to_map(
 	if (task == TASK_NULL)
 		return VM_MAP_NULL;
 
-	map = &task->itk_p->p_vmspace->vm_map;
+	map = (task == current_task()) ? current_map() : VM_MAP_NULL;
 	task_deallocate(task);
 	return (map);
 }

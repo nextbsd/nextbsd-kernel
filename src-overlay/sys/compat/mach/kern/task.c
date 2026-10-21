@@ -305,6 +305,18 @@ kern_return_t
 task_terminate(
 	register task_t	task)
 {
+
+	/*
+	 * nextbsd-kernel#300: convert_port_to_task() now returns the port's
+	 * own task, which may be TASK_NULL or another process's. Only the
+	 * IPC teardown below is implemented: nothing stops the target's
+	 * threads, so tearing down another task's space while it runs is
+	 * refused rather than attempted.
+	 */
+	if (task == TASK_NULL)
+		return (KERN_INVALID_ARGUMENT);
+	if (task != current_task())
+		return (KERN_FAILURE);
 #ifdef notyet	
 	register thread_t	thread, cur_thread;
 #if 0
@@ -1028,6 +1040,8 @@ task_get_assignment(
 	task_t		task,
 	processor_set_t	*pset)
 {
+	if (task == TASK_NULL)
+		return (KERN_INVALID_ARGUMENT);
 	if (!task->active)
 		return(KERN_FAILURE);
 
