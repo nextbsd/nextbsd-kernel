@@ -274,7 +274,9 @@ ipc_right_dnrequest(
 		kern_return_t kr;
 
 		kr = ipc_right_lookup_write(space, name, &entry);
-		ip_unlock_assert(port);
+		/* port is IP_NULL on the first pass */
+		if (port != IP_NULL)
+			ip_unlock_assert(port);
 		if (kr != KERN_SUCCESS)
 			return kr;
 		/* space is write-locked and active */
