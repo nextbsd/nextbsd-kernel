@@ -81,12 +81,6 @@
  * task_info (3405) is the only routine whose request port is a task_name_t
  * rather than a task_t -- the frozen stub calls convert_port_to_task_name().
  *
- * No UserPrefix.  mach_port.defs needs one because libmach already defines
- * trap wrappers under the public mach_port_* names; nothing in libmach
- * defines task_* or thread_create* today, so the generated client can own
- * the plain names and there is nothing to collide with.  Revisit if and when
- * task traps land.
- *
  * Signatures were cross-checked field-by-field against the frozen
  * __Request__/__Reply__ structs and against the argument list each _X stub
  * passes to the kernel: 36/36 agree.
@@ -97,6 +91,22 @@ subsystem
 	KernelServer
 #endif	/* NEXTBSD_KERNEL_SERVER */
 	task 3400;
+
+/*
+ * UserPrefix _kernelrpc_ -- nextbsd-userland#84 (step 4) and #93.
+ *
+ * It renames only the generated CLIENT stubs: the libmach client is
+ * _kernelrpc_task_* / _kernelrpc_thread_*, and libmach keeps the public
+ * names as wrappers over it, the same arrangement as mach_port.defs.
+ * libmach already defines task_get_special_port, task_set_special_port,
+ * task_policy_set/get and task_set_exception_ports under the public
+ * names, so a plain-name client would collide at link time.
+ *
+ * The kernel server is unaffected: gen-mig-servers.sh sends -user to
+ * /dev/null, and task_server.c regenerated with and without this line is
+ * byte-identical (_X* names, handler calls and every msgh_id).
+ */
+UserPrefix _kernelrpc_;
 
 /*
  * As with mach_port.defs: std_types.defs and mach_types.defs are the WIRE

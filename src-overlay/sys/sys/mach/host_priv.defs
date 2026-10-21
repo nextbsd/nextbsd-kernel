@@ -111,6 +111,22 @@ subsystem
 	host_priv 400;
 
 /*
+ * UserPrefix _kernelrpc_ -- nextbsd-userland#84 (step 4) and #93.
+ *
+ * It renames only the generated CLIENT stubs: the libmach client is
+ * _kernelrpc_host_*, and libmach keeps the public names as wrappers over
+ * it, the same arrangement as mach_port.defs.  libmach already defines
+ * host_set_special_port, host_set_exception_ports, host_reboot and
+ * host_get_host_port under the public names, so a plain-name client would
+ * collide at link time.
+ *
+ * The kernel server is unaffected: gen-mig-servers.sh sends -user to
+ * /dev/null, and host_priv_server.c regenerated with and without this line is
+ * byte-identical (_X* names, handler calls and every msgh_id).
+ */
+UserPrefix _kernelrpc_;
+
+/*
  * std_types.defs / mach_types.defs are nextbsd-userland's -- one copy of the
  * wire types, shared by this server and the libmach client.  clock_types.defs
  * and mach_debug_types.defs are ours, because userland has none.
