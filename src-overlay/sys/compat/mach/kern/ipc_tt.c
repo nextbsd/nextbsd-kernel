@@ -1375,7 +1375,8 @@ host_set_exception_ports(
 		return KERN_INVALID_ARGUMENT;
 
 	if (IP_VALID(new_port)) {
-		switch (new_behavior) {
+		/* nextbsd-userland#93: accept MACH_EXCEPTION_CODES, as XNU does. */
+		switch (new_behavior & ~MACH_EXCEPTION_MASK) {
 		case EXCEPTION_DEFAULT:
 		case EXCEPTION_STATE:
 		case EXCEPTION_STATE_IDENTITY:
@@ -1432,7 +1433,8 @@ task_set_exception_ports(
 	}
 
 	if (IP_VALID(new_port)) {
-		switch (new_behavior) {
+		/* nextbsd-userland#93: accept MACH_EXCEPTION_CODES, as XNU does. */
+		switch (new_behavior & ~MACH_EXCEPTION_MASK) {
 		case EXCEPTION_DEFAULT:
 		case EXCEPTION_STATE:
 		case EXCEPTION_STATE_IDENTITY:
