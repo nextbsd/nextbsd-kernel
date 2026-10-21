@@ -1,0 +1,66 @@
+From bca91b433d745bd0792724e25f871a39211f8afe Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 21 Oct 2026 08:46:11 -0500
+Subject: [PATCH] kern_cons: mute from cninit() for boot_mutemsgs
+
+boot_mutemsgs (RB_MUTEMSGS) only muted the console at the
+SI_SUB_COPYRIGHT SYSINIT, so everything the kernel printed before that,
+plus "-- Muting boot messages --" itself, still reached the console.
+
+Mute in cninit() instead, alongside the existing RB_MUTE check, so a
+normal boot prints nothing from the kernel handoff onward.  Single-user,
+verbose and askname boots stay unmuted, and panic() still clears
+cn_mute.  RB_MUTE (boot_mute) is deliberately not used: it also turns
+on the vt splash.
+
+mute_console() now also exempts RB_SINGLE and RB_ASKNAME, matching
+cninit(), so the askname root-device prompt stays visible.  It also
+does nothing when cninit() has already muted, so the "Muting" line is
+not printed (or logged to the message buffer) on a muted boot.
+
+Part of nextbsd/nextbsd#505.
+---
+ sys/kern/kern_cons.c | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/sys/kern/kern_cons.c b/sys/kern/kern_cons.c
+index fbe52735..a8ee531e 100644
+--- a/sys/kern/kern_cons.c
++++ b/sys/kern/kern_cons.c
+@@ -142,7 +142,13 @@ static void
+ mute_console(void *data __unused)
+ {
+ 
+-	if ((boothowto & (RB_MUTEMSGS | RB_VERBOSE)) == RB_MUTEMSGS) {
++	/*
++	 * Normally cninit() has already muted the console for
++	 * RB_MUTEMSGS, so there is nothing to announce.  This is only a
++	 * fallback for a console that was not muted that early.
++	 */
++	if (cn_mute == 0 && (boothowto & (RB_MUTEMSGS | RB_SINGLE |
++	    RB_VERBOSE | RB_ASKNAME)) == RB_MUTEMSGS) {
+ 		printf("-- Muting boot messages --\n");
+ 		cn_mute = 1;
+ 	}
+@@ -160,12 +166,13 @@ cninit(void)
+ 	 * Check if we should mute the console (for security reasons perhaps)
+ 	 * It can be changes dynamically using sysctl kern.consmute
+ 	 * once we are up and going.
+-	 * 
++	 *
++	 * RB_MUTEMSGS (boot_mutemsgs) mutes from here too, so nothing at
++	 * all is printed from the kernel handoff onward.  Single-user,
++	 * verbose and askname boots stay loud.  panic() unmutes.
+ 	 */
+-        cn_mute = ((boothowto & (RB_MUTE
+-			|RB_SINGLE
+-			|RB_VERBOSE
+-			|RB_ASKNAME)) == RB_MUTE);
++	cn_mute = (boothowto & (RB_MUTE | RB_MUTEMSGS)) != 0 &&
++	    (boothowto & (RB_SINGLE | RB_VERBOSE | RB_ASKNAME)) == 0;
+ 
+ 	/*
+ 	 * Bring up the kbd layer just in time for cnprobe.  Console drivers
+-- 
+2.54.0 (Apple Git-157)
+
