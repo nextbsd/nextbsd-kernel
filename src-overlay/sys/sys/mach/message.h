@@ -186,7 +186,29 @@ typedef char *mach_msg_trailer_info_t;
 		 MACH_MSGH_BITS_VOUCHER_MASK)
 
 #define MACH_MSGH_BITS_COMPLEX		0x80000000U
-#define	MACH_MSGH_BITS_CIRCULAR		0x10000000	/* internal use only */
+
+/*
+ * Kernel-owned header bits, at xnu-2422 (OS X 10.9) values so the
+ * NextBSD ABI matches what launchd-842 and libdispatch expect.
+ * MACH_MSGH_BITS_USER is everything a sender may set: COMPLEX plus the
+ * port-disposition fields.  xnu-2422 spells it 0x8000ffffU over its
+ * 8-bit remote/local fields; this header already uses the later
+ * 5-bit + voucher layout, so the same mask covers MACH_MSGH_BITS_PORTS_MASK.
+ * Copyin strips every other bit, so a sender cannot forge RAISEIMP
+ * or IMPHOLDASRT.
+ */
+#define	MACH_MSGH_BITS_USER		\
+		(MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS_PORTS_MASK)
+
+#define	MACH_MSGH_BITS_CIRCULAR		0x40000000	/* internal use only */
+#define	MACH_MSGH_BITS_RAISEIMP		0x20000000	/* importance raise, internal use only */
+#define	MACH_MSGH_BITS_IMPHOLDASRT	0x10000000	/* holds assertion already, in userland */
+
+#define	MACH_MSGH_BITS_USED		\
+		(MACH_MSGH_BITS_USER |		\
+		 MACH_MSGH_BITS_CIRCULAR |	\
+		 MACH_MSGH_BITS_RAISEIMP |	\
+		 MACH_MSGH_BITS_IMPHOLDASRT)
 
 #define MACH_MSGH_BITS(remote, local)				\
 	((remote) | ((local) << 8))
