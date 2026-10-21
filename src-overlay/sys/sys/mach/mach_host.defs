@@ -49,13 +49,6 @@
  *                                     OutP->host_info_out,
  *                                     &OutP->host_info_outCnt);
  *
- * No UserPrefix.  mach_port.defs needs one because libmach's mach_port entry
- * points are syscall traps that fall back to the MIG stub and would collide;
- * mach_host has no traps, and Apple sets no subsystem-wide prefix here
- * either.  (Apple spells the CLIENT side of 222 _kernelrpc_host_create_mach_
- * voucher via a per-routine #if; that is a userland-only concern and does not
- * reach the kernel server, which is what this file is generated for today.)
- *
  * RECEIVER TYPES.  Taken from the intran actually emitted, not assumed:
  * every routine converts with convert_port_to_host (host_t) EXCEPT 220
  * mach_zone_info, which the frozen stub converts with
@@ -94,6 +87,22 @@ subsystem
 	KernelServer
 #endif	/* NEXTBSD_KERNEL_SERVER */
 	mach_host 200;
+
+/*
+ * UserPrefix _kernelrpc_ -- nextbsd-userland#84 (step 4) and #93.
+ *
+ * It renames only the generated CLIENT stubs: the libmach client is
+ * _kernelrpc_host_* / _kernelrpc_mach_*, and libmach keeps the public
+ * names as wrappers over it, the same arrangement as mach_port.defs.
+ * libmach already defines host_info, host_statistics and
+ * host_request_notification under the public names, so a plain-name
+ * client would collide at link time.
+ *
+ * The kernel server is unaffected: gen-mig-servers.sh sends -user to
+ * /dev/null, and mach_host_server.c regenerated with and without this line is
+ * byte-identical (_X* names, handler calls and every msgh_id).
+ */
+UserPrefix _kernelrpc_;
 
 /*
  * std_types.defs / mach_types.defs are nextbsd-userland's -- one copy of the
