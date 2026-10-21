@@ -308,7 +308,8 @@ mach_msg_send(
 		return mr;
 	}
 
-	mr = ipc_mqueue_send(kmsg, option & MACH_SEND_TIMEOUT, timeout);
+	mr = ipc_mqueue_send(kmsg,
+	    option & (MACH_SEND_TIMEOUT | MACH_SEND_NOIMPORTANCE), timeout);
 
 	if (mr != MACH_MSG_SUCCESS) {
 	    mr |= ipc_kmsg_copyout_pseudo(kmsg, space, map, MACH_MSG_BODY_NULL);
@@ -345,6 +346,53 @@ MACRO_END
  *		MACH_RCV_INVALID_NOTIFY	Bad notify port.
  *		MACH_RCV_HEADER_ERROR
  */
+
+/*
+ *	Routine:	mach_msg_receive_importance
+ *	Purpose:
+ *		A RAISEIMP message has left its queue and is about to be
+ *		copied out to the receiver (xnu-2422 mach_msg_receive_results,
+ *		nextbsd#539 part D).  Take its count off the port it was
+ *		queued on; the receiving task keeps the internal assertion
+ *		it was given at send time and now owns it as an external
+ *		one, which userland drops when it is done.  A receiver that
+ *		does not accept boosts never had one: clear the bit so it
+ *		does not try to drop it.  The bit stays set for a receiver
+ *		that does, and reaches it through ipc_kmsg_copyout_header,
+ *		which keeps every MACH_MSGH_BITS_OTHER bit as xnu-2422 does.
+ *	Conditions:
+ *		Nothing locked.
+ */
+static void
+mach_msg_receive_importance(
+	ipc_kmsg_t	kmsg)
+{
+	ipc_port_t port;
+	task_t task_self;
+
+	if ((kmsg->ikm_header->msgh_bits & MACH_MSGH_BITS_RAISEIMP) == 0)
+		return;
+
+	port = (ipc_port_t) kmsg->ikm_header->msgh_remote_port;
+	if (IP_VALID(port)) {
+		ip_lock(port);
+		if (port->ip_impcount > 0)
+			port->ip_impcount--;
+		ip_unlock(port);
+	}
+
+	task_self = mach_proc_task(curproc);
+	if (!task_is_importance_receiver(task_self)) {
+		/*
+		 * The task was never ready to receive importance boost,
+		 * remove msghbit.
+		 */
+		kmsg->ikm_header->msgh_bits &= ~MACH_MSGH_BITS_RAISEIMP;
+	} else {
+		/* user will accept responsibility for the importance boost */
+		task_importance_externalize_assertion(task_self, 1, -1);
+	}
+}
 
 mach_msg_return_t
 mach_msg_receive(
@@ -459,6 +507,8 @@ mach_msg_receive(
 			 * code, msg is untouched (matches the userland
 			 * contract: check the return, don't read the buffer).
 			 */
+			/* the message is destroyed unreceived */
+			ipc_port_importance_kmsg_drop(kmsg);
 			if (msg_receive_error(kmsg, msg, option, seqno, space)
 			    == MACH_RCV_INVALID_DATA)
 				mr = MACH_RCV_INVALID_DATA;
@@ -466,6 +516,9 @@ mach_msg_receive(
 		FREE_SCATTER_LIST(slist, slist_size, slist_rt);
 		return mr;
 	}
+
+	mach_msg_receive_importance(kmsg);
+
 	trailer = (mach_msg_max_trailer_t *)
 			((vm_offset_t)kmsg->ikm_header +
 			round_msg(kmsg->ikm_header->msgh_size));
@@ -714,6 +767,8 @@ mach_msg_receive_results_error(thread_t thread)
 		 * paths; dereferencing it in msg_receive_error
 		 * page-faults the kernel.
 		 */
+		/* the message is destroyed unreceived */
+		ipc_port_importance_kmsg_drop(kmsg);
 		if (msg_receive_error(kmsg, msg, option, seqno, space)
 			== MACH_RCV_INVALID_DATA)
 			mr = MACH_RCV_INVALID_DATA;
@@ -746,6 +801,7 @@ mach_msg_receive_results(thread_t thread)
 										kmsg->ikm_header->msgh_remote_port->ip_context);
 #endif
 	trailer_size = REQUESTED_TRAILER_SIZE(option);
+	mach_msg_receive_importance(kmsg);
 	mr = ipc_kmsg_copyout(kmsg, space, map, MACH_MSG_BODY_NULL, option);
 
 	if (mr != MACH_MSG_SUCCESS) {

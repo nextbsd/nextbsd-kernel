@@ -183,6 +183,27 @@ typedef struct task_qos_policy *task_qos_policy_t;
 #define PROC_FLAG_APPLICATION        0x1000000 /* Process is an application */
 #define PROC_FLAG_IOS_APPLICATION PROC_FLAG_APPLICATION /* Process is an application */
 
+/*
+ * Task app types, at their xnu-2422 (OS X 10.9) values.  The kernel keeps
+ * one per task (task_imp_apptype) and derives the importance donor and
+ * receiver flags from it as xnu-2422's proc_set_task_apptype() does.
+ */
+#ifndef TASK_APPTYPE_NONE
+#define TASK_APPTYPE_NONE                0
+#define TASK_APPTYPE_DAEMON_INTERACTIVE  1
+#define TASK_APPTYPE_DAEMON_STANDARD     2
+#define TASK_APPTYPE_DAEMON_ADAPTIVE     3
+#define TASK_APPTYPE_DAEMON_BACKGROUND   4
+#define TASK_APPTYPE_APP_DEFAULT         5
+#define TASK_APPTYPE_APP_TAL             6
+#endif
+
+/* task policy state flags */
+#ifndef TASK_IMP_RECEIVER
+#define TASK_IMP_RECEIVER                    0x00000001
+#define TASK_IMP_DONOR                       0x00000002
+#endif
+
 
 
 

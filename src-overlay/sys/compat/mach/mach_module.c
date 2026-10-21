@@ -63,6 +63,21 @@ SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
 		   &mach_debug_enable, 0, "enable mach debug logging");
 
 /*
+ * Mach importance donation accounting (xnu-2422 IMPORTANCE_INHERITANCE,
+ * nextbsd#539 part D).  0, the default, keeps today's behaviour: the
+ * kernel never marks a message MACH_MSGH_BITS_RAISEIMP and
+ * MACH_PORT_IMPORTANCE_RECEIVER is refused, so no port or task count is
+ * ever created.  1 marks messages from donor tasks to donation ports and
+ * keeps the counts.  Either way nothing changes scheduling.  Counts made
+ * while it was 1 drain normally after it is set back to 0.
+ */
+int mach_importance;
+
+SYSCTL_INT(_mach, OID_AUTO, importance, CTLFLAG_RWTUN,
+		   &mach_importance, 0,
+		   "account Mach importance donation (RAISEIMP); no scheduling effect");
+
+/*
  * Regression detector for nextbsd-userland#135.
  *
  * rcvlarge_notify counts "a message is waiting on port N" events handed to

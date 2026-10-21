@@ -1549,6 +1549,32 @@ ipc_right_copyin(
 
 		ipc_port_clear_receiver(port);
 
+		/*
+		 * Importance (nextbsd#539 part D): ports in limbo have to
+		 * be tempowner (xnu-2422).  xnu-2422 hands the count back
+		 * to the caller to drop from current_task() once the space
+		 * is unlocked; here the port stays charged to the task it
+		 * leaves (ip_imp_task) and the count moves when the right
+		 * lands: ipc_port_check_circularity, ipc_port_destroy or
+		 * ipc_object_copyout_name drop it from that task.  A port
+		 * that is already tempowner keeps its owner.
+		 */
+		if (port->ip_tempowner == 0) {
+			task_t imp_task = TASK_NULL;
+
+			assert(port->ip_taskptr == 0);
+			if (port->ip_impcount > 0)
+				imp_task = space->is_task;
+			if (imp_task != TASK_NULL &&
+			    imp_task->imp_receiver != 0 &&
+			    space != ipc_space_kernel &&
+			    space != ipc_space_reply) {
+				port->ip_taskptr = 1;
+				port->ip_imp_task = imp_task;
+			}
+			port->ip_tempowner = 1;
+		}
+
 		port->ip_receiver_name = MACH_PORT_NAME_NULL;
 		port->ip_destination = IP_NULL;
 		ip_unlock(port);
@@ -2023,6 +2049,7 @@ ipc_right_copyout(
 
 	    case MACH_MSG_TYPE_PORT_RECEIVE: {
 		ipc_port_t dest;
+		natural_t assertcnt = port->ip_impcount;
 
 		assert(port->ip_mscount == 0);
 		assert(port->ip_receiver_name == MACH_PORT_NAME_NULL);
@@ -2054,8 +2081,23 @@ ipc_right_copyout(
 
 		entry->ie_bits = bits | MACH_PORT_TYPE_RECEIVE;
 
-		if (dest != IP_NULL)
+		if (dest != IP_NULL) {
+			/*
+			 * Importance (xnu-2422): deduct the assertion counts
+			 * we contributed to the old destination port.  They've
+			 * already been reflected into the task as a result of
+			 * getting enqueued.
+			 */
+			if (assertcnt > 0) {
+				ip_lock(dest);
+				if (dest->ip_impcount >= assertcnt)
+					dest->ip_impcount -= assertcnt;
+				else
+					dest->ip_impcount = 0;
+				ip_unlock(dest);
+			}
 			ipc_port_release(dest);
+		}
 		break;
 	    }
 

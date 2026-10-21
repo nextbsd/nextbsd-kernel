@@ -286,6 +286,21 @@ typedef struct mach_task {
 	int		semaphores_owned;	/* number of semaphores owned */
 
 	int		messages_received;
+
+	/*
+	 * Importance donation accounting, as xnu-2422 kern/task.h
+	 * (IMPORTANCE_INHERITANCE), nextbsd#539 part D.  Protected by the task
+	 * lock.  These are counts only: nothing reads them to change the
+	 * task's scheduling.
+	 */
+	uint32_t	imp_receiver	:1,	/* the task can receive importance boost */
+			imp_donor	:1,	/* the task always sends boosts regardless of boost status */
+			imp_reserved	:30;	/* reserved for future use */
+
+	uint32_t	task_imp_assertcnt;	/* total number of boost assertions (kernel managed plus userspace managed) */
+	uint32_t	task_imp_externcnt;	/* number of boost assertions externalized (userspace managed) */
+	integer_t	task_imp_apptype;	/* TASK_APPTYPE_* (xnu-2422 t_apptype) */
+	integer_t	task_imp_role;		/* task_role_t (xnu-2422 t_role) */
 	
 #ifdef notyet	/* Active activations in this task */
 	queue_head_t	thr_acts;	/* list of thread_activations */
@@ -392,5 +407,31 @@ extern void		mach_task_orphan(
 				struct proc	*p);
 
 extern task_t		kernel_task;
+
+/*
+ * Importance donation accounting (xnu-2422 kern/task_policy.c,
+ * nextbsd#539 part D).  The mark, set and hold/drop routines take the
+ * task lock, so none of them may be called with a port lock held.  Over-releases clamp at zero instead of
+ * panicking.  None of them changes scheduling.
+ */
+extern boolean_t	task_is_importance_donor(task_t task);
+extern boolean_t	task_is_importance_receiver(task_t task);
+extern void		task_importance_mark_donor(task_t task,
+				boolean_t donating);
+extern void		task_importance_mark_receiver(task_t task,
+				boolean_t receiving);
+extern void		task_importance_set_apptype(task_t task,
+				int apptype);
+extern int		task_importance_hold_internal_assertion(
+				task_t target_task, uint32_t count);
+extern int		task_importance_drop_internal_assertion(
+				task_t target_task, uint32_t count);
+extern int		task_importance_hold_external_assertion(
+				task_t target_task, uint32_t count);
+extern int		task_importance_drop_external_assertion(
+				task_t target_task, uint32_t count);
+extern int		task_importance_externalize_assertion(
+				task_t target_task, uint32_t count,
+				int sender_pid);
 
 #endif	/* _KERN_TASK_H_ */
