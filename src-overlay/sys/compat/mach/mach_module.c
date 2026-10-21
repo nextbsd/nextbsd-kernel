@@ -64,14 +64,16 @@ SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
 
 /*
  * Mach importance donation accounting (xnu-2422 IMPORTANCE_INHERITANCE,
- * nextbsd#539 part D).  0, the default, keeps today's behaviour: the
- * kernel never marks a message MACH_MSGH_BITS_RAISEIMP and
- * MACH_PORT_IMPORTANCE_RECEIVER is refused, so no port or task count is
- * ever created.  1 marks messages from donor tasks to donation ports and
- * keeps the counts.  Either way nothing changes scheduling.  Counts made
- * while it was 1 drain normally after it is set back to 0.
+ * nextbsd#539 parts D and E).  1, the default since nextbsd#539, marks
+ * messages from donor tasks to donation ports MACH_MSGH_BITS_RAISEIMP and
+ * keeps the port and task counts, as xnu-2422 does.  0 turns that off:
+ * the kernel never marks a message RAISEIMP and
+ * MACH_PORT_IMPORTANCE_RECEIVER is refused, so no new port or task count
+ * is created.  It can be set at boot (loader tunable) or at any time at
+ * runtime; counts made while it was 1 drain normally after it is set back
+ * to 0.  Either way nothing changes scheduling.
  */
-int mach_importance;
+int mach_importance = 1;
 
 SYSCTL_INT(_mach, OID_AUTO, importance, CTLFLAG_RWTUN,
 		   &mach_importance, 0,

@@ -1569,8 +1569,7 @@ ipc_right_copyin(
 			    imp_task->imp_receiver != 0 &&
 			    space != ipc_space_kernel &&
 			    space != ipc_space_reply) {
-				port->ip_taskptr = 1;
-				port->ip_imp_task = imp_task;
+				ipc_port_importance_bind(port, imp_task);
 			}
 			port->ip_tempowner = 1;
 		}

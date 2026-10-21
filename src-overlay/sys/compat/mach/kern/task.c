@@ -1783,6 +1783,20 @@ task_importance_set_apptype(task_t task, int apptype)
 	task_unlock(task);
 }
 
+/*
+ * Add to an assertion count, saturating instead of wrapping.  Nothing in
+ * NextBSD's userland gives back an external assertion yet (xnu-2422's
+ * libdispatch does, through proc_importance_assertion_complete()), so a
+ * receiver's counts only grow while it runs; a wrap to zero would make a
+ * busy daemon look unboosted.
+ */
+static uint32_t
+task_importance_count_add(uint32_t cnt, uint32_t count)
+{
+
+	return (count > UINT32_MAX - cnt ? UINT32_MAX : cnt + count);
+}
+
 static int
 task_importance_hold_assertion_locked(task_t target_task, boolean_t external,
     uint32_t count)
@@ -1805,10 +1819,13 @@ task_importance_hold_assertion_locked(task_t target_task, boolean_t external,
 				    target_task->task_imp_externcnt);
 			return (EOVERFLOW);
 		}
-		target_task->task_imp_assertcnt += count;
-		target_task->task_imp_externcnt += count;
+		target_task->task_imp_assertcnt = task_importance_count_add(
+		    target_task->task_imp_assertcnt, count);
+		target_task->task_imp_externcnt = task_importance_count_add(
+		    target_task->task_imp_externcnt, count);
 	} else
-		target_task->task_imp_assertcnt += count;
+		target_task->task_imp_assertcnt = task_importance_count_add(
+		    target_task->task_imp_assertcnt, count);
 
 	return (0);
 }
@@ -1918,7 +1935,8 @@ task_importance_externalize_assertion(task_t target_task, uint32_t count,
 		return (0);
 	task_lock(target_task);
 	if (target_task->imp_receiver != 0) {
-		target_task->task_imp_externcnt += count;
+		target_task->task_imp_externcnt = task_importance_count_add(
+		    target_task->task_imp_externcnt, count);
 		if (target_task->task_imp_externcnt >
 		    target_task->task_imp_assertcnt)
 			target_task->task_imp_externcnt =
@@ -1958,12 +1976,16 @@ task_importance_externalize_assertion(task_t target_task, uint32_t count,
  *
  * xnu-2422 holds a task reference for ip_imp_task; NextBSD task structs
  * are type-stable and never freed (task_free), so none is taken, as for
- * the other ip_imp_task users (ipc_port.c).
+ * the other ip_imp_task users (ipc_port.c).  A binding to a task struct
+ * that has since passed to another process is ignored
+ * (ipc_port_importance_owner): the boosts on the port then belong to
+ * nobody, and the new task takes them all.  That is also the common case
+ * of a job respawned into the proc struct its last instance used.
  */
 static void
 task_add_importance_watchport(task_t task, ipc_port_t port, int *boostp)
 {
-	task_t release_imp_task = TASK_NULL;
+	task_t owner, release_imp_task = TASK_NULL;
 	natural_t boost = 0;
 
 	*boostp = 0;
@@ -1974,14 +1996,14 @@ task_add_importance_watchport(task_t task, ipc_port_t port, int *boostp)
 	if (ip_active(port) && port->ip_tempowner != 0 &&
 	    port->ip_impdonation != 0) {
 		boost = port->ip_impcount;
-		if (port->ip_taskptr != 0 && port->ip_imp_task != task)
-			release_imp_task = port->ip_imp_task;
-		else if (port->ip_taskptr != 0)
+		owner = ipc_port_importance_owner(port);
+		if (owner == task)
 			boost = 0;	/* already bound here: nothing moves */
+		else
+			release_imp_task = owner;
 
 		/* mark the port as watching another task */
-		port->ip_taskptr = 1;
-		port->ip_imp_task = task;
+		ipc_port_importance_bind(port, task);
 	}
 	ip_unlock(port);
 
@@ -2049,8 +2071,12 @@ task_importance_drop_spawn_attrs(task_t task)
  * adaptive daemon (xnu-2422 does not even collect the ports for any
  * other type).  The boosts already queued on the ports are held by the
  * task, so that it starts boosted until it handles those messages
- * (xnu-2422 task_hold_multiple_assertion), but only while the
- * mach.importance sysctl is on.  Every port's send right is released.
+ * (xnu-2422 task_hold_multiple_assertion).  That is done whatever the
+ * mach.importance sysctl says now: a port only carries a count made while
+ * it was 1, and binding has already taken that count off the port's
+ * previous owner, so skipping the hold here would leave the count charged
+ * to nobody until the messages drain.  Every port's send right is
+ * released.
  *
  * Nothing here can fail an exec: a port that does not qualify is
  * skipped, as xnu-2422 skips it.
@@ -2089,7 +2115,7 @@ task_importance_apply_spawn_attrs(task_t task)
 		}
 	}
 
-	if (needboost > 0 && mach_importance != 0)
+	if (needboost > 0)
 		task_importance_hold_internal_assertion(task, needboost);
 
 	task_importance_release_watchports(ports, count);
