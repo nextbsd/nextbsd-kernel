@@ -1062,7 +1062,7 @@ ipc_kmsg_copyin_header(
 	mach_port_name_t		notify_name)
 {
 	mach_msg_header_t *msg  = kmsg->ikm_header;
-	mach_msg_bits_t mbits = msg->msgh_bits &~ MACH_MSGH_BITS_CIRCULAR;
+	mach_msg_bits_t mbits = msg->msgh_bits & MACH_MSGH_BITS_USER;
 	mach_msg_type_name_t dest_type = MACH_MSGH_BITS_REMOTE(mbits);
 	mach_msg_type_name_t reply_type = MACH_MSGH_BITS_LOCAL(mbits);
 	ipc_object_t dest_port, reply_port;
@@ -1957,7 +1957,14 @@ ipc_kmsg_copyin(
 	mach_port_name_t	notify)
 {
     mach_msg_return_t 		mr;
-    
+
+    /*
+     * Senders may set only MACH_MSGH_BITS_USER (as in xnu-2422).
+     * CIRCULAR, RAISEIMP and IMPHOLDASRT are kernel-owned; strip them
+     * here so a forged importance bit never reaches a receiver.
+     */
+    kmsg->ikm_header->msgh_bits &= MACH_MSGH_BITS_USER;
+
     mr = ipc_kmsg_copyin_header(kmsg, space, notify);
     if (mr != MACH_MSG_SUCCESS) {
 		return mr;
@@ -2851,7 +2858,7 @@ ipc_kmsg_copyout_pseudo(
 	mr = (ipc_kmsg_copyout_object(space, dest, dest_type, &dest_name) |
 	      ipc_kmsg_copyout_object(space, reply, reply_type, &reply_name));
 
-	kmsg->ikm_header->msgh_bits = mbits &~ MACH_MSGH_BITS_CIRCULAR;
+	kmsg->ikm_header->msgh_bits = mbits & MACH_MSGH_BITS_USER;
 	kmsg->ikm_header->msgh_remote_port = CAST_MACH_NAME_TO_PORT(dest_name);
 	kmsg->ikm_header->msgh_local_port = CAST_MACH_NAME_TO_PORT(reply_name);
 
