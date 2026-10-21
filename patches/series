@@ -53,3 +53,4 @@
 0060-NextBSD-allow-trusted-groups-to-chroot-without-no-new-privs.patch
 0061-NextBSD-add-time_set-eventhandler-fired-by-settime.patch
 0062-kern_cons-mute-from-cninit-for-boot_mutemsgs.patch
+0063-devfs-route-EVFILT_VNODE-on-device-files-to-the-vnod.patch
