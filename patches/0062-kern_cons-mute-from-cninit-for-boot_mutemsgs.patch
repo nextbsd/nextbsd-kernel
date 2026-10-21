@@ -1,4 +1,4 @@
-From 99508d78e51fae34c622cb0812f2f17eae59d019 Mon Sep 17 00:00:00 2001
+From bca91b433d745bd0792724e25f871a39211f8afe Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
 Date: Wed, 21 Oct 2026 08:46:11 -0500
 Subject: [PATCH] kern_cons: mute from cninit() for boot_mutemsgs
@@ -13,9 +13,10 @@ verbose and askname boots stay unmuted, and panic() still clears
 cn_mute.  RB_MUTE (boot_mute) is deliberately not used: it also turns
 on the vt splash.
 
-mute_console() now also exempts RB_SINGLE and does nothing when cninit()
-has already muted, so the "Muting" line is not printed (or logged to
-the message buffer) on a muted boot.
+mute_console() now also exempts RB_SINGLE and RB_ASKNAME, matching
+cninit(), so the askname root-device prompt stays visible.  It also
+does nothing when cninit() has already muted, so the "Muting" line is
+not printed (or logged to the message buffer) on a muted boot.
 
 Part of nextbsd/nextbsd#505.
 ---
@@ -23,7 +24,7 @@ Part of nextbsd/nextbsd#505.
  1 file changed, 13 insertions(+), 6 deletions(-)
 
 diff --git a/sys/kern/kern_cons.c b/sys/kern/kern_cons.c
-index fbe52735..68ad8e3d 100644
+index fbe52735..a8ee531e 100644
 --- a/sys/kern/kern_cons.c
 +++ b/sys/kern/kern_cons.c
 @@ -142,7 +142,13 @@ static void
@@ -36,8 +37,8 @@ index fbe52735..68ad8e3d 100644
 +	 * RB_MUTEMSGS, so there is nothing to announce.  This is only a
 +	 * fallback for a console that was not muted that early.
 +	 */
-+	if (cn_mute == 0 && (boothowto &
-+	    (RB_MUTEMSGS | RB_SINGLE | RB_VERBOSE)) == RB_MUTEMSGS) {
++	if (cn_mute == 0 && (boothowto & (RB_MUTEMSGS | RB_SINGLE |
++	    RB_VERBOSE | RB_ASKNAME)) == RB_MUTEMSGS) {
  		printf("-- Muting boot messages --\n");
  		cn_mute = 1;
  	}
