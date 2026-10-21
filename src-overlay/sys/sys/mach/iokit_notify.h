@@ -69,7 +69,7 @@ typedef struct {
  *
  *   iokit_notify_copyin_port: resolve a caller-supplied port *name* in the
  *       current task's IPC space to a retained naked send right (void *), the
- *       same MACH_MSG_TYPE_COPY_SEND copyin task_set_special_port_trap uses.
+ *       via ipc_object_copyin(MACH_MSG_TYPE_COPY_SEND).
  *       Returns 0 and *out on success; an errno on failure (*out untouched).
  *   iokit_notify_port_dead: true if the stored send right is dead/invalid.
  *   iokit_notify_copy_port: return a fresh retained send ref to the same port

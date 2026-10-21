@@ -12,8 +12,7 @@
  * Modeled directly on the proven kernel-originated send in
  * compat/mach/iokit_kextd.c (ikm_alloc -> fill header -> init trailer ->
  * ipc_mqueue_send_always). The caller-supplied port name is resolved to a
- * naked send right with the same MACH_MSG_TYPE_COPY_SEND copyin
- * sys_task_set_special_port_trap uses (compat/mach/mach_traps.c).
+ * naked send right with an ipc_object_copyin(MACH_MSG_TYPE_COPY_SEND).
  *
  * See sys/sys/mach/iokit_notify.h and sys/sys/ioregistry.h.
  */
@@ -56,8 +55,8 @@ notify_strcopy(char *dst, const char *src, size_t n)
 
 /*
  * Resolve a caller-supplied port *name* (in the current task's IPC space) to a
- * retained naked send right, returned opaquely as a void *. Same copyin the
- * task/host set_special_port traps use. Returns 0 + *out on success; a Mach
+ * retained naked send right, returned opaquely as a void *, via
+ * ipc_object_copyin(MACH_MSG_TYPE_COPY_SEND). Returns 0 + *out on success; a Mach
  * KERN_* mapped to an errno on failure.
  */
 int

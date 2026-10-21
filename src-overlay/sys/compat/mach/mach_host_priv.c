@@ -165,8 +165,8 @@ UNSUPPORTED;
  * set (nextbsd-userland#84). HOST_BOOTSTRAP_PORT is the bootstrap server
  * and HOST_KEXTD_PORT is kextd's load-request receive right (K3b #216).
  * The kernel-provided slots (HOST_PORT, HOST_PRIV_PORT, ...) and the
- * other Apple-defined slots are refused. Shared by the MIG handler below
- * and the host_set_special_port trap (mach_traps.c).
+ * other Apple-defined slots are refused. Shared by host_get_special_port
+ * above and the host_set_special_port MIG handler below.
  */
 boolean_t
 host_special_port_settable(int which)
@@ -182,8 +182,8 @@ host_special_port_settable(int which)
  *		(nextbsd-userland#84, Phase B2). Reached over MIG
  *		(host_priv 413), which needs a host_priv request port:
  *		mach_host_self() hands that to unjailed euid-0 tasks
- *		(kern/ipc_host.c). The host_set_special_port trap
- *		calls this too, with &realhost.
+ *		(kern/ipc_host.c). The old host_set_special_port
+ *		trap is gone (#84 Phase C); MIG is the only path.
  *	Conditions:
  *		Nothing locked. If successful, consumes the supplied
  *		send right (which may be IP_NULL to clear the slot);
