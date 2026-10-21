@@ -101,6 +101,7 @@
 #include <sys/errno.h>
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
@@ -1256,6 +1257,18 @@ mach_task_exit(task_t task)
 
 	if (task == TASK_NULL || task->itk_self == IP_NULL)
 		return;
+	/*
+	 * Spawn attributes never applied (an exec that failed, nextbsd#539
+	 * part E) go now. A dead task takes no more boosts: a watch port
+	 * may still name it (ip_imp_task) until launchd binds the port to
+	 * the job's next process.
+	 */
+	task_importance_drop_spawn_attrs(task);
+	task_lock(task);
+	task->imp_receiver = 0;
+	task->task_imp_assertcnt = 0;
+	task->task_imp_externcnt = 0;
+	task_unlock(task);
 	task_synchronizer_destroy_all(task);
 	ipc_task_terminate(task);
 }
@@ -1309,6 +1322,10 @@ mach_task_recycle(task_t task, struct proc *p)
 	task->task_imp_externcnt = 0;
 	task->task_imp_apptype = TASK_APPTYPE_NONE;
 	task->task_imp_role = TASK_UNSPECIFIED;
+	task->task_imp_watchports = NULL;	/* released by mach_task_exit */
+	task->task_imp_watchport_cnt = 0;
+	task->task_imp_spawn_apptype = TASK_APPTYPE_NONE;
+	task->task_imp_spawn_pending = FALSE;
 
 	mach_task_setup(task, p);
 }
@@ -1563,8 +1580,11 @@ mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
 	if (parent_task->itk_space == NULL)
 		return;
 
-	if (parent_task->itk_bootstrap == IP_NULL)
-		return; /* parent has no bootstrap port — nothing to inherit */
+	if (parent_task->itk_bootstrap == IP_NULL) {
+		/* No bootstrap port to inherit; importance flags still are. */
+		task_importance_inherit(parent_task, mach_proc_task(p2));
+		return;
+	}
 
 	/* Child should have p_machdata set up the same way mach_task_init_lazy
 	 * does on first syscall. We pre-create it here so the bootstrap port
@@ -1580,6 +1600,9 @@ mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
 		p2->p_machdata = child_task;
 	}
 	child_task->itk_puniqueid = parent_task->itk_uniqueid;
+
+	/* nextbsd#539 part E: donor/receiver flags, as xnu-2422 fork. */
+	task_importance_inherit(parent_task, child_task);
 
 	/* Task #39: task_init_internal(TASK_NULL, ...) above leaves
 	 * audit_token = KERNEL_AUDIT_TOKEN (val[5]=0). Without this,
@@ -1903,4 +1926,199 @@ task_importance_externalize_assertion(task_t target_task, uint32_t count,
 	}
 	task_unlock(target_task);
 	return (0);
+}
+
+/*
+ * Spawn-time importance attributes (nextbsd#539 part E).
+ *
+ * xnu-2422's posix_spawn takes the new process's type
+ * (posix_spawnattr_setprocesstype_np) and its importance watch ports
+ * (posix_spawnattr_set_importancewatch_port_np, PSPA_IMP_WATCHPORTS).
+ * It copies the watch ports in, loads the image, sets the app type
+ * (exec_handle_spawnattr_apptype), and only then binds the ports to the
+ * new task (task_add_importance_watchport), because whether a task can
+ * receive a boost depends on its app type (bsd/kern/kern_exec.c).
+ *
+ * launchd's POSIX_SPAWN_SETEXEC spawn is a plain execve(2) on NextBSD, so
+ * the child records the same attributes on its own task just before it
+ * execs (task_set_importance_watchports_np, mach_traps.c), and the
+ * process_exec hook (ipc_entry.c) applies them once the new image is in
+ * place.  The attributes are dropped unused at exit, at a later
+ * attribute call, and on an exec into a Linux image.
+ */
+
+/*
+ * A watch port charges the task it is bound to while its receive right
+ * waits in launchd.  Bind port to task, as xnu-2422's
+ * task_add_importance_watchport(), and return the boosts already queued
+ * on it in *boostp.  The port must be tempowner (launchd sets
+ * MACH_PORT_TEMPOWNER on every listener port), which also rules out a
+ * receive right already in a message.  If the port was bound to another
+ * task, that task's share of the boosts is dropped.
+ *
+ * xnu-2422 holds a task reference for ip_imp_task; NextBSD task structs
+ * are type-stable and never freed (task_free), so none is taken, as for
+ * the other ip_imp_task users (ipc_port.c).
+ */
+static void
+task_add_importance_watchport(task_t task, ipc_port_t port, int *boostp)
+{
+	task_t release_imp_task = TASK_NULL;
+	natural_t boost = 0;
+
+	*boostp = 0;
+	if (task->imp_receiver == 0 || !IP_VALID(port))
+		return;
+
+	ip_lock(port);
+	if (ip_active(port) && port->ip_tempowner != 0 &&
+	    port->ip_impdonation != 0) {
+		boost = port->ip_impcount;
+		if (port->ip_taskptr != 0 && port->ip_imp_task != task)
+			release_imp_task = port->ip_imp_task;
+		else if (port->ip_taskptr != 0)
+			boost = 0;	/* already bound here: nothing moves */
+
+		/* mark the port as watching another task */
+		port->ip_taskptr = 1;
+		port->ip_imp_task = task;
+	}
+	ip_unlock(port);
+
+	if (release_imp_task != TASK_NULL && boost > 0)
+		task_importance_drop_internal_assertion(release_imp_task, boost);
+
+	*boostp = (int)boost;
+}
+
+static void
+task_importance_release_watchports(ipc_port_t *ports, int count)
+{
+	int i;
+
+	if (ports == NULL)
+		return;
+	for (i = 0; i < count; i++)
+		if (IP_VALID(ports[i]))
+			ipc_port_release_send(ports[i]);
+	free(ports, M_MACH_TMP);
+}
+
+void
+task_importance_set_spawn_attrs(task_t task, int apptype, ipc_port_t *ports,
+    int count)
+{
+	ipc_port_t *old_ports;
+	int old_count;
+
+	task_lock(task);
+	old_ports = task->task_imp_watchports;
+	old_count = task->task_imp_watchport_cnt;
+	task->task_imp_watchports = ports;
+	task->task_imp_watchport_cnt = (ports != NULL) ? count : 0;
+	task->task_imp_spawn_apptype = apptype;
+	task->task_imp_spawn_pending = TRUE;
+	task_unlock(task);
+
+	task_importance_release_watchports(old_ports, old_count);
+}
+
+void
+task_importance_drop_spawn_attrs(task_t task)
+{
+	ipc_port_t *ports;
+	int count;
+
+	if (task == TASK_NULL)
+		return;
+	task_lock(task);
+	ports = task->task_imp_watchports;
+	count = task->task_imp_watchport_cnt;
+	task->task_imp_watchports = NULL;
+	task->task_imp_watchport_cnt = 0;
+	task->task_imp_spawn_apptype = TASK_APPTYPE_NONE;
+	task->task_imp_spawn_pending = FALSE;
+	task_unlock(task);
+
+	task_importance_release_watchports(ports, count);
+}
+
+/*
+ * Apply the pending attributes after a successful exec, in xnu-2422's
+ * order: the app type first, then the watch ports, and only for an
+ * adaptive daemon (xnu-2422 does not even collect the ports for any
+ * other type).  The boosts already queued on the ports are held by the
+ * task, so that it starts boosted until it handles those messages
+ * (xnu-2422 task_hold_multiple_assertion), but only while the
+ * mach.importance sysctl is on.  Every port's send right is released.
+ *
+ * Nothing here can fail an exec: a port that does not qualify is
+ * skipped, as xnu-2422 skips it.
+ */
+void
+task_importance_apply_spawn_attrs(task_t task)
+{
+	ipc_port_t *ports;
+	int apptype, boost, count, i, needboost;
+	boolean_t pending;
+
+	if (task == TASK_NULL)
+		return;
+	task_lock(task);
+	pending = task->task_imp_spawn_pending;
+	ports = task->task_imp_watchports;
+	count = task->task_imp_watchport_cnt;
+	apptype = task->task_imp_spawn_apptype;
+	task->task_imp_watchports = NULL;
+	task->task_imp_watchport_cnt = 0;
+	task->task_imp_spawn_apptype = TASK_APPTYPE_NONE;
+	task->task_imp_spawn_pending = FALSE;
+	task_unlock(task);
+
+	if (!pending)
+		return;
+
+	if (apptype != TASK_APPTYPE_NONE)
+		task_importance_set_apptype(task, apptype);
+
+	needboost = 0;
+	if (ports != NULL && apptype == TASK_APPTYPE_DAEMON_ADAPTIVE) {
+		for (i = 0; i < count; i++) {
+			task_add_importance_watchport(task, ports[i], &boost);
+			needboost += boost;
+		}
+	}
+
+	if (needboost > 0 && mach_importance != 0)
+		task_importance_hold_internal_assertion(task, needboost);
+
+	task_importance_release_watchports(ports, count);
+}
+
+/*
+ * fork: the child starts with its parent's donor and receiver flags and
+ * app type, and no assertions, as xnu-2422's task_create_internal().
+ */
+void
+task_importance_inherit(task_t parent_task, task_t child_task)
+{
+	uint32_t donor, receiver;
+	integer_t apptype;
+
+	if (parent_task == TASK_NULL || child_task == TASK_NULL ||
+	    parent_task == child_task)
+		return;
+	task_lock(parent_task);
+	donor = parent_task->imp_donor;
+	receiver = parent_task->imp_receiver;
+	apptype = parent_task->task_imp_apptype;
+	task_unlock(parent_task);
+
+	task_lock(child_task);
+	child_task->imp_donor = donor;
+	child_task->imp_receiver = receiver;
+	child_task->task_imp_assertcnt = 0;
+	child_task->task_imp_externcnt = 0;
+	child_task->task_imp_apptype = apptype;
+	task_unlock(child_task);
 }

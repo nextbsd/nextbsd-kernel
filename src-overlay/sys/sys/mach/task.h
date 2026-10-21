@@ -301,6 +301,20 @@ typedef struct mach_task {
 	uint32_t	task_imp_externcnt;	/* number of boost assertions externalized (userspace managed) */
 	integer_t	task_imp_apptype;	/* TASK_APPTYPE_* (xnu-2422 t_apptype) */
 	integer_t	task_imp_role;		/* task_role_t (xnu-2422 t_role) */
+
+	/*
+	 * Spawn attributes waiting for the next exec (nextbsd#539 part E).
+	 * NextBSD's launchd emulates POSIX_SPAWN_SETEXEC with execve(2), so
+	 * the child hands its process type and importance watch ports to
+	 * the kernel first (task_set_importance_watchports_np), and the
+	 * process_exec hook applies them after the new image is loaded, as
+	 * xnu-2422's posix_spawn does.  Protected by the task lock; the
+	 * array holds a send right for each port.
+	 */
+	struct ipc_port	**task_imp_watchports;
+	int		task_imp_watchport_cnt;
+	integer_t	task_imp_spawn_apptype;	/* TASK_APPTYPE_*, NONE if unset */
+	boolean_t	task_imp_spawn_pending;
 	
 #ifdef notyet	/* Active activations in this task */
 	queue_head_t	thr_acts;	/* list of thread_activations */
@@ -433,5 +447,22 @@ extern int		task_importance_drop_external_assertion(
 extern int		task_importance_externalize_assertion(
 				task_t target_task, uint32_t count,
 				int sender_pid);
+
+/*
+ * Spawn-time importance attributes (nextbsd#539 part E).  set_spawn_attrs
+ * takes over the send rights in ports (a malloc(M_MACH_TMP) array, or
+ * NULL), replacing any still pending.  apply_spawn_attrs runs at exec:
+ * it sets the app type and binds the watch ports to the task, then
+ * releases them.  drop_spawn_attrs releases them unused.  inherit copies
+ * the donor and receiver flags and app type to a forked child.  None may
+ * be called with a port or task lock held.
+ */
+extern void		task_importance_set_spawn_attrs(task_t task,
+				int apptype, struct ipc_port **ports,
+				int count);
+extern void		task_importance_apply_spawn_attrs(task_t task);
+extern void		task_importance_drop_spawn_attrs(task_t task);
+extern void		task_importance_inherit(task_t parent_task,
+				task_t child_task);
 
 #endif	/* _KERN_TASK_H_ */
