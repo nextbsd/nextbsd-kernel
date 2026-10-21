@@ -12,6 +12,9 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/mach/mach_types.h>
 #include <sys/mach/host_priv_server.h>
+#include <sys/mach/host.h>		/* realhost, host_lock */
+#include <sys/mach/host_special_ports.h>
+#include <sys/mach/ipc/ipc_port.h>
 
 
 int
@@ -108,13 +111,63 @@ host_set_UNDServer(
 
 UNSUPPORTED;
 
-int
+/*
+ * host_special_port_settable — the host special-port slots userland may
+ * set (nextbsd-userland#84). HOST_BOOTSTRAP_PORT is the bootstrap server
+ * and HOST_KEXTD_PORT is kextd's load-request receive right (K3b #216).
+ * The kernel-provided slots (HOST_PORT, HOST_PRIV_PORT, ...) and the
+ * other Apple-defined slots are refused. Shared by the MIG handler below
+ * and the host_set_special_port trap (mach_traps.c).
+ */
+boolean_t
+host_special_port_settable(int which)
+{
+
+	return (which == HOST_BOOTSTRAP_PORT || which == HOST_KEXTD_PORT);
+}
+
+/*
+ *	Routine:	host_set_special_port [kernel call]
+ *	Purpose:
+ *		Set one of the host's userland-settable special ports
+ *		(nextbsd-userland#84, Phase B2). Reached over MIG
+ *		(host_priv 413), which needs a host_priv request port:
+ *		mach_host_self() hands that to unjailed euid-0 tasks
+ *		(kern/ipc_host.c). The host_set_special_port trap
+ *		calls this too, with &realhost.
+ *	Conditions:
+ *		Nothing locked. If successful, consumes the supplied
+ *		send right (which may be IP_NULL to clear the slot);
+ *		on failure the caller still owns it (MIG destroys the
+ *		request message).
+ *	Returns:
+ *		KERN_SUCCESS		Changed the special port.
+ *		KERN_INVALID_HOST	host_priv is not the host_priv port.
+ *		KERN_INVALID_ARGUMENT	Not a userland-settable slot.
+ */
+kern_return_t
 host_set_special_port(
 	host_priv_t host_priv,
 	int which,
 	mach_port_t port
 )
-UNSUPPORTED;
+{
+	ipc_port_t old;
+
+	if (host_priv == HOST_NULL)
+		return (KERN_INVALID_HOST);
+	if (!host_special_port_settable(which))
+		return (KERN_INVALID_ARGUMENT);
+
+	host_lock(&realhost);
+	old = realhost.special[which];
+	realhost.special[which] = port;
+	host_unlock(&realhost);
+
+	if (IP_VALID(old))
+		ipc_port_release_send(old);
+	return (KERN_SUCCESS);
+}
 
 int
 kext_request(

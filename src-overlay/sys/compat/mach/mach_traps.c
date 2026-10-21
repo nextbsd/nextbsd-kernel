@@ -289,24 +289,29 @@ sys_task_set_special_port_trap(struct thread *td,
  * host_set_special_port — set a slot in the host's special-port array.
  * Dedicated syscall (each Mach trap gets its own FreeBSD slot from the
  * widened lkmnosys band). `host` is the host port name; we ignore it
- * and operate on realhost — matches the existing trap pattern.
+ * and operate on realhost — matches the existing trap pattern. The slot
+ * update itself is the MIG handler, host_set_special_port()
+ * (mach_host_priv.c, nextbsd-userland#84); the trap keeps its historical
+ * access rule (no host_priv check) until published userland has moved to
+ * the MIG client and the trap is retired (#84 Phase C).
  */
+extern kern_return_t host_set_special_port(host_priv_t host_priv, int which,
+    mach_port_t port);
+
 int
 sys_host_set_special_port_trap(struct thread *td,
     struct host_set_special_port_trap_args *uap)
 {
 	task_t task = current_task();
 	ipc_port_t port = IP_NULL;
-	ipc_port_t old;
 	kern_return_t kr;
 
-	/* Userland may set HOST_BOOTSTRAP_PORT (the bootstrap server) and
-	 * HOST_KEXTD_PORT (kextd's load-request receive right, K3b #216);
-	 * kernel-provided slots (HOST_PORT etc.) and other Apple-defined slots
-	 * are rejected. Registration is still gated by IPC-space ownership of
-	 * the port being installed (ipc_object_copyin below). */
-	if (uap->which != HOST_BOOTSTRAP_PORT &&
-	    uap->which != HOST_KEXTD_PORT) {
+	/* Userland may set HOST_BOOTSTRAP_PORT and HOST_KEXTD_PORT only.
+	 * Check before the copyin so a bad slot still reports
+	 * KERN_INVALID_ARGUMENT whatever the port name. Registration is
+	 * still gated by IPC-space ownership of the port being installed
+	 * (ipc_object_copyin below). */
+	if (!host_special_port_settable(uap->which)) {
 		td->td_retval[0] = KERN_INVALID_ARGUMENT;
 		return (0);
 	}
@@ -320,15 +325,10 @@ sys_host_set_special_port_trap(struct thread *td,
 		}
 	}
 
-	host_lock(&realhost);
-	old = realhost.special[uap->which];
-	realhost.special[uap->which] = port;
-	host_unlock(&realhost);
-
-	if (IP_VALID(old))
-		ipc_port_release_send(old);
-
-	td->td_retval[0] = KERN_SUCCESS;
+	kr = host_set_special_port(&realhost, uap->which, port);
+	if (kr != KERN_SUCCESS && IP_VALID(port))
+		ipc_port_release_send(port);
+	td->td_retval[0] = kr;
 	return (0);
 }
 

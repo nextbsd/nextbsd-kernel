@@ -151,6 +151,9 @@
 #include <sys/mach/ipc/ipc_space.h>
 
 #include <sys/kernel.h>
+#include <sys/proc.h>
+#include <sys/ucred.h>
+#include <sys/jail.h>
 
 /*
  * Forward declarations
@@ -175,6 +178,15 @@ ref_pset_port_locked(
 void ipc_host_init(void)
 {
 	ipc_port_t	port;
+
+	/*
+	 *	realhost.lock guards realhost.special[] (host_set/
+	 *	get_special_port, the bootstrap fallback in ipc_tt.c,
+	 *	iokit_kextd.c). Nothing initialised it before
+	 *	nextbsd-userland#84; this SYSINIT (SI_SUB_INTRINSIC)
+	 *	runs before any user process can reach those paths.
+	 */
+	mtx_init(&realhost.lock, "mach realhost", NULL, MTX_DEF);
 	/*
 	 *	Allocate and set up the two host ports.
 	 */
@@ -214,9 +226,52 @@ void ipc_host_init(void)
 }
 
 /*
+ *	Routine:	mach_host_priv_allowed
+ *	Purpose:
+ *		Whether the calling thread is privileged enough to be
+ *		handed the host_priv port by mach_host_self()
+ *		(nextbsd-userland#84, Phase B2). XNU decides this from
+ *		the task's security token: an effective uid of 0 gets
+ *		host_priv (set_security_token()). Here:
+ *
+ *		- the process must be a FreeBSD-ABI Mach task
+ *		  (mach_proc_task(); a Linux-ABI process's p_emuldata
+ *		  is not a task, and only the FreeBSD sysent reaches
+ *		  the Mach traps anyway);
+ *		- the thread's credential must have an effective uid
+ *		  of 0 (cr_uid). td_ucred is refreshed at syscall entry,
+ *		  so a set-id exec or a setuid() takes effect on the
+ *		  next call; a right already copied out is kept, as in
+ *		  XNU;
+ *		- the credential must not be jailed: host_priv controls
+ *		  host-wide state (the bootstrap and kextd special
+ *		  ports, the host exception ports), which a jail's root
+ *		  must not reach.
+ *	Conditions:
+ *		Nothing locked.
+ */
+
+static boolean_t
+mach_host_priv_allowed(struct thread *td)
+{
+	struct ucred *cred = td->td_ucred;
+
+	if (mach_proc_task(td->td_proc) == TASK_NULL)
+		return (FALSE);
+	if (cred == NULL || cred->cr_uid != 0)
+		return (FALSE);
+	if (jailed(cred))
+		return (FALSE);
+	return (TRUE);
+}
+
+/*
  *	Routine:	mach_host_self [mach trap]
  *	Purpose:
- *		Give the caller send rights for his own host port.
+ *		Give the caller send rights for his own host port:
+ *		the host_priv port if mach_host_priv_allowed(), the
+ *		unprivileged host port otherwise, as XNU does. Every
+ *		host_t routine accepts either (convert_port_to_host).
  *	Conditions:
  *		Nothing locked.
  *	Returns:
@@ -229,7 +284,10 @@ mach_host_self(void)
 {
 	ipc_port_t sright;
 
-	sright = ipc_port_make_send(realhost.host_self);
+	if (mach_host_priv_allowed(curthread))
+		sright = ipc_port_make_send(realhost.host_priv_self);
+	else
+		sright = ipc_port_make_send(realhost.host_self);
 	return ipc_port_copyout_send(sright, current_space());
 }
 
