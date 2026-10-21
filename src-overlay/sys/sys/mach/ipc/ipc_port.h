@@ -242,12 +242,25 @@ struct ipc_port {
 	TAILQ_ENTRY(ipc_port) ip_next;
 	natural_t ip_sprequests: 1,
 		ip_spimportant:1,
-		ip_impdonation:1,
-		ip_tempowner:1,
+		ip_impdonation:1,	/* port accepts importance donation */
+		ip_tempowner:1,		/* limbo, or owner in ip_imp_task */
 		ip_guarded:1,
 		ip_strict_guard:1,
-		ip_pad:26;
+		ip_taskptr:1,		/* ip_imp_task is valid */
+		ip_pad:25;
 	mach_vm_address_t ip_context;
+
+	/*
+	 * Importance accounting (xnu-2422 IMPORTANCE_INHERITANCE, OS X 10.9),
+	 * nextbsd#539 part D.  ip_impcount is the number of importance
+	 * assertions this port carries: RAISEIMP messages queued on it plus
+	 * the counts of receive rights in transit to it.  Locked by the port
+	 * lock.  ip_imp_task is the task a tempowner port charges, when
+	 * ip_taskptr is set.  Task structs are type-stable (see task_free),
+	 * so no reference is held on it.
+	 */
+	natural_t ip_impcount;
+	struct mach_task *ip_imp_task;
 };
 
 
@@ -458,6 +471,38 @@ extern kern_return_t ipc_port_alloc_name(
 extern void ipc_port_dnnotify(
 	ipc_port_t		port,
 	ipc_port_request_t	dnrequests);
+
+/*
+ * Importance accounting (nextbsd#539 part D).  mach_importance is the
+ * mach.importance sysctl: while it is 0 no message is marked RAISEIMP, so
+ * no count is ever created.
+ */
+struct ipc_kmsg;
+struct mach_task;
+
+extern int mach_importance;
+
+/* Apply an importance delta to a port (and its chain, and its task) */
+extern boolean_t ipc_port_importance_delta(
+	ipc_port_t		port,
+	int			delta);
+
+/* Undo the importance a destroyed RAISEIMP message still holds */
+extern void ipc_port_importance_kmsg_drop(
+	struct ipc_kmsg		*kmsg);
+
+/* Importance work for a receive right copied out into a space */
+struct ipc_importance_copyout {
+	struct mach_task	*hold_task;
+	struct mach_task	*release_task;
+	natural_t		count;
+};
+extern void ipc_port_importance_copyout_prepare(
+	ipc_port_t			port,
+	ipc_space_t			space,
+	struct ipc_importance_copyout	*imp);
+extern void ipc_port_importance_copyout_finish(
+	struct ipc_importance_copyout	*imp);
 
 /* Destroy a port */
 extern void ipc_port_destroy(

@@ -98,6 +98,7 @@
 #include <sys/cdefs.h>
 #include <sys/types.h>
 #include <sys/param.h>
+#include <sys/errno.h>
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
@@ -1300,6 +1301,14 @@ mach_task_recycle(task_t task, struct proc *p)
 	bzero(&task->audit_token, sizeof(task->audit_token));
 	task->semaphores_owned = 0;
 	task->messages_received = 0;
+	/* Importance state (nextbsd#539 part D) belongs to the old owner. */
+	task->imp_receiver = 0;
+	task->imp_donor = 0;
+	task->imp_reserved = 0;
+	task->task_imp_assertcnt = 0;
+	task->task_imp_externcnt = 0;
+	task->task_imp_apptype = TASK_APPTYPE_NONE;
+	task->task_imp_role = TASK_UNSPECIFIED;
 
 	mach_task_setup(task, p);
 }
@@ -1626,3 +1635,272 @@ task_sysinit(void *arg __unused)
 
 /* before SI_SUB_INTRINSIC and after SI_SUB_EVENTHANDLER */
 SYSINIT(mach_thread, SI_SUB_KLD, SI_ORDER_ANY, task_sysinit, NULL);
+
+/*
+ * Importance donation accounting (nextbsd#539 part D).
+ *
+ * The task half of xnu-2422's IMPORTANCE_INHERITANCE (kern/task_policy.c):
+ * the donor and receiver flags, the app type that sets them, and the
+ * internal (kernel-managed) and external (userspace-managed) assertion
+ * counts.  The port half is in ipc_port.c; RAISEIMP messages and receive
+ * rights in transit move counts between ports and into the task that
+ * receives on them.
+ *
+ * This is accounting only.  xnu-2422 calls task_update_boost_locked() when
+ * task_imp_assertcnt leaves or reaches zero, to apply or remove the
+ * boost; nothing here does, so a count never changes how a task is
+ * scheduled.
+ *
+ * xnu-2422 panics (or asserts) on an over-release of an internal
+ * assertion and on clearing imp_receiver with counts pending.  NextBSD
+ * clamps at zero instead, and logs only when mach.debug_enable is set.
+ *
+ * Every routine takes the task lock.  Callers hold no port lock (the
+ * xnu-2422 order: ports are unlocked before a task is touched).
+ */
+
+boolean_t
+task_is_importance_donor(task_t task)
+{
+
+	if (task == TASK_NULL)
+		return (FALSE);
+	return ((task->imp_donor == 1 || task->task_imp_assertcnt > 0) ?
+	    TRUE : FALSE);
+}
+
+boolean_t
+task_is_importance_receiver(task_t task)
+{
+
+	if (task == TASK_NULL)
+		return (FALSE);
+	return (task->imp_receiver ? TRUE : FALSE);
+}
+
+void
+task_importance_mark_donor(task_t task, boolean_t donating)
+{
+
+	if (task == TASK_NULL)
+		return;
+	task_lock(task);
+	task->imp_donor = (donating ? 1 : 0);
+	task_unlock(task);
+}
+
+static void
+task_importance_mark_receiver_locked(task_t task, boolean_t receiving)
+{
+
+	/* Already a receiver: keep the counts it holds. */
+	if (receiving && task->imp_receiver != 0)
+		return;
+	if (!receiving && mach_debug_enable &&
+	    (task->task_imp_assertcnt != 0 || task->task_imp_externcnt != 0))
+		printf("mach importance: task %p stops receiving with %u "
+		    "assertions (%u external) pending; clearing\n", task,
+		    task->task_imp_assertcnt, task->task_imp_externcnt);
+	task->imp_receiver = (receiving ? 1 : 0);
+	task->task_imp_assertcnt = 0;
+	task->task_imp_externcnt = 0;
+}
+
+void
+task_importance_mark_receiver(task_t task, boolean_t receiving)
+{
+
+	if (task == TASK_NULL)
+		return;
+	task_lock(task);
+	task_importance_mark_receiver_locked(task, receiving);
+	task_unlock(task);
+}
+
+/*
+ * Record a task's app type and set its donor and receiver flags from it,
+ * as xnu-2422's proc_set_task_apptype() does.  An unknown type is ignored
+ * (xnu-2422 panics).
+ */
+void
+task_importance_set_apptype(task_t task, int apptype)
+{
+	int donor, receiver;
+
+	if (task == TASK_NULL)
+		return;
+
+	switch (apptype) {
+	case TASK_APPTYPE_APP_TAL:
+	case TASK_APPTYPE_APP_DEFAULT:
+	case TASK_APPTYPE_DAEMON_INTERACTIVE:
+		donor = 1;
+		receiver = 1;
+		break;
+	case TASK_APPTYPE_DAEMON_STANDARD:
+		donor = 1;
+		receiver = 0;
+		break;
+	case TASK_APPTYPE_DAEMON_ADAPTIVE:
+		donor = 0;
+		receiver = 1;
+		break;
+	case TASK_APPTYPE_DAEMON_BACKGROUND:
+		donor = 0;
+		receiver = 0;
+		break;
+	default:
+		return;
+	}
+
+	task_lock(task);
+	task->task_imp_apptype = apptype;
+	task->imp_donor = donor;
+	task_importance_mark_receiver_locked(task, receiver);
+	task_unlock(task);
+}
+
+static int
+task_importance_hold_assertion_locked(task_t target_task, boolean_t external,
+    uint32_t count)
+{
+
+	if (target_task->imp_receiver == 0)
+		return (0);
+
+	if (external) {
+		if (target_task->task_imp_externcnt == 0) {
+			/*
+			 * Only allowed to take a new boost assertion when
+			 * holding an external boost.
+			 */
+			if (mach_debug_enable)
+				printf("mach importance: task %p took a boost "
+				    "assertion without holding an external one "
+				    "(%u total, %u external)\n", target_task,
+				    target_task->task_imp_assertcnt,
+				    target_task->task_imp_externcnt);
+			return (EOVERFLOW);
+		}
+		target_task->task_imp_assertcnt += count;
+		target_task->task_imp_externcnt += count;
+	} else
+		target_task->task_imp_assertcnt += count;
+
+	return (0);
+}
+
+static int
+task_importance_drop_assertion_locked(task_t target_task, boolean_t external,
+    uint32_t count)
+{
+
+	if (target_task->imp_receiver == 0)
+		return (0);
+
+	if (external) {
+		if (count > target_task->task_imp_externcnt) {
+			/* The process over-released its boost count. */
+			if (mach_debug_enable)
+				printf("mach importance: task %p over-released "
+				    "external boost assertions (%u total, %u "
+				    "external, dropping %u)\n", target_task,
+				    target_task->task_imp_assertcnt,
+				    target_task->task_imp_externcnt, count);
+			return (EOVERFLOW);
+		}
+		target_task->task_imp_externcnt -= count;
+	}
+
+	if (count > target_task->task_imp_assertcnt) {
+		if (mach_debug_enable)
+			printf("mach importance: over-release of internal "
+			    "assertions for task %p (dropping %u, %u held, %u "
+			    "external); clamping at zero\n", target_task, count,
+			    target_task->task_imp_assertcnt,
+			    target_task->task_imp_externcnt);
+		count = target_task->task_imp_assertcnt;
+	}
+	target_task->task_imp_assertcnt -= count;
+	if (target_task->task_imp_externcnt > target_task->task_imp_assertcnt)
+		target_task->task_imp_externcnt =
+		    target_task->task_imp_assertcnt;
+
+	return (0);
+}
+
+int
+task_importance_hold_internal_assertion(task_t target_task, uint32_t count)
+{
+	int rval;
+
+	if (target_task == TASK_NULL || count == 0)
+		return (0);
+	task_lock(target_task);
+	rval = task_importance_hold_assertion_locked(target_task, FALSE, count);
+	task_unlock(target_task);
+	return (rval);
+}
+
+int
+task_importance_drop_internal_assertion(task_t target_task, uint32_t count)
+{
+	int rval;
+
+	if (target_task == TASK_NULL || count == 0)
+		return (0);
+	task_lock(target_task);
+	rval = task_importance_drop_assertion_locked(target_task, FALSE, count);
+	task_unlock(target_task);
+	return (rval);
+}
+
+int
+task_importance_hold_external_assertion(task_t target_task, uint32_t count)
+{
+	int rval;
+
+	if (target_task == TASK_NULL || count == 0)
+		return (0);
+	task_lock(target_task);
+	rval = task_importance_hold_assertion_locked(target_task, TRUE, count);
+	task_unlock(target_task);
+	return (rval);
+}
+
+int
+task_importance_drop_external_assertion(task_t target_task, uint32_t count)
+{
+	int rval;
+
+	if (target_task == TASK_NULL || count == 0)
+		return (0);
+	task_lock(target_task);
+	rval = task_importance_drop_assertion_locked(target_task, TRUE, count);
+	task_unlock(target_task);
+	return (rval);
+}
+
+/*
+ * Transfer an internal assertion to userspace responsibility: a RAISEIMP
+ * message was delivered, and the receiver now owns its boost until it
+ * drops it (proc_importance_assertion_complete() in libsyscall).
+ */
+int
+task_importance_externalize_assertion(task_t target_task, uint32_t count,
+    int sender_pid __unused)
+{
+
+	if (target_task == TASK_NULL || count == 0)
+		return (0);
+	task_lock(target_task);
+	if (target_task->imp_receiver != 0) {
+		target_task->task_imp_externcnt += count;
+		if (target_task->task_imp_externcnt >
+		    target_task->task_imp_assertcnt)
+			target_task->task_imp_externcnt =
+			    target_task->task_imp_assertcnt;
+	}
+	task_unlock(target_task);
+	return (0);
+}

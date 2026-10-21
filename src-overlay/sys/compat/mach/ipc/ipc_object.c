@@ -98,6 +98,7 @@
 #include <sys/mach/ipc/ipc_right.h>
 #include <sys/mach/ipc/ipc_notify.h>
 #include <sys/mach/ipc/ipc_pset.h>
+#include <sys/mach/ipc/ipc_port.h>
 
 uma_zone_t ipc_object_zones[IOT_NUMBER];
 
@@ -720,6 +721,7 @@ ipc_object_copyout_name(
 	ipc_entry_t oentry;
 	ipc_entry_t entry;
 	kern_return_t kr;
+	struct ipc_importance_copyout imp;
 
 	assert(IO_VALID(object));
 	assert(io_otype(object) == IOT_PORT);
@@ -765,10 +767,24 @@ ipc_object_copyout_name(
 
 	/* space is write-locked and active, object is locked and active */
 
+	/*
+	 * Importance (nextbsd#539 part D, as xnu-2422): we are slamming a
+	 * receive right into the space, without first having been enqueued
+	 * on a port destined there.  So, we have to arrange to boost the
+	 * task appropriately if this port has assertions (and the task
+	 * wants them).
+	 */
+	if (msgt_name == MACH_MSG_TYPE_PORT_RECEIVE)
+		ipc_port_importance_copyout_prepare((ipc_port_t) object,
+		    space, &imp);
+
 	kr = ipc_right_copyout(space, name, entry,
 			       msgt_name, object);
 	/* object is unlocked */
 	is_write_unlock(space);
+
+	if (msgt_name == MACH_MSG_TYPE_PORT_RECEIVE)
+		ipc_port_importance_copyout_finish(&imp);
 	return kr;
 }
 

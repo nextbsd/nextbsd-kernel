@@ -665,6 +665,8 @@ typedef integer_t mach_msg_option_t;
 #define MACH_SEND_NOTIFY	0x00000080
 #define MACH_SEND_ALWAYS	0x00010000	/* internal use only */
 #define MACH_SEND_TRAILER	0x00020000
+#define MACH_SEND_NOIMPORTANCE	0x00040000	/* msg won't carry importance */
+#define MACH_SEND_IMPORTANCE	0x00080000	/* msg carries importance - kernel only */
 
 
 
@@ -699,7 +701,7 @@ typedef integer_t mach_msg_option_t;
 /* The options that the kernel honors when passed from user space */
 #define MACH_SEND_USER		 (MACH_SEND_MSG | \
 				  MACH_SEND_TIMEOUT | MACH_SEND_NOTIFY | \
-				  MACH_SEND_TRAILER)
+				  MACH_SEND_TRAILER | MACH_SEND_NOIMPORTANCE)
 
 #define MACH_RCV_USER		 (MACH_RCV_MSG | \
 				  MACH_RCV_TIMEOUT | MACH_RCV_OVERWRITE | \

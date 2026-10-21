@@ -1436,6 +1436,8 @@ mach_port_set_attributes(
 {
 	ipc_port_t port = 0;
 	kern_return_t kr;
+	task_t release_imp_task;
+	natural_t assertcnt;
         
 	if (space == IS_NULL)
 		return KERN_INVALID_TASK;
@@ -1485,11 +1487,57 @@ mach_port_set_attributes(
 				ip_unlock(port);
 				return KERN_INVALID_ARGUMENT;
 			}
-			/*  without IMPORTANCE_INHERITANCE - this is essentially
-			 *  trivial
+
+			/*
+			 * Importance (nextbsd#539 part D, as xnu-2422): the
+			 * port stops charging its owner.  Release the count
+			 * from the task it was charged to: the task it was
+			 * bound to if it was already tempowner, otherwise the
+			 * task whose space holds it.  Nothing is charged to a
+			 * tempowner port until a task is bound to it.
 			 */
+			release_imp_task = TASK_NULL;
+			assertcnt = 0;
+			if (port->ip_tempowner != 0) {
+				if (port->ip_taskptr != 0) {
+					release_imp_task = port->ip_imp_task;
+					port->ip_taskptr = 0;
+					port->ip_imp_task = TASK_NULL;
+					assertcnt = port->ip_impcount;
+				}
+			} else {
+				assertcnt = port->ip_impcount;
+				if (assertcnt > 0 && space->is_task != TASK_NULL &&
+				    space->is_task->imp_receiver != 0)
+					release_imp_task = space->is_task;
+			}
+
 			port->ip_impdonation = 1;
 			port->ip_tempowner = 1;
+			ip_unlock(port);
+
+			/* drop assertions from previous destination task */
+			if (release_imp_task != TASK_NULL && assertcnt > 0)
+				task_importance_drop_internal_assertion(
+				    release_imp_task, assertcnt);
+			break;
+		}
+		case MACH_PORT_IMPORTANCE_RECEIVER: {
+			/*
+			 * Mark the receive right as accepting importance
+			 * donation (xnu-2422).  Refused, as before, while the
+			 * mach.importance sysctl is 0.
+			 */
+			if (mach_importance == 0)
+				return KERN_INVALID_ARGUMENT;
+			if (!MACH_PORT_NAME_VALID(name))
+				return KERN_INVALID_RIGHT;
+			kr = ipc_port_translate_receive(space, name, &port);
+			if (kr != KERN_SUCCESS)
+				return kr;
+			/* port is locked and active */
+
+			port->ip_impdonation = 1;
 			ip_unlock(port);
 			break;
 		}

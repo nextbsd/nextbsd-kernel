@@ -203,6 +203,7 @@
 #include <sys/mach/ipc/ipc_table.h>
 #include <sys/mach/ipc/ipc_voucher.h>
 #include <sys/mach/thread.h>
+#include <sys/mach/task.h>
 #include <sys/mach/rpc.h>
 
 #if	MACH_KDB
@@ -670,6 +671,13 @@ ipc_port_init(
 	port->ip_flags = 0;
 	port->ip_context = 0;
 
+	/* importance accounting (nextbsd#539 part D), as xnu-2422 */
+	port->ip_impdonation = 0;
+	port->ip_tempowner = 0;
+	port->ip_taskptr = 0;
+	port->ip_impcount = 0;
+	port->ip_imp_task = TASK_NULL;
+
 	/*
 	 *	Turn no more senders detection on
 	 *	for all ports.  Eventually, this
@@ -802,6 +810,272 @@ ipc_port_dnnotify(
 }
 
 /*
+ *	Importance accounting (nextbsd#539 part D).
+ *
+ *	The port half of xnu-2422's IMPORTANCE_INHERITANCE.  A message sent
+ *	by a donor task to a port marked ip_impdonation is flagged
+ *	MACH_MSGH_BITS_RAISEIMP and adds one to the port's ip_impcount
+ *	(ipc_mqueue_send); receiving it moves the count to the receiving
+ *	task's external count (mach_msg.c).  A receive right in transit
+ *	carries its count into every port along the chain it is queued on
+ *	(ipc_port_check_circularity), and the task at the base of the chain
+ *	holds the total as internal assertions.
+ *
+ *	Which task a port's count is charged to:
+ *	  - ip_tempowner set: ip_imp_task if ip_taskptr is set, else nobody
+ *	    (a receive right in limbo);
+ *	  - in a space: the space's task, if it is an importance receiver;
+ *	  - in transit: the task at the base of its chain.
+ *
+ *	Task routines take the task lock, so every one of them is called
+ *	after the port locks are dropped, as in xnu-2422.  Task structs are
+ *	type-stable (see task_free), so a task pointer read under a port lock
+ *	stays valid; the task routines ignore a task that is not an
+ *	importance receiver.
+ *
+ *	No count is created while the mach.importance sysctl is 0, and every
+ *	routine below does nothing for a zero count, so with the default
+ *	setting no task counter changes and no extra lock is taken.
+ */
+
+/*
+ *	Routine:	ipc_port_importance_task
+ *	Purpose:
+ *		The task, if any, a port's importance count is charged to.
+ *	Conditions:
+ *		The port is locked.
+ */
+static task_t
+ipc_port_importance_task(
+	ipc_port_t	port)
+{
+	ipc_space_t space;
+	task_t task;
+
+	if (!ip_active(port))
+		return TASK_NULL;
+	if (port->ip_tempowner != 0)
+		return (port->ip_taskptr != 0) ? port->ip_imp_task : TASK_NULL;
+	if (port->ip_receiver_name == MACH_PORT_NAME_NULL)
+		return TASK_NULL;	/* in limbo or in transit */
+	space = port->ip_receiver;
+	if (space == IS_NULL || space == ipc_space_kernel ||
+	    space == ipc_space_reply)
+		return TASK_NULL;
+	task = space->is_task;
+	if (task == TASK_NULL || task->imp_receiver == 0)
+		return TASK_NULL;
+	return task;
+}
+
+/*
+ *	Routine:	ipc_port_importance_delta
+ *	Purpose:
+ *		Adjust the importance count through the given port.
+ *		If the port is in transit, apply the delta throughout
+ *		the chain. Determine if the there is a task at the
+ *		base of the chain that wants/needs to be adjusted,
+ *		and if so, apply the delta.
+ *
+ *		As xnu-2422, except that a negative delta clamps each
+ *		port's count at zero instead of wrapping.
+ *	Conditions:
+ *		The port is referenced and locked on entry.
+ *		Nothing else is locked.
+ *		The lock may be dropped on exit.
+ *		Returns TRUE if lock was dropped.
+ */
+boolean_t
+ipc_port_importance_delta(
+	ipc_port_t	port,
+	int		delta)
+{
+	ipc_port_t next, base;
+	task_t task;
+	boolean_t dropped = FALSE;
+
+	if (delta == 0)
+		return FALSE;
+
+	base = port;
+
+	/* if port is in transit, have to search for end of chain */
+	if (ip_active(port) &&
+	    port->ip_destination != IP_NULL &&
+	    port->ip_receiver_name == MACH_PORT_NAME_NULL) {
+
+		dropped = TRUE;
+
+		ip_unlock(port);
+		ipc_port_multiple_lock(); /* massive serialization */
+		ip_lock(base);
+
+		while (ip_active(base) &&
+		       base->ip_destination != IP_NULL &&
+		       base->ip_receiver_name == MACH_PORT_NAME_NULL) {
+
+			base = base->ip_destination;
+			ip_lock(base);
+		}
+		ipc_port_multiple_unlock();
+	}
+
+	/* unlock down to the base, adding a boost at each level */
+	for (;;) {
+		if (delta > 0)
+			port->ip_impcount += delta;
+		else if (port->ip_impcount > (natural_t)-delta)
+			port->ip_impcount -= (natural_t)-delta;
+		else
+			port->ip_impcount = 0;
+
+		if (port == base)
+			break;
+
+		/* port is in transit */
+		next = port->ip_destination;
+		ip_unlock(port);
+		port = next;
+	}
+
+	/* find the task (if any) to boost according to the base */
+	task = ipc_port_importance_task(base);
+
+	/*
+	 * Only the base is locked.  If we have to hold or drop task
+	 * importance assertions, we'll have to drop that lock as well.
+	 */
+	if (task != TASK_NULL) {
+		ip_unlock(base);
+		dropped = TRUE;
+
+		if (delta > 0)
+			task_importance_hold_internal_assertion(task, delta);
+		else
+			task_importance_drop_internal_assertion(task, -delta);
+	} else if (dropped == TRUE) {
+		ip_unlock(base);
+		/* just unlocked base, so return TRUE */
+	}
+
+	return dropped;
+}
+
+/*
+ *	Routine:	ipc_port_importance_kmsg_drop
+ *	Purpose:
+ *		A RAISEIMP message is being thrown away without being
+ *		received (a receive error after it left the queue, or a
+ *		failed send): take its count back off its destination
+ *		and clear the bit.  Port destruction drops the counts of
+ *		the messages still queued, so this is not called for them.
+ *	Conditions:
+ *		Nothing locked.  The message holds a reference for its
+ *		destination port.
+ */
+void
+ipc_port_importance_kmsg_drop(
+	ipc_kmsg_t	kmsg)
+{
+	ipc_port_t port;
+
+	if ((kmsg->ikm_header->msgh_bits & MACH_MSGH_BITS_RAISEIMP) == 0)
+		return;
+	kmsg->ikm_header->msgh_bits &= ~MACH_MSGH_BITS_RAISEIMP;
+
+	port = (ipc_port_t) kmsg->ikm_header->msgh_remote_port;
+	if (!IP_VALID(port))
+		return;
+	ip_lock(port);
+	if (ipc_port_importance_delta(port, -1) == FALSE)
+		ip_unlock(port);
+}
+
+/*
+ *	Routine:	ipc_port_importance_copyout_prepare
+ *	Purpose:
+ *		A receive right is being copied out into a space by name
+ *		(ipc_object_copyout_name), not as a message carried by a
+ *		port the space already owned.  Take it out of limbo and
+ *		note what has to move: its count is dropped from the task
+ *		it was still charged to and held by the space's task.
+ *		(xnu-2422 ipc_object_copyout_name.)  The receive right's
+ *		previous destination, if it was in transit, is handled by
+ *		ipc_right_copyout.
+ *	Conditions:
+ *		The space is write-locked and the port locked.
+ *		ipc_port_importance_copyout_finish must be called once
+ *		both are unlocked.
+ */
+void
+ipc_port_importance_copyout_prepare(
+	ipc_port_t			port,
+	ipc_space_t			space,
+	struct ipc_importance_copyout	*imp)
+{
+	task_t task;
+
+	imp->hold_task = TASK_NULL;
+	imp->release_task = TASK_NULL;
+	imp->count = port->ip_impcount;
+
+	if (port->ip_tempowner != 0 && port->ip_taskptr != 0)
+		imp->release_task = port->ip_imp_task;
+	port->ip_taskptr = 0;
+	port->ip_imp_task = TASK_NULL;
+
+	/* take port out of limbo */
+	port->ip_tempowner = 0;
+
+	if (space != ipc_space_kernel && space != ipc_space_reply) {
+		task = space->is_task;
+		if (task != TASK_NULL && task->imp_receiver != 0)
+			imp->hold_task = task;
+	}
+}
+
+void
+ipc_port_importance_copyout_finish(
+	struct ipc_importance_copyout	*imp)
+{
+
+	if (imp->count == 0 || imp->hold_task == imp->release_task)
+		return;
+	if (imp->hold_task != TASK_NULL)
+		task_importance_hold_internal_assertion(imp->hold_task,
+		    imp->count);
+	if (imp->release_task != TASK_NULL)
+		task_importance_drop_internal_assertion(imp->release_task,
+		    imp->count);
+}
+
+/*
+ *	Routine:	ipc_port_destroy_importance
+ *	Purpose:
+ *		Drop the importance a destroyed (or port-destroyed
+ *		notified) receive right held: off the chain it was in
+ *		transit on, or from the task it was charged to.
+ *	Conditions:
+ *		Nothing locked.  The caller holds a reference for dest.
+ */
+static void
+ipc_port_destroy_importance(
+	ipc_port_t	dest,
+	task_t		task,
+	natural_t	assertcnt)
+{
+
+	if (assertcnt == 0)
+		return;
+	if (dest != IP_NULL) {
+		ip_lock(dest);
+		if (ipc_port_importance_delta(dest, -(int)assertcnt) == FALSE)
+			ip_unlock(dest);
+	} else if (task != TASK_NULL)
+		task_importance_drop_internal_assertion(task, assertcnt);
+}
+
+/*
  *	Routine:	ipc_port_destroy
  *	Purpose:
  *		Destroys a port.  Cleans up queued messages.
@@ -825,6 +1099,9 @@ ipc_port_destroy(
 	ipc_thread_t sender;
 	ipc_port_request_t dnrequests;
 	thread_pool_t thread_pool;
+	task_t release_imp_task = TASK_NULL;
+	ipc_port_t imp_dest = IP_NULL;
+	natural_t assertcnt;
 
 	assert(ip_active(port));
 	/* port->ip_receiver_name is garbage */
@@ -837,6 +1114,38 @@ ipc_port_destroy(
 	/* first check for a backup port */
 
 	pdrequest = port->ip_pdrequest;
+
+	/*
+	 * Importance (nextbsd#539 part D): determine how many assertions
+	 * to drop and from whom, as xnu-2422 does.  xnu-2422 charges an
+	 * owned port's count to current_task() and keeps a per-thread
+	 * tally so that ports destroyed inside this one's queued messages
+	 * are not charged again.  The callers here still have the port in
+	 * its space (ipc_port_clear_receiver leaves ip_receiver alone), so
+	 * charge that space's task directly; a port destroyed in transit
+	 * takes its count back off the chain it was queued on, which is a
+	 * no-op on a destination that is itself being destroyed.  The
+	 * caller holds a reference for the destination of a port in
+	 * transit (ipc_port_release_receive).
+	 */
+	assertcnt = port->ip_impcount;
+	if (assertcnt > 0) {
+		if (port->ip_tempowner != 0) {
+			if (port->ip_taskptr != 0)
+				release_imp_task = port->ip_imp_task;
+			/* otherwise in limbo: nothing is charged */
+		} else if (port->ip_receiver_name != MACH_PORT_NAME_NULL) {
+			release_imp_task = ipc_port_importance_task(port);
+		} else if (port->ip_destination != IP_NULL) {
+			imp_dest = port->ip_destination;
+		}
+	}
+	port->ip_taskptr = 0;
+	port->ip_imp_task = TASK_NULL;
+	if (pdrequest != IP_NULL)
+		/* mark in limbo for the journey */
+		port->ip_tempowner = 1;
+
 	if (pdrequest != IP_NULL) {
 		/* we assume the ref for pdrequest */
 		port->ip_pdrequest = IP_NULL;
@@ -847,6 +1156,13 @@ ipc_port_destroy(
 		ip_unlock(port);
 
 		if (!ipc_port_check_circularity(port, pdrequest)) {
+			/*
+			 * The count now rides with port to pdrequest's
+			 * receiver (ipc_port_check_circularity); drop it
+			 * from the old owner before port can be received.
+			 */
+			ipc_port_destroy_importance(imp_dest,
+			    release_imp_task, assertcnt);
 			/* consumes our refs for port and pdrequest */
 			ipc_notify_port_destroyed(pdrequest, port);
 			return;
@@ -926,6 +1242,8 @@ ipc_port_destroy(
 	/* XXXX Perhaps should verify that ip_thread_pool is empty! */
 
 	ipc_port_release(port); /* consume caller's ref */
+
+	ipc_port_destroy_importance(imp_dest, release_imp_task, assertcnt);
 }
 
 /*
@@ -950,6 +1268,9 @@ ipc_port_check_circularity(
 	ipc_port_t	dest)
 {
 	ipc_port_t base;
+	task_t task = TASK_NULL;
+	task_t release_task = TASK_NULL;
+	natural_t assertcnt;
 
 	assert(port != IP_NULL);
 	assert(dest != IP_NULL);
@@ -1043,20 +1364,45 @@ ipc_port_check_circularity(
 	ip_reference(dest);
 	port->ip_destination = dest;
 
+	/*
+	 * Importance (nextbsd#539 part D, as xnu-2422): port was in limbo
+	 * or still charged to a task.  Its count now rides along the
+	 * chain: every port from dest to base carries it, and the task at
+	 * the base (if any) holds it.  Drop it from the task port was
+	 * still charged to (ipc_right_copyin leaves a moved receive right
+	 * charged to its old owner until here).
+	 */
+	if (port->ip_tempowner != 0 && port->ip_taskptr != 0)
+		release_task = port->ip_imp_task;
+	port->ip_taskptr = 0;
+	port->ip_imp_task = TASK_NULL;
+	assertcnt = port->ip_impcount;
+
+	/* take the port out of limbo w.r.t. assertions */
+	port->ip_tempowner = 0;
+
 	/* now unlock chain */
 
-	while (port != base) {
+	ip_unlock(port);
+
+	for (;;) {
 		ipc_port_t next;
 
-		/* port is in transit */
+		/* every port along chain track assertions behind it */
+		dest->ip_impcount += assertcnt;
 
-		assert(ip_active(port));
-		assert(port->ip_receiver_name == MACH_PORT_NAME_NULL);
-		assert(port->ip_destination != IP_NULL);
+		if (dest == base)
+			break;
 
-		next = port->ip_destination;
-		ip_unlock(port);
-		port = next;
+		/* dest is in transit */
+
+		assert(ip_active(dest));
+		assert(dest->ip_receiver_name == MACH_PORT_NAME_NULL);
+		assert(dest->ip_destination != IP_NULL);
+
+		next = dest->ip_destination;
+		ip_unlock(dest);
+		dest = next;
 	}
 
 	/* base is not in transit */
@@ -1064,7 +1410,29 @@ ipc_port_check_circularity(
 	assert(!ip_active(base) ||
 	       (base->ip_receiver_name != MACH_PORT_NAME_NULL) ||
 	       (base->ip_destination == IP_NULL));
+
+	/*
+	 * Find the task to boost (if any).  We will boost "through" ports
+	 * that don't know about inheritance to deliver receive rights
+	 * that do.
+	 */
+	if (assertcnt > 0)
+		task = ipc_port_importance_task(base);
+
 	ip_unlock(base);
+
+	/*
+	 * Transfer assertions now that the ports are unlocked.
+	 * Avoid extra overhead if transferring to/from the same task.
+	 */
+	if (assertcnt > 0 && task != release_task) {
+		if (task != TASK_NULL)
+			task_importance_hold_internal_assertion(task,
+			    assertcnt);
+		if (release_task != TASK_NULL)
+			task_importance_drop_internal_assertion(release_task,
+			    assertcnt);
+	}
 
 	return FALSE;
 }

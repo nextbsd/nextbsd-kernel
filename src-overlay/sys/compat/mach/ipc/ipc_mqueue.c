@@ -212,6 +212,32 @@ ipc_mqueue_init(
 }
 
 /*
+ *	Routine:	ipc_mqueue_send_importance_backout
+ *	Purpose:
+ *		The send failed and the caller keeps the message: back
+ *		out the importance boost it added, if any (xnu-2422
+ *		ipc_kmsg_send, MACH_SEND_TIMED_OUT/INTERRUPTED).  The port
+ *		may have changed hands; the back-out finds the new owner.
+ *	Conditions:
+ *		The port is locked; it is unlocked on return.
+ */
+static void
+ipc_mqueue_send_importance_backout(
+	ipc_port_t		port,
+	ipc_kmsg_t		kmsg,
+	boolean_t		did_importance)
+{
+
+	if (did_importance == FALSE) {
+		ip_unlock(port);
+		return;
+	}
+	kmsg->ikm_header->msgh_bits &= ~MACH_MSGH_BITS_RAISEIMP;
+	if (ipc_port_importance_delta(port, -1) == FALSE)
+		ip_unlock(port);
+}
+
+/*
  *	Routine:	ipc_mqueue_send
  *	Purpose:
  *		Send a message to a port.  The message holds a reference
@@ -238,6 +264,7 @@ ipc_mqueue_send(
 	ipc_port_t port;
 	kern_return_t           save_wait_result;
 	ipc_thread_t self = current_thread();
+	boolean_t did_importance = FALSE;
 
 	port = (ipc_port_t) kmsg->ikm_header->msgh_remote_port;
 	assert(IP_VALID(port));
@@ -312,6 +339,31 @@ ipc_mqueue_send(
 		}
 
 		/*
+		 * Importance (nextbsd#539 part D, as xnu-2422
+		 * ipc_kmsg_send): a message from a donor task to a port
+		 * that accepts donation raises the receiver's importance.
+		 * Mark it and count it on the port (and its chain, and
+		 * its task).  That can drop the port lock; if it does,
+		 * revalidate the destination.  Kernel-originated sends
+		 * (MACH_SEND_ALWAYS) never donate, as xnu-2422's
+		 * MACH_SEND_KERNEL_DEFAULT includes MACH_SEND_NOIMPORTANCE.
+		 * Nothing here runs while the mach.importance sysctl is 0.
+		 */
+		if (did_importance == FALSE &&
+		    mach_importance != 0 &&
+		    port->ip_impdonation != 0 &&
+		    (option & (MACH_SEND_NOIMPORTANCE | MACH_SEND_ALWAYS)) == 0 &&
+		    ((option & MACH_SEND_IMPORTANCE) != 0 ||
+		     task_is_importance_donor(mach_proc_task(curproc)))) {
+			did_importance = TRUE;
+			kmsg->ikm_header->msgh_bits |= MACH_MSGH_BITS_RAISEIMP;
+			if (ipc_port_importance_delta(port, 1) == TRUE) {
+				ip_lock(port);
+				continue;
+			}
+		}
+
+		/*
 		 *  Don't block if:
 		 *	1) We're under the queue limit.
 		 *	2) Caller used the MACH_SEND_ALWAYS internal option.
@@ -330,7 +382,8 @@ ipc_mqueue_send(
 
 		if (option & MACH_SEND_TIMEOUT) {
 			if (timeout == 0) {
-				ip_unlock(port);
+				ipc_mqueue_send_importance_backout(port, kmsg,
+				    did_importance);
 				return MACH_SEND_TIMED_OUT;
 			}
 			thread_will_wait_with_timeout(self, timeout);
@@ -363,7 +416,8 @@ ipc_mqueue_send(
 		    case THREAD_INTERRUPTED:
 			/* send was interrupted - give up */
 
-			ip_unlock(port);
+			ipc_mqueue_send_importance_backout(port, kmsg,
+			    did_importance);
 			return MACH_SEND_INTERRUPTED;
 
 		    case THREAD_TIMED_OUT:
