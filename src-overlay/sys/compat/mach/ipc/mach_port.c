@@ -1500,7 +1500,8 @@ mach_port_set_attributes(
 			assertcnt = 0;
 			if (port->ip_tempowner != 0) {
 				if (port->ip_taskptr != 0) {
-					release_imp_task = port->ip_imp_task;
+					release_imp_task =
+					    ipc_port_importance_owner(port);
 					port->ip_taskptr = 0;
 					port->ip_imp_task = TASK_NULL;
 					assertcnt = port->ip_impcount;

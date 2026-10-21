@@ -677,6 +677,7 @@ ipc_port_init(
 	port->ip_taskptr = 0;
 	port->ip_impcount = 0;
 	port->ip_imp_task = TASK_NULL;
+	port->ip_imp_taskid = 0;
 
 	/*
 	 *	Turn no more senders detection on
@@ -822,8 +823,9 @@ ipc_port_dnnotify(
  *	holds the total as internal assertions.
  *
  *	Which task a port's count is charged to:
- *	  - ip_tempowner set: ip_imp_task if ip_taskptr is set, else nobody
- *	    (a receive right in limbo);
+ *	  - ip_tempowner set: ip_imp_task if ip_taskptr is set and that task
+ *	    struct still belongs to the process it was bound to, else nobody
+ *	    (a receive right in limbo, or an owner that has exited);
  *	  - in a space: the space's task, if it is an importance receiver;
  *	  - in transit: the task at the base of its chain.
  *
@@ -831,12 +833,63 @@ ipc_port_dnnotify(
  *	after the port locks are dropped, as in xnu-2422.  Task structs are
  *	type-stable (see task_free), so a task pointer read under a port lock
  *	stays valid; the task routines ignore a task that is not an
- *	importance receiver.
+ *	importance receiver.  A task struct is reused by the next process
+ *	that gets its proc struct (mach_task_recycle), so a bound port also
+ *	records its owner's itk_uniqueid, and ipc_port_importance_owner()
+ *	stops naming a task struct that has passed to another process.
+ *	Without that, a watch port whose job had exited charged whichever
+ *	process inherited the job's proc struct.
  *
- *	No count is created while the mach.importance sysctl is 0, and every
- *	routine below does nothing for a zero count, so with the default
- *	setting no task counter changes and no extra lock is taken.
+ *	No count is created while the mach.importance sysctl is 0 (it is 1
+ *	by default), and every routine below does nothing for a zero count,
+ *	so with it at 0 no task counter changes and no extra lock is taken.
  */
+
+/*
+ *	Routine:	ipc_port_importance_owner
+ *	Purpose:
+ *		The task a tempowner port is bound to (ip_imp_task), or
+ *		TASK_NULL if it is bound to none, or if the bound task
+ *		struct has since been recycled for another process (its
+ *		itk_uniqueid no longer matches).  The old owner's counts
+ *		were cleared when it exited (mach_task_exit), so nothing is
+ *		left to release from it.
+ *	Conditions:
+ *		The port is locked.
+ */
+task_t
+ipc_port_importance_owner(
+	ipc_port_t	port)
+{
+	task_t task;
+
+	if (port->ip_taskptr == 0)
+		return TASK_NULL;
+	task = port->ip_imp_task;
+	if (task == TASK_NULL || task->itk_uniqueid != port->ip_imp_taskid)
+		return TASK_NULL;
+	return task;
+}
+
+/*
+ *	Routine:	ipc_port_importance_bind
+ *	Purpose:
+ *		Bind a tempowner port to a task: its count is charged to
+ *		that task until it is bound elsewhere, lands in a space,
+ *		or the task exits.
+ *	Conditions:
+ *		The port is locked.
+ */
+void
+ipc_port_importance_bind(
+	ipc_port_t	port,
+	task_t		task)
+{
+
+	port->ip_taskptr = 1;
+	port->ip_imp_task = task;
+	port->ip_imp_taskid = task->itk_uniqueid;
+}
 
 /*
  *	Routine:	ipc_port_importance_task
@@ -855,7 +908,7 @@ ipc_port_importance_task(
 	if (!ip_active(port))
 		return TASK_NULL;
 	if (port->ip_tempowner != 0)
-		return (port->ip_taskptr != 0) ? port->ip_imp_task : TASK_NULL;
+		return ipc_port_importance_owner(port);
 	if (port->ip_receiver_name == MACH_PORT_NAME_NULL)
 		return TASK_NULL;	/* in limbo or in transit */
 	space = port->ip_receiver;
@@ -1019,8 +1072,8 @@ ipc_port_importance_copyout_prepare(
 	imp->release_task = TASK_NULL;
 	imp->count = port->ip_impcount;
 
-	if (port->ip_tempowner != 0 && port->ip_taskptr != 0)
-		imp->release_task = port->ip_imp_task;
+	if (port->ip_tempowner != 0)
+		imp->release_task = ipc_port_importance_owner(port);
 	port->ip_taskptr = 0;
 	port->ip_imp_task = TASK_NULL;
 
@@ -1131,8 +1184,7 @@ ipc_port_destroy(
 	assertcnt = port->ip_impcount;
 	if (assertcnt > 0) {
 		if (port->ip_tempowner != 0) {
-			if (port->ip_taskptr != 0)
-				release_imp_task = port->ip_imp_task;
+			release_imp_task = ipc_port_importance_owner(port);
 			/* otherwise in limbo: nothing is charged */
 		} else if (port->ip_receiver_name != MACH_PORT_NAME_NULL) {
 			release_imp_task = ipc_port_importance_task(port);
@@ -1372,8 +1424,8 @@ ipc_port_check_circularity(
 	 * still charged to (ipc_right_copyin leaves a moved receive right
 	 * charged to its old owner until here).
 	 */
-	if (port->ip_tempowner != 0 && port->ip_taskptr != 0)
-		release_task = port->ip_imp_task;
+	if (port->ip_tempowner != 0)
+		release_task = ipc_port_importance_owner(port);
 	port->ip_taskptr = 0;
 	port->ip_imp_task = TASK_NULL;
 	assertcnt = port->ip_impcount;

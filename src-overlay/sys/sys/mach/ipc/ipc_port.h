@@ -257,10 +257,14 @@ struct ipc_port {
 	 * the counts of receive rights in transit to it.  Locked by the port
 	 * lock.  ip_imp_task is the task a tempowner port charges, when
 	 * ip_taskptr is set.  Task structs are type-stable (see task_free),
-	 * so no reference is held on it.
+	 * so no reference is held on it; but a task struct passes to the next
+	 * process that reuses its proc struct, so ip_imp_taskid records the
+	 * owner's itk_uniqueid and ipc_port_importance_owner() only returns
+	 * ip_imp_task while the two still match (nextbsd#539).
 	 */
 	natural_t ip_impcount;
 	struct mach_task *ip_imp_task;
+	uint64_t ip_imp_taskid;
 };
 
 
@@ -486,6 +490,15 @@ extern int mach_importance;
 extern boolean_t ipc_port_importance_delta(
 	ipc_port_t		port,
 	int			delta);
+
+/* The task a tempowner port is bound to, if it is still that process's */
+extern struct mach_task *ipc_port_importance_owner(
+	ipc_port_t		port);
+
+/* Bind a tempowner port to a task */
+extern void ipc_port_importance_bind(
+	ipc_port_t		port,
+	struct mach_task	*task);
 
 /* Undo the importance a destroyed RAISEIMP message still holds */
 extern void ipc_port_importance_kmsg_drop(
