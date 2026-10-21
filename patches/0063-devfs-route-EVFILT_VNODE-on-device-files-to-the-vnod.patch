@@ -1,0 +1,58 @@
+From 2f9d4bb1a87e4e95b8dc89b76e55ad3267092645 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 21 Oct 2026 10:53:04 -0500
+Subject: [PATCH] devfs: route EVFILT_VNODE on device files to the vnode layer
+
+devfs_kqfilter_f() handed every kqueue registration on a device file to
+the driver's d_kqfilter.  Drivers implement only data filters such as
+EVFILT_READ/EVFILT_WRITE (ttydev_kqfilter returns EINVAL for anything
+else), so EVFILT_VNODE on a device fd failed with EINVAL, even though
+the vnode layer (vfs_kqfilter) supports it and devfs vnodes post
+NOTE_REVOKE from vop_reclaim_post when they are revoked or their cdev
+is destroyed.  This behaviour is inherited from FreeBSD.
+
+On NextBSD, follow Darwin: EVFILT_VNODE describes the file, so send it
+to VOP_KQFILTER(fp->f_vnode), as vn_kqfilter does for regular files.
+All other filters still go to the driver.  The registration still runs
+under devfs_fp_check(), so a device that is already gone returns ENXIO
+as before.  The knote holds the vnode via vhold() and is released by
+filt_vfsdetach(); it takes no cdev reference, so the dev_relthread()
+pairing is unchanged.
+
+This lets Apple's launchd arm EVFILT_VNODE/NOTE_REVOKE on its
+/dev/console fd unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/fs/devfs/devfs_vnops.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/sys/fs/devfs/devfs_vnops.c b/sys/fs/devfs/devfs_vnops.c
+index 8c188e7..0f7ec96 100644
+--- a/sys/fs/devfs/devfs_vnops.c
++++ b/sys/fs/devfs/devfs_vnops.c
+@@ -1014,7 +1014,20 @@ devfs_kqfilter_f(struct file *fp, struct knote *kn)
+ 	error = devfs_fp_check(fp, &dev, &dsw, &ref);
+ 	if (error)
+ 		return (error);
+-	error = dsw->d_kqfilter(dev, kn);
++	/*
++	 * NextBSD: EVFILT_VNODE describes the file, not the device, so
++	 * route it to the vnode layer as for regular files (vn_kqfilter)
++	 * rather than to the driver, which only knows READ/WRITE-style
++	 * filters.  This matches Darwin, where device files support
++	 * EVFILT_VNODE (e.g. NOTE_REVOKE on a revoked or destroyed tty).
++	 * The knote holds the vnode (vhold) and is detached through
++	 * filt_vfsdetach; it takes no cdev reference, so the thread
++	 * reference from devfs_fp_check is dropped as usual below.
++	 */
++	if (kn->kn_filter == EVFILT_VNODE)
++		error = VOP_KQFILTER(fp->f_vnode, kn);
++	else
++		error = dsw->d_kqfilter(dev, kn);
+ 	td->td_fpop = fpop;
+ 	dev_relthread(dev, ref);
+ 	return (error);
+-- 
+2.54.0 (Apple Git-157)
+
