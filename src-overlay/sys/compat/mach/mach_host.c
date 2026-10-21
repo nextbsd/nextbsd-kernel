@@ -10,6 +10,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/systm.h>
 #include <sys/signal.h>
 #include <sys/proc.h>
+#include <sys/eventhandler.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
 #include <sys/smp.h>		/* mp_ncpus */
 #include <sys/counter.h>
 #include <sys/vmmeter.h>	/* vm_cnt, vm_free_count(), vm_wire_count() */
@@ -23,6 +26,11 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/mach/host_special_ports.h>
 #include <sys/mach/host.h>
+#include <sys/mach/host_notify.h>
+#include <sys/mach/ipc/ipc_port.h>
+#include <sys/mach/ipc/ipc_space.h>
+#include <sys/mach/ipc/ipc_kmsg.h>
+#include <sys/mach/ipc/ipc_mqueue.h>
 #include <sys/mach/mach_host_server.h>
 
 host_data_t	realhost;
@@ -191,13 +199,123 @@ host_register_well_known_mach_voucher_attr_manager(
 )
 UNSUPPORTED;
 
+/*
+ * host_request_notification (nextbsd-userland#93, group 4).
+ *
+ * HOST_NOTIFY_CALENDAR_CHANGE only, as in XNU.  The caller's send-once
+ * right is kept in realhost.calendar_notify, replacing (and releasing)
+ * any earlier registration; one slot, not XNU's per-port list.  When
+ * settime() steps the wall clock (settimeofday(2), clock_settime(2)) the
+ * time_set eventhandler (patches/0061) posts host_calendar_changed,
+ * msgid HOST_CALENDAR_CHANGED_REPLYID (950), to that right and clears
+ * the slot; libdispatch re-registers on receipt.  The post uses
+ * MACH_SEND_ALWAYS on a send-once right, so it never blocks, and a dead
+ * port just drops the message.
+ */
+static struct mtx host_calendar_mtx;
+MTX_SYSINIT(host_calendar, &host_calendar_mtx, "mach host calendar notify",
+    MTX_DEF);
+
+typedef struct {
+	mach_msg_header_t		hdr;
+	mach_msg_format_0_trailer_t	trailer;
+} host_calendar_changed_msg_t;
+
 int
 host_request_notification(
 	host_t host,
 	host_flavor_t notify_type,
 	mach_port_t notify_port
 )
-UNSUPPORTED;
+{
+	ipc_port_t port = (ipc_port_t)notify_port;
+	ipc_port_t old;
+	boolean_t kernel_port;
+
+	if (host == HOST_NULL)
+		return (KERN_INVALID_ARGUMENT);
+	if (notify_type != HOST_NOTIFY_CALENDAR_CHANGE)
+		return (KERN_INVALID_ARGUMENT);
+	if (!IP_VALID(port))
+		return (KERN_INVALID_CAPABILITY);
+	/* A kernel-owned port would be dispatched to a kobject server. */
+	ip_lock(port);
+	kernel_port = (port->ip_receiver == ipc_space_kernel);
+	ip_unlock(port);
+	if (kernel_port)
+		return (KERN_INVALID_CAPABILITY);
+
+	/* Success consumes the send-once right (ipc_kobject_server). */
+	mtx_lock(&host_calendar_mtx);
+	old = realhost.calendar_notify;
+	realhost.calendar_notify = port;
+	mtx_unlock(&host_calendar_mtx);
+
+	if (IP_VALID(old))
+		ipc_port_release_sonce(old);
+	return (KERN_SUCCESS);
+}
+
+static void
+host_notify_calendar_change(void *arg __unused)
+{
+	ipc_port_t port;
+	ipc_kmsg_t kmsg;
+	host_calendar_changed_msg_t *m;
+	boolean_t kernel_port;
+
+	mtx_lock(&host_calendar_mtx);
+	port = realhost.calendar_notify;
+	realhost.calendar_notify = IP_NULL;
+	mtx_unlock(&host_calendar_mtx);
+
+	if (!IP_VALID(port))
+		return;
+
+	ip_lock(port);
+	kernel_port = (port->ip_receiver == ipc_space_kernel);
+	ip_unlock(port);
+	if (kernel_port) {
+		ipc_port_release_sonce(port);
+		return;
+	}
+
+	kmsg = ikm_alloc(sizeof *m);
+	if (kmsg == IKM_NULL) {
+		ipc_port_release_sonce(port);
+		return;
+	}
+	ikm_init(kmsg, sizeof *m);
+	m = (host_calendar_changed_msg_t *)kmsg->ikm_header;
+
+	m->hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_PORT_SEND_ONCE, 0);
+	m->hdr.msgh_local_port = MACH_PORT_NULL;
+	m->hdr.msgh_remote_port = (mach_port_t)port;	/* consumed by send */
+	m->hdr.msgh_voucher_port = 0;
+	m->hdr.msgh_id = HOST_CALENDAR_CHANGED_REPLYID;
+	m->hdr.msgh_size = (mach_msg_size_t)
+	    (sizeof(*m) - sizeof(mach_msg_format_0_trailer_t));
+
+	/* A sane minimum trailer, as iokit_kextd.c / ipc_notify.c do. */
+	m->trailer.msgh_seqno = 0;
+	m->trailer.msgh_sender = KERNEL_SECURITY_TOKEN;
+	m->trailer.msgh_trailer_type = MACH_MSG_TRAILER_FORMAT_0;
+	m->trailer.msgh_trailer_size = MACH_MSG_TRAILER_MINIMUM_SIZE;
+
+	ipc_mqueue_send_always(kmsg);
+}
+
+static eventhandler_tag host_calendar_tag;
+
+static void
+host_calendar_sysinit(void *arg __unused)
+{
+
+	host_calendar_tag = EVENTHANDLER_REGISTER(time_set,
+	    host_notify_calendar_change, NULL, EVENTHANDLER_PRI_ANY);
+}
+/* After SI_SUB_EVENTHANDLER; same slot as mach_busystate.c. */
+SYSINIT(host_calendar, SI_SUB_KLD, SI_ORDER_ANY, host_calendar_sysinit, NULL);
 
 int
 host_statistics(

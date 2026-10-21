@@ -98,6 +98,13 @@ struct	host {
 	struct ipc_port *host_self;
 	struct ipc_port *host_priv_self;
 	struct ipc_port *host_security_self;
+	/*
+	 * Send-once right registered by host_request_notification(
+	 * HOST_NOTIFY_CALENDAR_CHANGE); consumed by the next calendar
+	 * change.  Protected by its own mutex in compat/mach/mach_host.c,
+	 * not by host_lock (nextbsd-userland#93).
+	 */
+	struct ipc_port *calendar_notify;
 };
 
 #define host_lock(host)		mtx_lock(&(host)->lock)
