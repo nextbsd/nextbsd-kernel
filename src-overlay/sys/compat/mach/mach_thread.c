@@ -43,6 +43,8 @@ __FBSDID("$FreeBSD$");
 #include <sys/sched.h>
 #include <sys/sleepqueue.h>
 #include <sys/signal.h>
+#include <sys/syslog.h>
+#include <sys/sysent.h>
 
 #include <sys/mach/mach_types.h>
 #include <sys/mach/mach_traps.h>
@@ -242,6 +244,83 @@ mach_thread_init(void *arg __unused, struct thread *td)
 }
 
 /*
+ * True when td_machdata may hold a Mach thread: td's process is native ABI,
+ * or a kernel process (whose threads may send Mach messages from the kernel,
+ * e.g. iokit_kextd_send() from a taskqueue, and which the Linuxulator never
+ * touches). Otherwise the slot is the Linuxulator's.
+ */
+static __inline boolean_t
+mach_td_native(struct thread *td)
+{
+	struct proc *p;
+
+	p = td->td_proc;
+	return (SV_PROC_ABI(p) == SV_ABI_FREEBSD ||
+	    (p->p_flag & P_SYSTEM) != 0);
+}
+
+/*
+ * mach_td_thread — td's Mach thread, or THREAD_NULL if it has none.
+ *
+ * td_machdata is #defined to td_emuldata (compat_shim.h), and for every
+ * thread of a Linux-ABI process the Linuxulator keeps its 32-byte struct
+ * linux_emuldata there (linux_proc_init(), on fork, clone and exec). Read as
+ * a struct thread_shuttle, every ith_* field past the first few is out of
+ * bounds of that allocation. So nothing may read a thread's td_machdata
+ * without checking the ABI first; this does both. It is the thread analog
+ * of mach_proc_task() (nextbsd-kernel#153, #269).
+ *
+ * td's process must be live: the caller is td itself, or holds td's process
+ * still (the exec hook). The thread_dtor handler below cannot use this.
+ */
+thread_t
+mach_td_thread(struct thread *td)
+{
+
+	if (td->td_machdata == NULL || !mach_td_native(td))
+		return (THREAD_NULL);
+	return ((thread_t)td->td_machdata);
+}
+
+/*
+ * Free a thread's Mach state and clear its slot. thread must be td's.
+ *
+ * ipc_thr_act_terminate() takes the shuttle off its thread kport first, so
+ * any send right to the port still held elsewhere is a dead name from then
+ * on, and releases the shuttle's own send rights. Idempotent in the sense
+ * that a shuttle already terminated (ith_self == IP_NULL) is only freed.
+ */
+static void
+mach_thread_teardown(struct thread *td, thread_t thread)
+{
+
+	td->td_machdata = NULL;
+	ipc_thr_act_terminate(thread);
+	mtx_destroy(&thread->ith_lock_data);
+	uma_zfree(thread_shuttle_zone, thread);
+}
+
+/*
+ * mach_thread_exit — tear down td's Mach thread state, if it has any.
+ *
+ * For the exec hook (ipc_entry.c): on a native -> Linux exec every thread's
+ * Mach state goes before linux_on_exec() takes the slot (nextbsd-kernel#269).
+ * It loops because, for td == curthread, the port teardown could reach
+ * ipc_kmsg_destroy(), which would give the still-native thread a fresh
+ * shuttle on demand; that one must not be left for the Linuxulator either.
+ */
+void
+mach_thread_exit(struct thread *td)
+{
+	thread_t thread;
+
+	while ((thread = mach_td_thread(td)) != THREAD_NULL)
+		mach_thread_teardown(td, thread);
+}
+
+static int mach_thread_stale_logged;
+
+/*
  * mach_thread_init_lazy — give a thread Mach state on demand.
  *
  * Called by the wired thread-self / host-self syscall wrappers when
@@ -254,14 +333,39 @@ mach_thread_init(void *arg __unused, struct thread *td)
  * td_machdata is in the same shape as if both eventhandlers had fired.
  * Idempotent; concurrent callers race on atomic_cmpset_ptr with the
  * loser leaking a bounded amount.
+ *
+ * A thread of a Linux-ABI process is refused with ENOMEM, and nothing is
+ * allocated into its slot: that is the Linuxulator's (see mach_td_thread).
+ *
+ * A shuttle left in the slot that is not td's (ith_td != td) or whose
+ * thread kport is gone (ith_self == IP_NULL) is stale: the struct thread
+ * was recycled with Mach state still attached. mach_thread_dtor() should
+ * make that impossible, so it is logged once. The stale shuttle is
+ * detached and leaked (something may still point at it), after its thread
+ * kport is terminated if the shuttle is td's own, and td gets a fresh one.
  */
 int
 mach_thread_init_lazy(struct thread *td)
 {
 	thread_t thread;
 
-	if (td->td_machdata != NULL)
-		return (0);
+	if (!mach_td_native(td))
+		return (ENOMEM);
+
+	thread = mach_td_thread(td);
+	if (thread != THREAD_NULL) {
+		if (thread->ith_td == td && thread->ith_self != IP_NULL)
+			return (0);
+		if (!mach_thread_stale_logged) {
+			mach_thread_stale_logged = 1;
+			log(LOG_WARNING, "mach: tid %d: stale Mach thread %p "
+			    "in a recycled thread; replacing it\n",
+			    td->td_tid, thread);
+		}
+		if (thread->ith_td == td)
+			ipc_thr_act_terminate(thread);
+		td->td_machdata = NULL;
+	}
 
 	thread = uma_zalloc(thread_shuttle_zone, M_NOWAIT | M_ZERO);
 	if (thread == NULL)
@@ -290,19 +394,53 @@ mach_thread_fini(void *arg __unused, struct thread *td)
 	 * thread in the kernel, including threads that existed before
 	 * mach.ko loaded (so mach_thread_init never ran on them) and
 	 * threads of processes that never picked up Mach state.
-	 * td_machdata (aliased to td_emuldata via compat_shim.h) is
-	 * NULL for those. Without this guard the very next thread to
+	 * mach_td_thread() is THREAD_NULL for those, and for Linux-ABI
+	 * threads, whose slot (td_emuldata, compat_shim.h) holds a
+	 * linux_emuldata. Without this guard the very next thread to
 	 * exit page-faults inside this handler, panicking the kernel.
 	 */
-	thread = td->td_machdata;
-	if (thread == NULL)
+	thread = mach_td_thread(td);
+	if (thread == THREAD_NULL)
 		return;
 
 	MPASS(thread->ith_kmsg == NULL);
 	MPASS(thread->ith_td == td);
-	ipc_thr_act_terminate(thread);
-	mtx_destroy(&thread->ith_lock_data);
-	uma_zfree(thread_shuttle_zone, thread);
+	mach_thread_teardown(td, thread);
+}
+
+/*
+ * thread_dtor handler: free a dead thread's Mach state (nextbsd-kernel#269).
+ *
+ * Hook point. thread_dtor runs once per dead thread, after it is off the
+ * CPU and before its struct thread goes back to the type-stable UMA zone:
+ * from thread_free() and the zombie reaper (thread_reap_domain()) for every
+ * thread but a process's last, and from proc_dtor() for the last one, which
+ * stays with the proc struct. So no IPC can still be running on the thread,
+ * and every recycled struct thread starts with no Mach state. It never runs
+ * on the dying thread itself. thread_fini (UMA release) would be too late:
+ * type-stable items are rarely released, and a reused struct would carry
+ * the old shuttle and thread port. process_exit covers only the last
+ * thread. The PhaseB-bisect registrations below stay disabled.
+ *
+ * Why the slot is read directly, not through mach_td_thread(): for a
+ * zombie, td_proc may already have been reaped and reused, by a Linux
+ * process even (thread_stash() drops p_exitthreads before the zombie is
+ * freed), so its ABI says nothing about td. The slot needs no ABI check
+ * here anyway: the Linuxulator frees and NULLs its td_emuldata on every
+ * thread exit (linux_thread_dtor() as sv_ontdexit, from kern_thr_exit()
+ * and exit1()), so a dead thread's non-NULL slot can only be ours.
+ *
+ * Threads that never had Mach state, the common case, return at once.
+ */
+static void
+mach_thread_dtor(void *arg __unused, struct thread *td)
+{
+	thread_t thread;
+
+	thread = td->td_machdata;
+	if (thread == NULL)
+		return;
+	mach_thread_teardown(td, thread);
 }
 
 static void
@@ -311,8 +449,8 @@ mach_thread_ctor(void *arg __unused, struct thread *td)
 	thread_t thread;
 
 	/* Same NULL-guard rationale as mach_thread_fini above. */
-	thread = td->td_machdata;
-	if (thread == NULL)
+	thread = mach_td_thread(td);
+	if (thread == THREAD_NULL)
 		return;
 
 	MPASS(thread->ith_td == td);
@@ -337,6 +475,8 @@ thread_sysinit(void *arg __unused)
 	#if 0 /*PhaseB-bisect*/
 	EVENTHANDLER_REGISTER(thread_fini, mach_thread_fini, NULL, EVENTHANDLER_PRI_ANY);
 #endif
+	/* See mach_thread_dtor for why thread_dtor (nextbsd-kernel#269). */
+	EVENTHANDLER_REGISTER(thread_dtor, mach_thread_dtor, NULL, EVENTHANDLER_PRI_ANY);
 }
 
 /* before SI_SUB_INTRINSIC and after SI_SUB_EVENTHANDLER */

@@ -938,6 +938,16 @@ ipc_entry_exit_hook(void *arg __unused, struct proc *p)
  * is torn down and detached now, before linux_on_exec() installs its pem in
  * the same slot.
  *
+ * The same goes for the threads (nextbsd-kernel#269): linux_on_exec() also
+ * overwrites td_emuldata, the Mach thread slot, of every thread in the
+ * process, so each thread's Mach state is torn down and the slot cleared
+ * first. That is done whether or not the process has a task, since a thread
+ * can pick up Mach state without one (ipc_kmsg_destroy). The other threads
+ * are parked at the user boundary (pre_execve()'s SINGLE_BOUNDARY), so none
+ * is inside Mach IPC, and the list cannot change; linux_on_exec() walks it
+ * the same way. mach_thread_exit() skips any thread with no Mach state, and
+ * does nothing on a Linux -> Linux exec, where every slot is the Linuxulator's.
+ *
  * A set-id exec is the exception (nextbsd-kernel#267): the task and the
  * exec'ing thread get new control ports and lose their exception ports and
  * debug-control port, as XNU's ipc_task_reset / ipc_thread_reset do, so
@@ -951,29 +961,29 @@ static void
 ipc_entry_exec_hook(void *arg __unused, struct proc *p,
     struct image_params *imgp)
 {
+	struct thread *td;
 	task_t task;
 	thread_t thread;
+	bool to_linux;
+
+	to_linux = (imgp->sysent->sv_flags & SV_ABI_MASK) != SV_ABI_FREEBSD;
 
 	task = mach_proc_task(p);
-	if (task == TASK_NULL)
-		return;
-
-	ipc_entry_list_close(p);
-
-	if (imgp->credential_setid) {
-		ipc_task_reset(task);
-		/*
-		 * p is single-threaded and native-ABI here (mach_proc_task()
-		 * above), so td_emuldata cannot be a Linux struct. Switch to
-		 * the thread-side ABI-checked accessor (#269) once it lands.
-		 */
-		thread = curthread->td_machdata;
-		if (thread != THREAD_NULL)
-			ipc_thread_reset(thread);
+	if (task != TASK_NULL) {
+		ipc_entry_list_close(p);
+		if (imgp->credential_setid) {
+			ipc_task_reset(task);
+			thread = mach_td_thread(curthread);
+			if (thread != THREAD_NULL)
+				ipc_thread_reset(thread);
+		}
+		if (to_linux)
+			mach_task_orphan(p);
 	}
 
-	if ((imgp->sysent->sv_flags & SV_ABI_MASK) != SV_ABI_FREEBSD)
-		mach_task_orphan(p);
+	if (to_linux)
+		FOREACH_THREAD_IN_PROC(p, td)
+			mach_thread_exit(td);
 }
 
 static void

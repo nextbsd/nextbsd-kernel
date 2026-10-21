@@ -106,6 +106,8 @@ int sys_mach_wait_quiet(struct thread *, struct mach_wait_quiet_args *);
  */
 int mach_task_init_lazy(struct proc *p);
 int mach_thread_init_lazy(struct thread *td);
+/* td's Mach thread, ABI-checked (mach_thread.c, nextbsd-kernel#269). */
+thread_t mach_td_thread(struct thread *td);
 
 /*
  * NULL-guard wrappers. The "no Mach state" path returns MACH_PORT_NULL
@@ -143,9 +145,10 @@ sys_thread_self_trap_guarded(struct thread *td, struct thread_self_trap_args *ua
 {
 	if (td->td_proc->p_machdata == NULL)
 		mach_task_init_lazy(td->td_proc);
-	if (td->td_machdata == NULL)
+	if (mach_td_thread(td) == NULL)
 		mach_thread_init_lazy(td);
-	if (td->td_proc->p_machdata == NULL || td->td_machdata == NULL) {
+	if (td->td_proc->p_machdata == NULL ||
+	    mach_td_thread(td) == NULL) {
 		td->td_retval[0] = 0;	/* MACH_PORT_NULL */
 		return (0);
 	}
@@ -157,9 +160,10 @@ sys_host_self_trap_guarded(struct thread *td, struct host_self_trap_args *uap)
 {
 	if (td->td_proc->p_machdata == NULL)
 		mach_task_init_lazy(td->td_proc);
-	if (td->td_machdata == NULL)
+	if (mach_td_thread(td) == NULL)
 		mach_thread_init_lazy(td);
-	if (td->td_proc->p_machdata == NULL || td->td_machdata == NULL) {
+	if (td->td_proc->p_machdata == NULL ||
+	    mach_td_thread(td) == NULL) {
 		td->td_retval[0] = 0;	/* MACH_PORT_NULL */
 		return (0);
 	}
@@ -178,9 +182,10 @@ sys_mach_msg_trap_guarded(struct thread *td, struct mach_msg_trap_args *uap)
 {
 	if (td->td_proc->p_machdata == NULL)
 		mach_task_init_lazy(td->td_proc);
-	if (td->td_machdata == NULL)
+	if (mach_td_thread(td) == NULL)
 		mach_thread_init_lazy(td);
-	if (td->td_proc->p_machdata == NULL || td->td_machdata == NULL) {
+	if (td->td_proc->p_machdata == NULL ||
+	    mach_td_thread(td) == NULL) {
 		/* Mach state unavailable — return a generic error to userland.
 		 * MACH_SEND_NO_BUFFER is the closest "we couldn't even try"
 		 * code in the standard return set. */

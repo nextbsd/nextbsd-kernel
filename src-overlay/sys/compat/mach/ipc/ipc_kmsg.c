@@ -569,14 +569,17 @@ ipc_kmsg_destroy(ipc_kmsg_t	kmsg)
 	 *	DispatchWorker (libdispatch pthread-workqueue) threads reach here
 	 *	on exit — when the kernel walks their space to close Mach ports
 	 *	(ipc_entry_teardown -> ipc_port_destroy) — without ever having gone
-	 *	through mach.ko's thread-init path.  Their td_machdata is NULL, so
-	 *	the current_thread()->ith_messages deref in ipc_kmsg_delayed_destroy
-	 *	page-faults (#148; mirrors the #252 filt_machport fix).  Give the
-	 *	thread Mach state on demand.  If that allocation ever fails, destroy
-	 *	the message directly rather than via the per-thread delayed queue, so
-	 *	teardown can never fault.
+	 *	through mach.ko's thread-init path.  They have no Mach thread
+	 *	(mach_td_thread() is THREAD_NULL), so the current_thread()->
+	 *	ith_messages deref in ipc_kmsg_delayed_destroy page-faults (#148;
+	 *	mirrors the #252 filt_machport fix).  Give the thread Mach state on
+	 *	demand.  If that ever fails, destroy the message directly rather than
+	 *	via the per-thread delayed queue, so teardown can never fault.  That
+	 *	includes a thread of a Linux-ABI process, which runs this from generic
+	 *	fd and kqueue teardown: mach_thread_init_lazy() refuses it, because
+	 *	its slot holds the Linuxulator's emuldata (#269).
 	 */
-	if (curthread->td_machdata == NULL &&
+	if (mach_td_thread(curthread) == THREAD_NULL &&
 	    mach_thread_init_lazy(curthread) != 0) {
 		ipc_kmsg_clean(kmsg);
 		ipc_kmsg_free(kmsg);

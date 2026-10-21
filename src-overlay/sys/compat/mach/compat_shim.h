@@ -34,10 +34,17 @@
  *
  * Aliasing instead of adding new fields keeps mach.ko a true out-of-
  * tree module: no kernel patches, no KBI bumps, no rebuild of the
- * kernel proper to install us. The cost is that mach.ko and the linux
- * compat module cannot both attach their state to the same proc — a
- * tradeoff we accept since neither runs Mach processes and Linux
- * processes in the same container.
+ * kernel proper to install us.
+ *
+ * The cost is that both slots are shared with the Linuxulator, and
+ * nothing keeps the two apart for us. For a Linux-ABI process
+ * p_emuldata holds a struct linux_pemuldata and every thread's
+ * td_emuldata a struct linux_emuldata, and a native -> Linux exec
+ * overwrites both. So every Mach access goes through the ABI-checked
+ * accessors, mach_proc_task() (kern/task.c) and mach_td_thread()
+ * (mach_thread.c; current_thread() uses it), and never through these
+ * fields directly. Only the lazy-init, fork, exec and teardown paths
+ * that own the Mach state may touch them (nextbsd-kernel#153, #269).
  */
 #define	p_machdata	p_emuldata
 #define	td_machdata	td_emuldata
