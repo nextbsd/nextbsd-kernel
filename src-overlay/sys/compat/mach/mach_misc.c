@@ -192,12 +192,6 @@ sys_mk_timer_cancel(struct thread *td, struct mk_timer_cancel_args *uap)
 }
 
 int
-sys_task_name_for_pid(struct thread *td, struct task_name_for_pid_args *uap)
-{
-	return (ENOSYS);
-}
-
-int
 sys_macx_backing_store_suspend(struct thread *td, struct macx_backing_store_suspend_args *uap)
 {
 	return (ENOSYS);

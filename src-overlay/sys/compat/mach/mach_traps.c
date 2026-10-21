@@ -56,6 +56,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/sem.h>
 #include <sys/msg.h>
 #include <sys/ptrace.h>
+#include <sys/ucred.h>
 #include <sys/signalvar.h>
 #include <machine/atomic.h>
 
@@ -208,6 +209,82 @@ sys_task_for_pid(struct thread *td, struct task_for_pid_args *uap)
 		tret = MACH_PORT_NAME_NULL;
 out:
 	if (copyout(&tret, uap->t, sizeof(tret)) != 0 && kr == KERN_SUCCESS) {
+		mach_port_deallocate(self->itk_space, tret);
+		kr = KERN_INVALID_ADDRESS;
+	}
+	td->td_retval[0] = kr;
+	return (0);
+}
+
+/*
+ * task_name_for_pid (nextbsd-kernel#308): put a send right to pid's task
+ * name port (itk_nself, IKOT_TASK_NAME) in the caller's IPC space, as
+ * xnu-2422's task_name_for_pid() in bsd/vm/vm_unix.c.
+ *
+ * A name port only identifies its task. It converts to a task_name_t
+ * (task_info) and never to a task_t, so the check is weaker than
+ * task_for_pid's: there is no p_candebug(). pget() runs p_cansee() on the
+ * locked proc, which keeps jails, see_other_uids/gids and MAC in force,
+ * and then xnu-2422's rule applies on top: the target is the caller
+ * itself, or the caller's effective uid is 0 (kauth_cred_issuser), or the
+ * two share both effective and real uid.
+ *
+ * The name port survives a set-id exec (ipc_task_reset keeps it, as
+ * xnu-2422 does), so a right taken before the exec still names the task.
+ *
+ * Errors follow task_for_pid: KERN_FAILURE for pid 0, a target_tport that
+ * is not the caller's own task, no such process, a denied caller, or a
+ * target with no live Mach task. *tn is always written, MACH_PORT_NULL on
+ * failure.
+ */
+int
+sys_task_name_for_pid(struct thread *td, struct task_name_for_pid_args *uap)
+{
+	task_t self = current_task();
+	ipc_port_t port = IP_NULL, sright = IP_NULL;
+	mach_port_name_t tret = MACH_PORT_NAME_NULL;
+	kern_return_t kr = KERN_FAILURE;
+	struct ucred *cred, *tcred;
+	struct proc *p;
+	task_t task;
+
+	/* pid 0 is the kernel. */
+	if (uap->pid == 0)
+		goto out;
+
+	/* target_tport must be a send right to the caller's own task. */
+	if (ipc_port_translate_send(self->itk_space, uap->target_tport,
+	    &port) != KERN_SUCCESS)
+		goto out;
+	task = (ip_active(port) && ip_kotype(port) == IKOT_TASK) ?
+	    (task_t)port->ip_kobject : TASK_NULL;
+	ip_unlock(port);
+	if (task != self)
+		goto out;
+
+	if (pget(uap->pid, PGET_CANSEE | PGET_NOTWEXIT | PGET_NOTID, &p) != 0)
+		goto out;
+	cred = td->td_ucred;
+	tcred = p->p_ucred;
+	if ((p == td->td_proc || cred->cr_uid == 0 ||
+	    (tcred->cr_uid == cred->cr_uid &&
+	    tcred->cr_ruid == cred->cr_ruid)) &&
+	    (task = mach_proc_task(p)) != TASK_NULL) {
+		task_reference(task);
+		sright = convert_task_name_to_port(task); /* consumes the ref */
+	}
+	PROC_UNLOCK(p);
+	if (!IP_VALID(sright))
+		goto out;
+
+	/* Consumes sright, also on failure. */
+	tret = ipc_port_copyout_send(sright, self->itk_space);
+	if (MACH_PORT_NAME_VALID(tret))
+		kr = KERN_SUCCESS;
+	else
+		tret = MACH_PORT_NAME_NULL;
+out:
+	if (copyout(&tret, uap->tn, sizeof(tret)) != 0 && kr == KERN_SUCCESS) {
 		mach_port_deallocate(self->itk_space, tret);
 		kr = KERN_INVALID_ADDRESS;
 	}
