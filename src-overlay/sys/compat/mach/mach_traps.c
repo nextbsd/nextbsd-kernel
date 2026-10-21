@@ -79,6 +79,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/mach/thread_switch.h>
 
 #include <sys/mach/mach_init.h>
+#include <sys/mach/ipc_kobject.h>	/* IKOT_TASK */
 
 #include <sys/mach/mach_vm.h>
 #include <sys/mach/mach.h>
@@ -142,9 +143,76 @@ int
 sys_semaphore_signal_all_trap(struct thread *td, struct semaphore_signal_all_trap_args *uap)
 	UNSUPPORTED;
 
+/*
+ * task_for_pid (nextbsd-kernel#298): put a send right to pid's task port in
+ * the caller's IPC space, as XNU's task_for_pid() in bsd/kern/kern_proc.c.
+ *
+ * Privilege is the ptrace(2) rule, with no taskgated: pget() runs
+ * p_cansee() and p_candebug() on the locked proc, as kern_ptrace() does for
+ * PT_ATTACH, and system processes are refused as there. So root passes
+ * unless a jail, securelevel (for init) or the MAC policy says otherwise;
+ * anyone else needs security.bsd.unprivileged_proc_debug, a target whose
+ * credentials are a subset of its own, and a target that is not set-id.
+ *
+ * The send right is made before the proc is unlocked. p_candebug() refuses
+ * a target in exec, so a set-id exec can only start afterwards, and that
+ * exec resets the task port (ipc_task_reset, #267): this right then names
+ * a dead kobject, not the new image.
+ *
+ * Errors are XNU's: KERN_FAILURE for pid 0, a target_tport that is not the
+ * caller's own task, no such process, a denied caller, or a target with no
+ * live Mach task. *t is always written, MACH_PORT_NULL on failure.
+ */
 int
 sys_task_for_pid(struct thread *td, struct task_for_pid_args *uap)
-	UNSUPPORTED;
+{
+	task_t self = current_task();
+	ipc_port_t port = IP_NULL, sright = IP_NULL;
+	mach_port_name_t tret = MACH_PORT_NAME_NULL;
+	kern_return_t kr = KERN_FAILURE;
+	struct proc *p;
+	task_t task;
+
+	/* pid 0 is the kernel; XNU refuses it whoever asks. */
+	if (uap->pid == 0)
+		goto out;
+
+	/* target_tport must be a send right to the caller's own task. */
+	if (ipc_port_translate_send(self->itk_space, uap->target_tport,
+	    &port) != KERN_SUCCESS)
+		goto out;
+	task = (ip_active(port) && ip_kotype(port) == IKOT_TASK) ?
+	    (task_t)port->ip_kobject : TASK_NULL;
+	ip_unlock(port);
+	if (task != self)
+		goto out;
+
+	if (pget(uap->pid, PGET_CANSEE | PGET_CANDEBUG | PGET_NOTWEXIT |
+	    PGET_NOTID, &p) != 0)
+		goto out;
+	if ((p->p_flag & P_SYSTEM) == 0 &&
+	    (task = mach_proc_task(p)) != TASK_NULL) {
+		task_reference(task);
+		sright = convert_task_to_port(task);	/* consumes the ref */
+	}
+	PROC_UNLOCK(p);
+	if (!IP_VALID(sright))
+		goto out;
+
+	/* Consumes sright, also on failure. */
+	tret = ipc_port_copyout_send(sright, self->itk_space);
+	if (MACH_PORT_NAME_VALID(tret))
+		kr = KERN_SUCCESS;
+	else
+		tret = MACH_PORT_NAME_NULL;
+out:
+	if (copyout(&tret, uap->t, sizeof(tret)) != 0 && kr == KERN_SUCCESS) {
+		mach_port_deallocate(self->itk_space, tret);
+		kr = KERN_INVALID_ADDRESS;
+	}
+	td->td_retval[0] = kr;
+	return (0);
+}
 
 int
 sys_thread_switch(struct thread *td __unused, struct thread_switch_args *uap)
