@@ -67,9 +67,11 @@ FreeBSD's `lkmnosys` band from 10 slots to 58 because "lkmnosys slots
 (210-219) are exhausted by the Mach trap set"
 (`patches/0001-NextBSD-widen-lkmnosys-dynamic-syscall-band-to-58-sl.patch:26`).
 The seven subsystems carry roughly 156 routines. One slot each never fits.
-`mach_syscall_wire_register()` already wires 14 traps
-(`compat/mach/mach_syscall_wire.c:657-699`). Some of them have no Apple
-counterpart; converting those is nextbsd-userland#84.
+`mach_syscall_wire_register()` already wires 11 traps
+(`compat/mach/mach_syscall_wire.c:545-582`). The three that had no Apple
+counterpart (`task_get_special_port`, `task_set_special_port`,
+`host_set_special_port`) were converted to MIG and their traps deleted
+(nextbsd-userland#84); their slots stay `lkmnosys`.
 
 ### A generated server is not a working routine
 

@@ -175,34 +175,6 @@ struct host_self_trap_args {
 	syscallarg_t dummy;
 };
 /*
- * task_get_special_port / task_set_special_port traps. Not part of the
- * Apple-imported _kernelrpc_*_trap family (Apple delivers these via
- * MIG over the task port); added here as direct syscalls because
- * freebsd-launchd-mach doesn't ship MIG. The `which` selector matches
- * TASK_BOOTSTRAP_PORT etc. from <sys/mach/task_special_ports.h>.
- */
-struct task_get_special_port_trap_args {
-	char target_l_[PADL_(mach_port_name_t)]; mach_port_name_t target; char target_r_[PADR_(mach_port_name_t)];
-	char which_l_[PADL_(int)]; int which; char which_r_[PADR_(int)];
-	char port_l_[PADL_(mach_port_name_t *)]; mach_port_name_t * port; char port_r_[PADR_(mach_port_name_t *)];
-};
-struct task_set_special_port_trap_args {
-	char target_l_[PADL_(mach_port_name_t)]; mach_port_name_t target; char target_r_[PADR_(mach_port_name_t)];
-	char which_l_[PADL_(int)]; int which; char which_r_[PADR_(int)];
-	char port_l_[PADL_(mach_port_name_t)]; mach_port_name_t port; char port_r_[PADR_(mach_port_name_t)];
-};
-/*
- * host_set_special_port trap. Mirrors task_set_special_port: `host` is
- * the host port name (ignored — the kernel uses realhost), `which`
- * selects the slot per <sys/mach/host_special_ports.h>, `port` is the
- * send right to install (a userland mach_port_name_t).
- */
-struct host_set_special_port_trap_args {
-	char host_l_[PADL_(mach_port_name_t)]; mach_port_name_t host; char host_r_[PADR_(mach_port_name_t)];
-	char which_l_[PADL_(int)]; int which; char which_r_[PADR_(int)];
-	char port_l_[PADL_(mach_port_name_t)]; mach_port_name_t port; char port_r_[PADR_(mach_port_name_t)];
-};
-/*
  * mach_wait_quiet — block until the device tree quiesces (mach.bus.busy
  * reaches 0). `timeout` is a nanosecond budget; 0 means wait
  * indefinitely. Backs Apple's IOKitWaitQuiet / IOServiceWaitQuiet. See
