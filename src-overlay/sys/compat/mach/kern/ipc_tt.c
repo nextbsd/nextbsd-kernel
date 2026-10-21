@@ -135,7 +135,7 @@
 
 #define THR_ACT_NULL NULL
 
-
+static boolean_t ref_task_name_port_locked(ipc_port_t, task_t *);
 
 /*
  *	Routine:	ipc_task_init
@@ -155,6 +155,7 @@ ipc_task_create(
 	ipc_space_t space;
 	kern_return_t kr;
 	ipc_port_t kport;
+	ipc_port_t nport;
 
 	kr = ipc_space_create(&ipc_table_entries[0], &space);
 	if (kr != KERN_SUCCESS)
@@ -164,7 +165,18 @@ ipc_task_create(
 	if (kport == IP_NULL)
 		panic("ipc_task_init");
 
+	/*
+	 * The task name port (nextbsd-kernel#308), as in xnu-2422: the
+	 * kernel holds no right to it, task_get_special_port(TASK_NAME_PORT)
+	 * and task_name_for_pid() make send rights on demand, and it dies
+	 * with the task in ipc_task_terminate().
+	 */
+	nport = ipc_port_alloc_kernel();
+	if (nport == IP_NULL)
+		panic("ipc_task_init");
+
 	task->itk_self = kport;
+	task->itk_nself = nport;
 	task->itk_sself = ipc_port_make_send(kport);
 	task->itk_space = space;
 	space->is_task = task;
@@ -226,11 +238,15 @@ ipc_task_enable(
 	task_t		task)
 {
 	ipc_port_t kport;
+	ipc_port_t nport;
 
 	itk_lock(task);
 	kport = task->itk_self;
 	if (kport != IP_NULL)
 		ipc_kobject_set(kport, (ipc_kobject_t) task, IKOT_TASK);
+	nport = task->itk_nself;
+	if (nport != IP_NULL)
+		ipc_kobject_set(nport, (ipc_kobject_t) task, IKOT_TASK_NAME);
 	itk_unlock(task);
 }
 
@@ -247,11 +263,15 @@ ipc_task_disable(
 	task_t		task)
 {
 	ipc_port_t kport;
+	ipc_port_t nport;
 
 	itk_lock(task);
 	kport = task->itk_self;
 	if (kport != IP_NULL)
 		ipc_kobject_set(kport, IKO_NULL, IKOT_NONE);
+	nport = task->itk_nself;
+	if (nport != IP_NULL)
+		ipc_kobject_set(nport, IKO_NULL, IKOT_NONE);
 	itk_unlock(task);
 }
 
@@ -312,6 +332,7 @@ ipc_task_terminate(
 	task_t		task)
 {
 	ipc_port_t kport;
+	ipc_port_t nport;
 	int i;
 
 	itk_lock(task);
@@ -324,12 +345,17 @@ ipc_task_terminate(
 	}
 
 	/*
-	 * Detach the task from its port first, so a send right held anywhere
+	 * Detach the task from its ports first, so a send right held anywhere
 	 * else stops resolving to this task now rather than whenever the port
 	 * is finally freed (ipc_task_disable, inlined under the same lock).
+	 * The name port goes with the task port (nextbsd-kernel#308).
 	 */
 	ipc_kobject_set(kport, IKO_NULL, IKOT_NONE);
 	task->itk_self = IP_NULL;
+	nport = task->itk_nself;
+	if (nport != IP_NULL)
+		ipc_kobject_set(nport, IKO_NULL, IKOT_NONE);
+	task->itk_nself = IP_NULL;
 	itk_unlock(task);
 
 	/*
@@ -374,9 +400,15 @@ ipc_task_terminate(
 		}
 	}
 
-	/* destroy the kernel port */
+	/*
+	 * Destroy the kernel ports. Destroying the name port turns every
+	 * send right to it into a dead name and fires the dead-name
+	 * notifications registered on it, as in xnu-2422.
+	 */
 
 	ipc_port_dealloc_kernel(kport);
+	if (nport != IP_NULL)
+		ipc_port_dealloc_kernel(nport);
 }
 
 /*
@@ -393,7 +425,9 @@ ipc_task_terminate(
  *		tree has no privileged exception ports to keep.
  *		The bootstrap, host, registered, seatbelt and task-
  *		access ports are left alone: launchd relies on
- *		bootstrap surviving exec.
+ *		bootstrap surviving exec. So is the task name port,
+ *		as in xnu-2422: it represents no specific privilege
+ *		(nextbsd-kernel#308).
  *	Conditions:
  *		Nothing locked.
  */
@@ -1142,13 +1176,12 @@ convert_port_to_task(
  *	Conditions:
  *		Nothing locked.
  *
- *	XNU accepts an active IKOT_TASK or IKOT_TASK_NAME port. NextBSD has
- *	no task name ports yet (no IKOT_TASK_NAME kobject type, and
- *	task_name_for_pid() returns ENOSYS), so only a task port names a
- *	task here, and the lookup is convert_port_to_task()'s: the reference
- *	is taken under the port lock, and a dead or non-task port gives
- *	TASK_NULL (nextbsd-kernel#303). When name ports are added, accept
- *	IKOT_TASK_NAME in the same locked check.
+ *	As XNU's: an active IKOT_TASK or IKOT_TASK_NAME port names a task,
+ *	and the reference is taken under the port lock as in
+ *	convert_port_to_task(); a dead port or any other kind gives
+ *	TASK_NULL (nextbsd-kernel#303, #308). Only this conversion accepts a
+ *	name port: convert_port_to_task() and convert_port_to_space() still
+ *	take IKOT_TASK alone, so a name port never controls its task.
  *
  *	The MIG task_name_t destructor, task_name_deallocate(), drops the
  *	reference (task_info, 3405, is the only routine that uses it).
@@ -1157,8 +1190,17 @@ task_name_t
 convert_port_to_task_name(
 	ipc_port_t	port)
 {
+	boolean_t r;
+	task_t task = TASK_NULL;
 
-	return ((task_name_t)convert_port_to_task(port));
+	r = FALSE;
+	while (!r && IP_VALID(port)) {
+		ip_lock(port);
+		r = ref_task_name_port_locked(port, &task);
+		/* port unlocked */
+	}
+
+	return ((task_name_t)task);
 }
 
 /*
@@ -1174,14 +1216,20 @@ task_name_deallocate(
 	task_deallocate((task_t)task_name);
 }
 
-boolean_t
-ref_task_port_locked( ipc_port_t port, task_t *ptask )
+/*
+ * Take a reference on the task an active IKOT_TASK port names (or, when
+ * matchn, an IKOT_TASK_NAME port too; nextbsd-kernel#308). Called with
+ * the port locked; returns with it unlocked. FALSE means try again.
+ */
+static boolean_t
+ref_task_port_locked_kind(ipc_port_t port, task_t *ptask, boolean_t matchn)
 {
 	task_t task;
 
 	task = TASK_NULL;
 	if (ip_active(port) &&
-		(ip_kotype(port) == IKOT_TASK)) {
+		(ip_kotype(port) == IKOT_TASK ||
+		 (matchn && ip_kotype(port) == IKOT_TASK_NAME))) {
 		task = (task_t) port->ip_kobject;
 		assert(task != TASK_NULL);
 
@@ -1200,6 +1248,20 @@ ref_task_port_locked( ipc_port_t port, task_t *ptask )
 	*ptask = task;
 	ip_unlock(port);
 	return (TRUE);
+}
+
+boolean_t
+ref_task_port_locked( ipc_port_t port, task_t *ptask )
+{
+
+	return (ref_task_port_locked_kind(port, ptask, FALSE));
+}
+
+static boolean_t
+ref_task_name_port_locked(ipc_port_t port, task_t *ptask)
+{
+
+	return (ref_task_port_locked_kind(port, ptask, TRUE));
 }
 
 /*
@@ -1368,6 +1430,33 @@ convert_task_to_port(
 	itk_unlock(task);
 
 	task_deallocate(task);
+	return port;
+}
+
+/*
+ *	Routine:	convert_task_name_to_port
+ *	Purpose:
+ *		Convert from a task name ref to a port.
+ *		Consumes a task name ref; produces a naked send right
+ *		which may be invalid (nextbsd-kernel#308).
+ *	Conditions:
+ *		Nothing locked.
+ */
+
+ipc_port_t
+convert_task_name_to_port(
+	task_name_t	task_name)
+{
+	ipc_port_t port;
+
+	itk_lock(task_name);
+	if (task_name->itk_nself != IP_NULL)
+		port = ipc_port_make_send(task_name->itk_nself);
+	else
+		port = IP_NULL;
+	itk_unlock(task_name);
+
+	task_name_deallocate(task_name);
 	return port;
 }
 
