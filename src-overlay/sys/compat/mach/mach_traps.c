@@ -318,8 +318,7 @@ sys__kernelrpc_mach_port_insert_right_trap(struct thread *td, struct _kernelrpc_
 	disp = ipc_object_copyin_type(uap->polyPoly);
 	rv = mach_port_insert_right(task->itk_space, uap->name, port, disp);
 done:
-	if (task)
-		task_deallocate(task);
+	/* current_task() takes no reference, so none is dropped (#300). */
 	td->td_retval[0] = rv;
 	return (0);
 }
