@@ -1136,6 +1136,8 @@ task_set_port_space(
  *			notification is generated.
  *	Conditions:
  *		Nothing locked.
+ *		Consumes the notify send-once right only on success;
+ *		on failure the caller still owns it.
  *	Returns:
  *		KERN_SUCCESS		Requested a notification.
  *		KERN_INVALID_TASK	The space is null.
@@ -1148,6 +1150,7 @@ task_set_port_space(
  *		KERN_INVALID_VALUE	Sync isn't zero.
  *	MACH_NOTIFY_DEAD_NAME:
  *		KERN_RESOURCE_SHORTAGE	Couldn't allocate memory.
+ *		KERN_INVALID_ARGUMENT	Name is null or dead.
  *		KERN_INVALID_ARGUMENT	Name denotes dead name, but
  *			sync is zero or notify is IP_NULL.
  *		KERN_UREFS_OVERFLOW	Name denotes dead name, but
@@ -1209,25 +1212,30 @@ mach_port_request_notification(
 		break;
 	}
 
-	case MACH_NOTIFY_DEAD_NAME: {
-		ipc_port_t port = 0;
-		ipc_port_request_index_t indexp;
-
+	case MACH_NOTIFY_DEAD_NAME:
+		/*
+		 * A dead-name request names a send, send-once or receive
+		 * right (or a dead name, for an immediate notification), as
+		 * in xnu-2422 and CMU Mach. ipc_right_dnrequest() registers
+		 * the request against the entry (ie_request) and the port's
+		 * table, growing it as needed, and hands back the send-once
+		 * right registered before. This used to go through
+		 * ipc_port_translate_receive(), so a request on a send right
+		 * -- launchd's on its bootstrap port, libdispatch's on its
+		 * peers -- failed with KERN_INVALID_RIGHT
+		 * (nextbsd-userland#354).
+		 *
+		 * As in xnu-2422, sync is only a flag here: non-zero asks
+		 * for an immediate notification if the name is already dead.
+		 */
 		if (!MACH_PORT_NAME_VALID(name))
-			return KERN_INVALID_RIGHT;
+			return KERN_INVALID_ARGUMENT;
 
-		kr = ipc_port_translate_receive(space, name, &port);
+		kr = ipc_right_dnrequest(space, name, sync != 0, notify,
+		    previousp);
 		if (kr != KERN_SUCCESS)
 			return kr;
-		/* port is locked and active */
-
-		ipc_port_dnrequest(port, name, notify, &indexp);
-		ip_unlock(port);
-
-		/* XXX: what to do here? return index? */
-		*previousp = MACH_PORT_NULL;
 		break;
-	}
 
 	default:
 		return KERN_INVALID_VALUE;

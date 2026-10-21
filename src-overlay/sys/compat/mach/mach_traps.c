@@ -619,10 +619,17 @@ done:
  * PANIC-CRITICAL (launchd calls this at PID-1 init inside os_assumes_zero):
  *  - `previous` is written by the callee ONLY on KERN_SUCCESS; init it IP_NULL
  *    and only translate/copyout on success.
- *  - the callee returns `previous` as an ipc_port_t with a ref (pd/nsrequest);
- *    ipc_object_copyout(SEND_ONCE) consumes exactly that ref. Guard on
- *    IP_VALID — the common DEAD_NAME path returns IP_NULL, for which we copyout
- *    MACH_PORT_NULL and do NOT call copyout on the port.
+ *  - the callee returns `previous` as a send-once right (pd/ns/dnrequest);
+ *    ipc_object_copyout(SEND_ONCE) consumes it. Guard on IP_VALID: with no
+ *    earlier request it is IP_NULL, for which we copyout MACH_PORT_NULL and do
+ *    NOT call copyout on the port. If the copyout fails the right is destroyed
+ *    as a send-once right, as XNU's MIG reply path does.
+ *  - the callee consumes the notify send-once right only on success. On
+ *    failure it is destroyed here, as XNU's ipc_kobject_server destroys a
+ *    failed request's rights; it used to leak.
+ *  - notify must be a send-once right (MIG's mach_port_send_once_t): any
+ *    other disposition would be registered and later sent as a send-once
+ *    right it isn't.
  */
 int
 sys__kernelrpc_mach_port_request_notification_trap(struct thread *td,
@@ -636,6 +643,11 @@ sys__kernelrpc_mach_port_request_notification_trap(struct thread *td,
 	/* Resolve the notify port name -> ipc_port_t with the caller's disposition
 	 * (typically MACH_MSG_TYPE_MAKE_SEND_ONCE). A null notify name is allowed. */
 	if (uap->notify != 0) {
+		if (uap->notifyPoly != MACH_MSG_TYPE_MAKE_SEND_ONCE &&
+		    uap->notifyPoly != MACH_MSG_TYPE_MOVE_SEND_ONCE) {
+			td->td_retval[0] = KERN_INVALID_VALUE;
+			return (0);
+		}
 		kr = ipc_object_copyin(space, uap->notify, uap->notifyPoly,
 		    (ipc_object_t *)&notify_port);
 		if (kr != KERN_SUCCESS) {
@@ -647,11 +659,16 @@ sys__kernelrpc_mach_port_request_notification_trap(struct thread *td,
 	kr = mach_port_request_notification(space, uap->name, uap->msgid,
 	    uap->sync, notify_port, &previous);
 
+	if (kr != KERN_SUCCESS && IP_VALID(notify_port))
+		ipc_object_destroy((ipc_object_t)notify_port,
+		    MACH_MSG_TYPE_PORT_SEND_ONCE);
+
 	if (kr == KERN_SUCCESS && IP_VALID(previous)) {
 		kern_return_t ckr = ipc_object_copyout(space,
 		    (ipc_object_t)previous, MACH_MSG_TYPE_PORT_SEND_ONCE, &prev_name);
 		if (ckr != KERN_SUCCESS) {
-			ipc_port_release_send(previous);
+			ipc_object_destroy((ipc_object_t)previous,
+			    MACH_MSG_TYPE_PORT_SEND_ONCE);
 			prev_name = (ckr == KERN_INVALID_CAPABILITY) ?
 			    MACH_PORT_NAME_DEAD : MACH_PORT_NAME_NULL;
 		}
