@@ -178,6 +178,15 @@ ref_pset_port_locked(
 void ipc_host_init(void)
 {
 	ipc_port_t	port;
+
+	/*
+	 *	realhost.lock guards realhost.special[] (host_set/
+	 *	get_special_port, the bootstrap fallback in ipc_tt.c,
+	 *	iokit_kextd.c). Nothing initialised it before
+	 *	nextbsd-userland#84; this SYSINIT (SI_SUB_INTRINSIC)
+	 *	runs before any user process can reach those paths.
+	 */
+	mtx_init(&realhost.lock, "mach realhost", NULL, MTX_DEF);
 	/*
 	 *	Allocate and set up the two host ports.
 	 */
