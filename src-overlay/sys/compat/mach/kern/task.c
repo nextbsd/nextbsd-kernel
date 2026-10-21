@@ -814,6 +814,19 @@ task_set_info(
 	return (KERN_SUCCESS);
 }
 
+/*
+ *	task_info:
+ *
+ *	The flavours libc, launchd and ps-style tools use, as in XNU
+ *	(xnu-2422), from the task's NextBSD process (nextbsd-kernel#303):
+ *	TASK_BASIC_INFO_32, TASK_BASIC2_INFO_32, TASK_BASIC_INFO_64
+ *	(TASK_BASIC_INFO on LP64), MACH_TASK_BASIC_INFO,
+ *	TASK_THREAD_TIMES_INFO and TASK_AUDIT_TOKEN.
+ *	mach_task_get_usage() (mach_task.c) reads the process and refuses a
+ *	task whose process is exiting, in exec or gone. The obsolete
+ *	TASK_SCHED_* and TASK_SECURITY_TOKEN flavours are unchanged; every
+ *	other flavour is KERN_INVALID_ARGUMENT.
+ */
 kern_return_t
 task_info(
 	task_t			task,
@@ -821,95 +834,108 @@ task_info(
 	task_info_t		task_info_out,
 	mach_msg_type_number_t	*task_info_count)
 {
+	struct mach_task_usage	tu;
+	kern_return_t		kr;
 
 	if (task == TASK_NULL)
 		return(KERN_INVALID_ARGUMENT);
 
 	switch (flavor) {
-	    case TASK_BASIC_INFO:
+	    case TASK_BASIC_INFO_32:
+	    case TASK_BASIC2_INFO_32:
 	    {
-#ifdef notyet
-		register task_basic_info_t	basic_info;
-#endif
+		task_basic_info_32_t	basic_info;
 
-		if (*task_info_count < TASK_BASIC_INFO_COUNT) {
-		    return(KERN_INVALID_ARGUMENT);
-		}
+		if (*task_info_count < TASK_BASIC_INFO_32_COUNT)
+			return (KERN_INVALID_ARGUMENT);
+		if ((kr = mach_task_get_usage(task, &tu)) != KERN_SUCCESS)
+			return (kr);
 
-#ifdef notyet
-		basic_info = (task_basic_info_t) task_info_out;
+		basic_info = (task_basic_info_32_t)task_info_out;
+		basic_info->virtual_size = (natural_t)tu.virtual_size;
+		/* The "BASIC2" flavour reports the peak resident size. */
+		basic_info->resident_size = (natural_t)
+		    (flavor == TASK_BASIC2_INFO_32 ?
+		    tu.resident_size_max : tu.resident_size);
+		basic_info->policy = POLICY_TIMESHARE;
+		basic_info->suspend_count = tu.suspend_count;
+		basic_info->user_time = tu.user_time;
+		basic_info->system_time = tu.system_time;
 
-		map = (task == kernel_task) ? kernel_map : task->map;
+		*task_info_count = TASK_BASIC_INFO_32_COUNT;
+		break;
+	    }
 
-		basic_info->virtual_size  = map->size;
-		basic_info->resident_size = pmap_resident_count(map->pmap)
-						   * PAGE_SIZE;
-		task_lock(task);
-		basic_info->policy = task->policy;
-		basic_info->suspend_count = task->user_stop_count;
-		basic_info->user_time.seconds
-				= task->total_user_time.seconds;
-		basic_info->user_time.microseconds
-				= task->total_user_time.microseconds;
-		basic_info->system_time.seconds
-				= task->total_system_time.seconds;
-		basic_info->system_time.microseconds 
-				= task->total_system_time.microseconds;
-		task_unlock(task);
-#endif
+	    case TASK_BASIC_INFO_64:
+	    {
+		task_basic_info_64_t	basic_info;
 
-		*task_info_count = TASK_BASIC_INFO_COUNT;
+		if (*task_info_count < TASK_BASIC_INFO_64_COUNT)
+			return (KERN_INVALID_ARGUMENT);
+		if ((kr = mach_task_get_usage(task, &tu)) != KERN_SUCCESS)
+			return (kr);
+
+		basic_info = (task_basic_info_64_t)task_info_out;
+		basic_info->virtual_size = tu.virtual_size;
+		basic_info->resident_size = tu.resident_size;
+		basic_info->policy = POLICY_TIMESHARE;
+		basic_info->suspend_count = tu.suspend_count;
+		basic_info->user_time = tu.user_time;
+		basic_info->system_time = tu.system_time;
+
+		*task_info_count = TASK_BASIC_INFO_64_COUNT;
+		break;
+	    }
+
+	    case MACH_TASK_BASIC_INFO:
+	    {
+		mach_task_basic_info_t	basic_info;
+
+		if (*task_info_count < MACH_TASK_BASIC_INFO_COUNT)
+			return (KERN_INVALID_ARGUMENT);
+		if ((kr = mach_task_get_usage(task, &tu)) != KERN_SUCCESS)
+			return (kr);
+
+		basic_info = (mach_task_basic_info_t)task_info_out;
+		basic_info->virtual_size = tu.virtual_size;
+		basic_info->resident_size = tu.resident_size;
+		basic_info->resident_size_max = tu.resident_size_max;
+		basic_info->policy = POLICY_TIMESHARE;
+		basic_info->suspend_count = tu.suspend_count;
+		basic_info->user_time = tu.user_time;
+		basic_info->system_time = tu.system_time;
+
+		*task_info_count = MACH_TASK_BASIC_INFO_COUNT;
 		break;
 	    }
 
 	    case TASK_THREAD_TIMES_INFO:
 	    {
-		register task_thread_times_info_t times_info;
+		task_thread_times_info_t times_info;
 
-		if (*task_info_count < TASK_THREAD_TIMES_INFO_COUNT) {
-		    return (KERN_INVALID_ARGUMENT);
-		}
+		if (*task_info_count < TASK_THREAD_TIMES_INFO_COUNT)
+			return (KERN_INVALID_ARGUMENT);
+		if ((kr = mach_task_get_usage(task, &tu)) != KERN_SUCCESS)
+			return (kr);
 
-		times_info = (task_thread_times_info_t) task_info_out;
-		times_info->user_time.seconds = 0;
-		times_info->user_time.microseconds = 0;
-		times_info->system_time.seconds = 0;
-		times_info->system_time.microseconds = 0;
+		times_info = (task_thread_times_info_t)task_info_out;
+		times_info->user_time = tu.live_user_time;
+		times_info->system_time = tu.live_system_time;
 
-#ifdef notyet
-		task_lock(task);
-		queue_iterate(&task->thr_acts, thr_act,
-			      thread_act_t, thr_acts)
-		{
-			thread_t thread;
-		    time_value_t user_time, system_time;
-		    spl_t	 s;
-
-		    thread = act_lock_thread(thr_act);
-
-		    /* Skip empty threads and threads that have migrated
-		     * into this task:
-		     */
-		    if (thr_act->ith_object) {
-				act_unlock_thread(thr_act);
-				continue;
-		    }
-		    assert(thread);	/* Must have thread, if no thread_pool*/
-		    s = splsched();
-		    thread_lock(thread);
-
-		    thread_read_times(thread, &user_time, &system_time);
-
-		    thread_unlock(thread);
-		    splx(s);
-		    act_unlock_thread(thr_act);
-
-		    time_value_add(&times_info->user_time, &user_time);
-		    time_value_add(&times_info->system_time, &system_time);
-		}
-		task_unlock(task);
-#endif
 		*task_info_count = TASK_THREAD_TIMES_INFO_COUNT;
+		break;
+	    }
+
+	    case TASK_AUDIT_TOKEN:
+	    {
+		if (*task_info_count < TASK_AUDIT_TOKEN_COUNT)
+			return (KERN_INVALID_ARGUMENT);
+		if ((kr = mach_task_get_usage(task, &tu)) != KERN_SUCCESS)
+			return (kr);
+
+		*(audit_token_t *)task_info_out = tu.audit_token;
+
+		*task_info_count = TASK_AUDIT_TOKEN_COUNT;
 		break;
 	    }
 

@@ -68,13 +68,12 @@ convert_port_to_semaphore(ipc_port_t port)
 	return (NULL);
 }
 
-task_name_t
-convert_port_to_task_name(ipc_port_t port)
-{
-
-	return (NULL);
-}
-
+/*
+ * Left a stub (nextbsd-kernel#303). XNU converts an IKOT_TASK_RESUME port
+ * here, but NextBSD has no such kobject: task_suspend2() is unsupported
+ * and hands out no token port, and task_resume2() is unsupported and has
+ * no MIG destructor, so a reference taken here would never be dropped.
+ */
 task_suspension_token_t
 convert_port_to_task_suspension_token(ipc_port_t port)
 {

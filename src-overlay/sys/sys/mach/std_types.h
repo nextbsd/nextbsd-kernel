@@ -180,7 +180,6 @@ extern int mach_debug_enable;
 #define ds_master_notify(map) 0
 #define vm_map_copy_steal_pages(copy)
 #define thread_deallocate(thread)
-#define task_name_deallocate(task)
 #define assert_wait(a, b)
 #define cpu_number() curcpu
 #define copyoutmap(a, b, c, d) copyout((const void *)b, (void *)c, d)

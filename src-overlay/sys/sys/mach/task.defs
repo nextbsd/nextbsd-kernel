@@ -68,6 +68,7 @@
  *                               outtran convert_task_to_port
  *                               destr.  task_deallocate
  *     task_name_t               intran  convert_port_to_task_name   (3405 only)
+ *                               destr.  task_name_deallocate
  *     thread_act_t              outtran convert_thread_to_port
  *     semaphore_t               intran  convert_port_to_semaphore
  *     processor_set_t           intran  convert_port_to_pset
