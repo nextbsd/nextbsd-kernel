@@ -55,6 +55,7 @@ struct _kernelrpc_mach_port_insert_right_trap_args;
 struct _kernelrpc_mach_port_request_notification_trap_args;
 struct _kernelrpc_mach_port_move_member_trap_args;
 struct mach_wait_quiet_args;
+struct task_for_pid_args;
 
 SYSCTL_DECL(_mach);
 static SYSCTL_NODE(_mach, OID_AUTO, syscall, CTLFLAG_RW, 0,
@@ -87,6 +88,7 @@ int sys__kernelrpc_mach_port_request_notification_trap(struct thread *,
 int sys__kernelrpc_mach_port_move_member_trap(struct thread *,
     struct _kernelrpc_mach_port_move_member_trap_args *);
 int sys_mach_wait_quiet(struct thread *, struct mach_wait_quiet_args *);
+int sys_task_for_pid(struct thread *, struct task_for_pid_args *);
 
 /*
  * Phase C2: lazy Mach init. If the calling process/thread has no
@@ -281,6 +283,23 @@ sys_mach_wait_quiet_guarded(struct thread *td, struct mach_wait_quiet_args *uap)
 	return (sys_mach_wait_quiet(td, uap));
 }
 
+/*
+ * task_for_pid (nextbsd-kernel#298) — needs the caller's Mach task, whose
+ * space receives the right. On no-Mach-state return KERN_FAILURE (5), what
+ * XNU returns when target_tport is not a task; *t is left alone.
+ */
+static int
+sys_task_for_pid_guarded(struct thread *td, struct task_for_pid_args *uap)
+{
+	if (td->td_proc->p_machdata == NULL)
+		mach_task_init_lazy(td->td_proc);
+	if (td->td_proc->p_machdata == NULL) {
+		td->td_retval[0] = 5;	/* KERN_FAILURE */
+		return (0);
+	}
+	return (sys_task_for_pid(td, uap));
+}
+
 static struct sysent mach_reply_port_sysent = {
 	.sy_narg	= 0,
 	.sy_call	= (sy_call_t *)sys_mach_reply_port_guarded,
@@ -386,6 +405,14 @@ static struct sysent mach_wait_quiet_sysent = {
 	.sy_flags	= 0,
 };
 
+/* task_for_pid sysent. 3 args: (target_tport, pid, t). */
+static struct sysent task_for_pid_sysent = {
+	.sy_narg	= 3,
+	.sy_call	= (sy_call_t *)sys_task_for_pid_guarded,
+	.sy_auevent	= AUE_NULL,
+	.sy_flags	= 0,
+};
+
 static int mach_reply_port_offset = NO_SYSCALL;
 static struct sysent mach_reply_port_old_sysent;
 
@@ -418,6 +445,9 @@ static struct sysent _kernelrpc_mach_port_move_member_old_sysent;
 
 static int mach_wait_quiet_offset = NO_SYSCALL;
 static struct sysent mach_wait_quiet_old_sysent;
+
+static int task_for_pid_offset = NO_SYSCALL;
+static struct sysent task_for_pid_old_sysent;
 
 SYSCTL_INT(_mach_syscall, OID_AUTO, mach_reply_port, CTLFLAG_RD,
     &mach_reply_port_offset, 0,
@@ -485,6 +515,11 @@ SYSCTL_INT(_mach_syscall, OID_AUTO, mach_wait_quiet, CTLFLAG_RD,
     &mach_wait_quiet_offset, 0,
     "Dynamically-allocated FreeBSD syscall number for mach_wait_quiet "
     "(1-arg syscall; -1 if registration failed)");
+
+SYSCTL_INT(_mach_syscall, OID_AUTO, task_for_pid, CTLFLAG_RD,
+    &task_for_pid_offset, 0,
+    "Dynamically-allocated FreeBSD syscall number for task_for_pid "
+    "(3-arg syscall; -1 if registration failed)");
 
 static void
 wire_one(const char *name, int *offset, struct sysent *sy,
@@ -579,12 +614,16 @@ mach_syscall_wire_register(void *arg __unused)
 	    &_kernelrpc_mach_port_move_member_old_sysent);
 	wire_one("mach_wait_quiet", &mach_wait_quiet_offset,
 	    &mach_wait_quiet_sysent, &mach_wait_quiet_old_sysent);
+	wire_one("task_for_pid", &task_for_pid_offset,
+	    &task_for_pid_sysent, &task_for_pid_old_sysent);
 }
 
 static void
 mach_syscall_wire_deregister(void *arg __unused)
 {
 
+	unwire_one("task_for_pid", &task_for_pid_offset,
+	    &task_for_pid_old_sysent);
 	unwire_one("mach_wait_quiet", &mach_wait_quiet_offset,
 	    &mach_wait_quiet_old_sysent);
 	unwire_one("mach_port_move_member",
