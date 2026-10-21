@@ -138,18 +138,31 @@ typedef	integer_t	host_flavor_t;
 #define HOST_PRIORITY_INFO	5	/* priority information */
 #define HOST_PAGING_INFO	6	/* VM/paging info */
 
+/*
+ * nextbsd-userland#93: Apple's current layout (the CMU one had a
+ * vm_size_t memory_size, 8 bytes on LP64, so its count disagreed with
+ * every Apple-derived caller).  48 bytes / 12 integer_t on LP64; the
+ * first five fields are the HOST_BASIC_INFO_OLD_COUNT prefix.
+ */
 struct host_basic_info {
-	integer_t	max_cpus;	/* max number of cpus possible */
-	integer_t	avail_cpus;	/* number of cpus now available */
-	vm_size_t	memory_size;	/* size of memory in bytes */
-	cpu_type_t	cpu_type;	/* cpu type */
-	cpu_subtype_t	cpu_subtype;	/* cpu subtype */
+	integer_t	max_cpus;		/* max number of CPUs possible */
+	integer_t	avail_cpus;		/* number of CPUs now available */
+	natural_t	memory_size;		/* bytes, clamped to 2 GB */
+	cpu_type_t	cpu_type;		/* cpu type */
+	cpu_subtype_t	cpu_subtype;		/* cpu subtype */
+	integer_t	cpu_threadtype;		/* cpu threadtype */
+	integer_t	physical_cpu;		/* physical CPUs now available */
+	integer_t	physical_cpu_max;	/* max physical CPUs possible */
+	integer_t	logical_cpu;		/* logical CPUs now available */
+	integer_t	logical_cpu_max;	/* max logical CPUs possible */
+	uint64_t	max_mem;		/* actual size of physical memory */
 };
 
 typedef	struct host_basic_info	host_basic_info_data_t;
 typedef struct host_basic_info	*host_basic_info_t;
-#define HOST_BASIC_INFO_COUNT \
-		(sizeof(host_basic_info_data_t)/sizeof(integer_t))
+#define HOST_BASIC_INFO_COUNT ((mach_msg_type_number_t) \
+		(sizeof(host_basic_info_data_t)/sizeof(integer_t)))
+#define HOST_BASIC_INFO_OLD_COUNT ((mach_msg_type_number_t) 5)
 
 struct host_sched_info {
 	integer_t	min_timeout;	/* minimum timeout in milliseconds */
@@ -208,6 +221,10 @@ typedef struct host_load_info	*host_load_info_t;
 /* in <mach/vm_statistics.h> */
 #define	HOST_VM_INFO_COUNT \
 		(sizeof(vm_statistics_data_t)/sizeof(integer_t))
+/* Apple's revisions of the HOST_VM_INFO count (nextbsd-userland#93). */
+#define	HOST_VM_INFO_REV0_COUNT	((mach_msg_type_number_t) 12)	/* to hits */
+#define	HOST_VM_INFO_REV1_COUNT	((mach_msg_type_number_t) 14)	/* + purge */
+#define	HOST_VM_INFO_REV2_COUNT	HOST_VM_INFO_COUNT		/* + spec. */
 
 struct host_cpu_load_info {		/* number of ticks while running... */
 	unsigned long	cpu_ticks[CPU_STATE_MAX]; /* ... in the given mode */
