@@ -51,3 +51,4 @@
 0058-vt-drop-to-no-backend-when-there-is-nothing-to-downgrade-to.patch
 0059-NextBSD-enable-unprivileged-chroot-by-default.patch
 0060-NextBSD-allow-trusted-groups-to-chroot-without-no-new-privs.patch
+0061-NextBSD-add-time_set-eventhandler-fired-by-settime.patch

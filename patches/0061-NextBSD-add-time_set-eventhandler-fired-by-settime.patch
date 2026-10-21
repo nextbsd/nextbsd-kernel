@@ -1,0 +1,59 @@
+From 0698370c4fd64431e920495c1551cffc2eaa28cd Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Tue, 20 Oct 2026 19:49:14 -0500
+Subject: [PATCH] NextBSD: add a time_set eventhandler fired when settime()
+ steps the clock
+
+settime() is the common path of settimeofday(2) and clock_settime(2)
+(CLOCK_REALTIME). Invoke a new time_set eventhandler after the clock has
+been stepped and the RTC reset, so kernel subsystems can react to a
+calendar change.
+
+NextBSD's Mach layer uses it to post host_calendar_changed (msgid 950)
+to the port registered with host_request_notification(
+HOST_NOTIFY_CALENDAR_CHANGE), which libdispatch uses to re-evaluate
+wall-clock timers (nextbsd/nextbsd-userland#93). With no handler
+registered the invoke is a no-op.
+
+Refs nextbsd/nextbsd-userland#93. Carried out-of-tree for NextBSD.
+---
+ sys/kern/kern_time.c   | 2 ++
+ sys/sys/eventhandler.h | 4 ++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/sys/kern/kern_time.c b/sys/kern/kern_time.c
+index 3e8117c..43f726c 100644
+--- a/sys/kern/kern_time.c
++++ b/sys/kern/kern_time.c
+@@ -42,6 +42,7 @@
+ #include <sys/resourcevar.h>
+ #include <sys/signalvar.h>
+ #include <sys/kernel.h>
++#include <sys/eventhandler.h>
+ #include <sys/sleepqueue.h>
+ #include <sys/syscallsubr.h>
+ #include <sys/sysctl.h>
+@@ -166,6 +167,7 @@ settime(struct thread *td, struct timeval *tv)
+ 	ts.tv_nsec = tv->tv_usec * 1000;
+ 	tc_setclock(&ts);
+ 	resettodr();
++	EVENTHANDLER_INVOKE(time_set);
+ 	return (0);
+ }
+ 
+diff --git a/sys/sys/eventhandler.h b/sys/sys/eventhandler.h
+index 2ebb73a..ffcaadc 100644
+--- a/sys/sys/eventhandler.h
++++ b/sys/sys/eventhandler.h
+@@ -335,4 +335,8 @@ typedef void (*env_change_fn)(void *, const char *);
+ EVENTHANDLER_DECLARE(setenv, env_change_fn);
+ EVENTHANDLER_DECLARE(unsetenv, env_change_fn);
+ 
++/* Wall clock stepped by settime() (settimeofday(2), clock_settime(2)) */
++typedef void (*time_set_fn)(void *);
++EVENTHANDLER_DECLARE(time_set, time_set_fn);
++
+ #endif /* _SYS_EVENTHANDLER_H_ */
+-- 
+2.54.0 (Apple Git-157)
+
