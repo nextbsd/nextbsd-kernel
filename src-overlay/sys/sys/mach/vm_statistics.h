@@ -115,6 +115,8 @@ struct vm_statistics {
 	integer_t       purgeable_count;        /* # of pages purgeable */
 	integer_t       purges;                 /* # of pages purged */
 
+	/* nextbsd-userland#93: Apple's 15th field (HOST_VM_INFO_REV2). */
+	integer_t	speculative_count;	/* # of pages speculative */
 };
 
 typedef struct vm_statistics	*vm_statistics_t;
