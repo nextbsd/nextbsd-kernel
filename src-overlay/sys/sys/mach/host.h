@@ -110,4 +110,7 @@ typedef struct host	host_data_t;
 
 extern host_data_t	realhost;
 
+/* Userland-settable host special-port slots (mach_host_priv.c, nextbsd-userland#84). */
+extern boolean_t	host_special_port_settable(int which);
+
 #endif	/* _KERN_HOST_H_ */

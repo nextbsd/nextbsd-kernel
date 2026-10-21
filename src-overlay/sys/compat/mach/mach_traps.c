@@ -295,7 +295,6 @@ sys_task_set_special_port_trap(struct thread *td,
  * access rule (no host_priv check) until published userland has moved to
  * the MIG client and the trap is retired (#84 Phase C).
  */
-extern boolean_t host_special_port_settable(int which);
 extern kern_return_t host_set_special_port(host_priv_t host_priv, int which,
     mach_port_t port);
 
