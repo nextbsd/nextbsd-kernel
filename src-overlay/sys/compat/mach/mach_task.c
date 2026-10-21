@@ -73,6 +73,20 @@ task_get_state(
 )
 UNSUPPORTED;
 
+/*
+ * task_policy_get / task_policy_set (nextbsd-userland#93, group 3).
+ *
+ * NextBSD has no Mach task-policy engine: there is nothing for a
+ * category or QoS tier to drive.  So set validates the flavor and the
+ * count the way XNU does and accepts known flavors as a no-op, and get
+ * reports the defaults (*get_default = TRUE) with the flavor's count.
+ * Unknown flavors are KERN_INVALID_ARGUMENT in both directions.
+ *
+ * TASK_SUPPRESSION_POLICY is accepted by set, as XNU accepts it, but its
+ * layout is not in our headers, so get has no defaults to report for it;
+ * TASK_POLICY_STATE is get-only and privileged in XNU.  Both are
+ * KERN_INVALID_ARGUMENT from get.
+ */
 int
 task_policy_get(
 	task_t task,
@@ -81,7 +95,42 @@ task_policy_get(
 	mach_msg_type_number_t *policy_infoCnt,
 	boolean_t *get_default
 )
-UNSUPPORTED;
+{
+	task_category_policy_t cat;
+	task_qos_policy_t qos;
+
+	if (task == NULL || policy_info == NULL ||
+	    policy_infoCnt == NULL || get_default == NULL)
+		return (KERN_INVALID_ARGUMENT);
+
+	switch (flavor) {
+	case TASK_CATEGORY_POLICY:
+		if (*policy_infoCnt < TASK_CATEGORY_POLICY_COUNT)
+			return (KERN_INVALID_ARGUMENT);
+		cat = (task_category_policy_t)policy_info;
+		cat->role = TASK_UNSPECIFIED;
+		*policy_infoCnt = TASK_CATEGORY_POLICY_COUNT;
+		break;
+
+	case TASK_BASE_QOS_POLICY:
+	case TASK_OVERRIDE_QOS_POLICY:
+	case TASK_BASE_LATENCY_QOS_POLICY:
+	case TASK_BASE_THROUGHPUT_QOS_POLICY:
+		if (*policy_infoCnt < TASK_QOS_POLICY_COUNT)
+			return (KERN_INVALID_ARGUMENT);
+		qos = (task_qos_policy_t)policy_info;
+		qos->task_latency_qos_tier = LATENCY_QOS_TIER_UNSPECIFIED;
+		qos->task_throughput_qos_tier = THROUGHPUT_QOS_TIER_UNSPECIFIED;
+		*policy_infoCnt = TASK_QOS_POLICY_COUNT;
+		break;
+
+	default:
+		return (KERN_INVALID_ARGUMENT);
+	}
+
+	*get_default = TRUE;
+	return (KERN_SUCCESS);
+}
 
 int
 task_policy_set(
@@ -90,7 +139,36 @@ task_policy_set(
 	task_policy_t policy_info,
 	mach_msg_type_number_t policy_infoCnt
 )
-UNSUPPORTED;
+{
+
+	if (task == NULL)
+		return (KERN_INVALID_ARGUMENT);
+
+	switch (flavor) {
+	case TASK_CATEGORY_POLICY:
+		if (policy_infoCnt < TASK_CATEGORY_POLICY_COUNT)
+			return (KERN_INVALID_ARGUMENT);
+		break;
+
+	case TASK_BASE_QOS_POLICY:
+	case TASK_OVERRIDE_QOS_POLICY:
+	case TASK_BASE_LATENCY_QOS_POLICY:
+	case TASK_BASE_THROUGHPUT_QOS_POLICY:
+		if (policy_infoCnt < TASK_QOS_POLICY_COUNT)
+			return (KERN_INVALID_ARGUMENT);
+		break;
+
+	case TASK_SUPPRESSION_POLICY:
+		break;
+
+	default:
+		return (KERN_INVALID_ARGUMENT);
+	}
+
+	/* Accepted; no task-policy engine to apply it to. */
+	(void)policy_info;
+	return (KERN_SUCCESS);
+}
 
 int
 task_purgable_info(
