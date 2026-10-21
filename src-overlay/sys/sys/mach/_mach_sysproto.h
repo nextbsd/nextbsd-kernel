@@ -194,6 +194,15 @@ struct task_set_importance_watchports_np_args {
 	char count_l_[PADL_(int)]; int count; char count_r_[PADR_(int)];
 	char proctype_l_[PADL_(int)]; int proctype; char proctype_r_[PADR_(int)];
 };
+/*
+ * task_importance_assertion_np — hold or drop one external importance
+ * assertion on the calling task (nextbsd#539 part G; NextBSD's form of
+ * xnu-2422's process_policy PROC_POLICY_BOOST/PROC_POLICY_IMP_IMPORTANT).
+ * See src/mach_traps.c.
+ */
+struct task_importance_assertion_np_args {
+	char action_l_[PADL_(int)]; int action; char action_r_[PADR_(int)];
+};
 struct mach_msg_trap_args {
 	char msg_l_[PADL_(mach_msg_header_t *)]; mach_msg_header_t * msg; char msg_r_[PADR_(mach_msg_header_t *)];
 	char option_l_[PADL_(mach_msg_option_t)]; mach_msg_option_t option; char option_r_[PADR_(mach_msg_option_t)];
