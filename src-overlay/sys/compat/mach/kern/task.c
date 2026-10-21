@@ -103,10 +103,13 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
+#include <sys/resource.h>
+#include <sys/sched.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <sys/sysent.h>
 #include <sys/systm.h>
+#include <sys/taskqueue.h>
 #include <sys/mach/vm_types.h>
 
 #include <sys/mach/task_info.h>
@@ -1326,6 +1329,9 @@ mach_task_recycle(task_t task, struct proc *p)
 	task->task_imp_watchport_cnt = 0;
 	task->task_imp_spawn_apptype = TASK_APPTYPE_NONE;
 	task->task_imp_spawn_pending = FALSE;
+	/* p_nice was not touched for p (part F); see task_importance_sched_fork */
+	task->task_imp_sched_bg = 0;
+	task->task_imp_sched_nice = 0;
 
 	mach_task_setup(task, p);
 }
@@ -1580,6 +1586,9 @@ mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
 	if (parent_task->itk_space == NULL)
 		return;
 
+	/* nextbsd#539 part F: a demoted parent's child gets its nice back. */
+	task_importance_sched_fork(p1, parent_task, p2);
+
 	if (parent_task->itk_bootstrap == IP_NULL) {
 		/* No bootstrap port to inherit; importance flags still are. */
 		task_importance_inherit(parent_task, mach_proc_task(p2));
@@ -1738,6 +1747,7 @@ task_importance_mark_receiver(task_t task, boolean_t receiving)
 	task_lock(task);
 	task_importance_mark_receiver_locked(task, receiving);
 	task_unlock(task);
+	task_importance_sched_kick(task);
 }
 
 /*
@@ -1781,6 +1791,7 @@ task_importance_set_apptype(task_t task, int apptype)
 	task->imp_donor = donor;
 	task_importance_mark_receiver_locked(task, receiver);
 	task_unlock(task);
+	task_importance_sched_kick(task);
 }
 
 static int
@@ -1855,52 +1866,72 @@ task_importance_drop_assertion_locked(task_t target_task, boolean_t external,
 int
 task_importance_hold_internal_assertion(task_t target_task, uint32_t count)
 {
+	boolean_t was, now;
 	int rval;
 
 	if (target_task == TASK_NULL || count == 0)
 		return (0);
 	task_lock(target_task);
+	was = (target_task->task_imp_assertcnt != 0);
 	rval = task_importance_hold_assertion_locked(target_task, FALSE, count);
+	now = (target_task->task_imp_assertcnt != 0);
 	task_unlock(target_task);
+	if (was != now)
+		task_importance_sched_kick(target_task);
 	return (rval);
 }
 
 int
 task_importance_drop_internal_assertion(task_t target_task, uint32_t count)
 {
+	boolean_t was, now;
 	int rval;
 
 	if (target_task == TASK_NULL || count == 0)
 		return (0);
 	task_lock(target_task);
+	was = (target_task->task_imp_assertcnt != 0);
 	rval = task_importance_drop_assertion_locked(target_task, FALSE, count);
+	now = (target_task->task_imp_assertcnt != 0);
 	task_unlock(target_task);
+	if (was != now)
+		task_importance_sched_kick(target_task);
 	return (rval);
 }
 
 int
 task_importance_hold_external_assertion(task_t target_task, uint32_t count)
 {
+	boolean_t was, now;
 	int rval;
 
 	if (target_task == TASK_NULL || count == 0)
 		return (0);
 	task_lock(target_task);
+	was = (target_task->task_imp_assertcnt != 0);
 	rval = task_importance_hold_assertion_locked(target_task, TRUE, count);
+	now = (target_task->task_imp_assertcnt != 0);
 	task_unlock(target_task);
+	if (was != now)
+		task_importance_sched_kick(target_task);
 	return (rval);
 }
 
 int
 task_importance_drop_external_assertion(task_t target_task, uint32_t count)
 {
+	boolean_t was, now;
 	int rval;
 
 	if (target_task == TASK_NULL || count == 0)
 		return (0);
 	task_lock(target_task);
+	was = (target_task->task_imp_assertcnt != 0);
 	rval = task_importance_drop_assertion_locked(target_task, TRUE, count);
+	now = (target_task->task_imp_assertcnt != 0);
 	task_unlock(target_task);
+	if (was != now)
+		task_importance_sched_kick(target_task);
 	return (rval);
 }
 
@@ -2098,12 +2129,20 @@ task_importance_apply_spawn_attrs(task_t task)
 /*
  * fork: the child starts with its parent's donor and receiver flags and
  * app type, and no assertions, as xnu-2422's task_create_internal().
+ *
+ * An adaptive daemon's child is not adaptive (xnu-2422
+ * task_policy_create(), nextbsd#539 part F): it becomes an interactive
+ * daemon that donates if the parent is boosted, and a background daemon
+ * that takes no boosts otherwise.  Only exec gives a task the adaptive
+ * type, so only a job launchd started as adaptive is ever demoted by
+ * mach.importance_sched.
  */
 void
 task_importance_inherit(task_t parent_task, task_t child_task)
 {
 	uint32_t donor, receiver;
 	integer_t apptype;
+	boolean_t boosted;
 
 	if (parent_task == TASK_NULL || child_task == TASK_NULL ||
 	    parent_task == child_task)
@@ -2112,7 +2151,18 @@ task_importance_inherit(task_t parent_task, task_t child_task)
 	donor = parent_task->imp_donor;
 	receiver = parent_task->imp_receiver;
 	apptype = parent_task->task_imp_apptype;
+	boosted = (parent_task->task_imp_assertcnt != 0);
 	task_unlock(parent_task);
+
+	if (apptype == TASK_APPTYPE_DAEMON_ADAPTIVE) {
+		if (boosted) {
+			apptype = TASK_APPTYPE_DAEMON_INTERACTIVE;
+			donor = 1;
+		} else {
+			apptype = TASK_APPTYPE_DAEMON_BACKGROUND;
+			receiver = 0;
+		}
+	}
 
 	task_lock(child_task);
 	child_task->imp_donor = donor;
@@ -2121,4 +2171,179 @@ task_importance_inherit(task_t parent_task, task_t child_task)
 	child_task->task_imp_externcnt = 0;
 	child_task->task_imp_apptype = apptype;
 	task_unlock(child_task);
+}
+
+/*
+ * Scheduling effect of importance (nextbsd#539 part F).
+ *
+ * xnu-2422 runs an adaptive daemon (TASK_APPTYPE_DAEMON_ADAPTIVE) as
+ * DARWIN_BG while it holds no importance, and returns it to normal
+ * scheduling while it is boosted (kern/task_policy.c,
+ * task_policy_update_internal_locked(): "Adaptive daemons are DARWIN_BG
+ * unless boosted"; task_update_boost_locked() runs on every 0 <-> nonzero
+ * change of task_imp_assertcnt).  This is the minimal port of that: an
+ * adaptive daemon whose task_imp_assertcnt (which includes
+ * task_imp_externcnt) is 0 runs at nice PRIO_MAX, and gets its own nice
+ * back while it holds a boost.  Every other app type, PID 1, system
+ * processes and any process with no Mach task keep their priority.
+ *
+ * Why nice and not the idle class: FreeBSD's idle class (rtp_to_pri with
+ * RTP_PRIO_IDLE, as idprio(1) does) only runs when no other thread wants
+ * the CPU, and ULE gives an idle-class thread none of the priority boost a
+ * timeshare thread gets when it sleeps in the kernel (sched_sleep).
+ * Turnstiles lend priority to the owner of a mutex or rwlock, but sx and
+ * lockmgr locks (vnode locks among them) lend none.  A daemon such as
+ * syslogd holds a vnode lock on /var/log/* while it writes; demoted to
+ * idle, it could sit on that lock forever under load while normal
+ * processes wait behind it.  Nice PRIO_MAX keeps it timeshare: ULE still
+ * gives it a share of the CPU and the in-kernel sleep boost.  It is also
+ * closer to DARWIN_BG, which is a low timeshare band (MAXPRI_THROTTLE),
+ * not an idle class.
+ *
+ * Nothing is changed under a port or task lock.  A boost transition only
+ * enqueues task_imp_sched_task (task_importance_sched_kick).  The
+ * taskqueue handler walks the process list under allproc_lock and
+ * applies or undoes the demotion with sched_nice() under each process's
+ * PROC_LOCK, which also protects task_imp_sched_bg and
+ * task_imp_sched_nice.  The task lock is only taken inside the PROC_LOCK,
+ * and only to read the counts; nothing takes a PROC_LOCK under a task
+ * lock.  The handler recomputes every demotion from the current state,
+ * so transitions that cancel out before it runs cost nothing.
+ *
+ * A nice the administrator changes while a process is demoted is kept:
+ * the old nice is only restored if p_nice is still PRIO_MAX.  A demoted
+ * process's fork child inherits p_nice; task_importance_sched_fork gives
+ * it back (the child is not adaptive, see task_importance_inherit).
+ *
+ * mach.importance_sched is 0 by default.  While it is 0 nothing is
+ * demoted; setting it back to 0 at runtime restores every demoted
+ * process.  It also needs mach.importance: with that at 0 no boost is
+ * ever counted, so an adaptive daemon could never come back, and nothing
+ * is demoted.
+ */
+static int mach_importance_sched;
+
+static void task_importance_sched_walk(void *arg, int pending);
+static struct task task_imp_sched_task =
+    TASK_INITIALIZER(0, task_importance_sched_walk, NULL);
+
+static int
+sysctl_mach_importance_sched(SYSCTL_HANDLER_ARGS)
+{
+	int error, val;
+
+	val = mach_importance_sched;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	mach_importance_sched = (val != 0) ? 1 : 0;
+	/* A boot-time tunable needs no walk: no process runs yet. */
+	if (!cold)
+		taskqueue_enqueue(taskqueue_thread, &task_imp_sched_task);
+	return (0);
+}
+SYSCTL_PROC(_mach, OID_AUTO, importance_sched,
+    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, NULL, 0,
+    sysctl_mach_importance_sched, "I",
+    "run unboosted adaptive daemons at nice 20 (xnu DARWIN_BG); "
+    "needs mach.importance");
+
+/*
+ * Should this task's process be demoted now?  Called with the task lock
+ * held (and its process's PROC_LOCK).
+ */
+static boolean_t
+task_importance_sched_wants_bg_locked(task_t task)
+{
+
+	if (mach_importance_sched == 0 || mach_importance == 0)
+		return (FALSE);
+	if (task->task_imp_apptype != TASK_APPTYPE_DAEMON_ADAPTIVE ||
+	    task->imp_receiver == 0)
+		return (FALSE);
+	/* task_imp_assertcnt includes task_imp_externcnt */
+	return (task->task_imp_assertcnt == 0 ? TRUE : FALSE);
+}
+
+void
+task_importance_sched_kick(task_t task)
+{
+
+	if (task == TASK_NULL)
+		return;
+	/*
+	 * Unlocked reads: a hint only.  A demotion that is missed here is
+	 * picked up by the walk the sysctl change queued, or by the next
+	 * transition.
+	 */
+	if (mach_importance_sched == 0 && task->task_imp_sched_bg == 0)
+		return;
+	if (task->task_imp_apptype != TASK_APPTYPE_DAEMON_ADAPTIVE &&
+	    task->task_imp_sched_bg == 0)
+		return;
+	taskqueue_enqueue(taskqueue_thread, &task_imp_sched_task);
+}
+
+static void
+task_importance_sched_walk(void *arg __unused, int pending __unused)
+{
+	struct proc *p;
+	task_t task;
+	boolean_t want;
+
+	sx_slock(&allproc_lock);
+	FOREACH_PROC_IN_SYSTEM(p) {
+		PROC_LOCK(p);
+		if (p->p_state != PRS_NORMAL ||
+		    (p->p_flag & (P_SYSTEM | P_WEXIT)) != 0 ||
+		    p->p_pid <= 1 ||
+		    (task = mach_proc_task(p)) == TASK_NULL) {
+			PROC_UNLOCK(p);
+			continue;
+		}
+		task_lock(task);
+		want = task_importance_sched_wants_bg_locked(task);
+		task_unlock(task);
+
+		if (want && task->task_imp_sched_bg == 0) {
+			task->task_imp_sched_nice = p->p_nice;
+			task->task_imp_sched_bg = 1;
+			if (p->p_nice < PRIO_MAX)
+				sched_nice(p, PRIO_MAX);
+		} else if (!want && task->task_imp_sched_bg != 0) {
+			task->task_imp_sched_bg = 0;
+			/* Keep a nice someone else set meanwhile. */
+			if (p->p_nice == PRIO_MAX &&
+			    task->task_imp_sched_nice != PRIO_MAX)
+				sched_nice(p, task->task_imp_sched_nice);
+		}
+		PROC_UNLOCK(p);
+	}
+	sx_sunlock(&allproc_lock);
+}
+
+/*
+ * fork hook: p2 inherited p1's p_nice.  If that is a demotion, give p2 the
+ * nice p1 had before it; p2 is never adaptive (task_importance_inherit),
+ * so it would never be restored otherwise.  p2 is PRS_NEW and not yet
+ * runnable; nothing is locked on entry.
+ */
+void
+task_importance_sched_fork(struct proc *p1, task_t parent_task,
+    struct proc *p2)
+{
+	int bg, nice;
+
+	if (parent_task == TASK_NULL)
+		return;
+	PROC_LOCK(p1);
+	bg = parent_task->task_imp_sched_bg;
+	nice = parent_task->task_imp_sched_nice;
+	PROC_UNLOCK(p1);
+	if (bg == 0)
+		return;
+	PROC_LOCK(p2);
+	if (p2->p_nice == PRIO_MAX && nice != PRIO_MAX)
+		sched_nice(p2, nice);
+	PROC_UNLOCK(p2);
 }

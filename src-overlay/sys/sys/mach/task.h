@@ -315,6 +315,16 @@ typedef struct mach_task {
 	int		task_imp_watchport_cnt;
 	integer_t	task_imp_spawn_apptype;	/* TASK_APPTYPE_*, NONE if unset */
 	boolean_t	task_imp_spawn_pending;
+
+	/*
+	 * Scheduling effect of importance (nextbsd#539 part F,
+	 * mach.importance_sched).  Set only by the importance taskqueue
+	 * handler and the fork hook, under the owning process's PROC_LOCK.
+	 * task_imp_sched_bg: this process was demoted (its p_nice raised to
+	 * PRIO_MAX); task_imp_sched_nice: its p_nice before that.
+	 */
+	int		task_imp_sched_bg;
+	int		task_imp_sched_nice;
 	
 #ifdef notyet	/* Active activations in this task */
 	queue_head_t	thr_acts;	/* list of thread_activations */
@@ -464,5 +474,17 @@ extern void		task_importance_apply_spawn_attrs(task_t task);
 extern void		task_importance_drop_spawn_attrs(task_t task);
 extern void		task_importance_inherit(task_t parent_task,
 				task_t child_task);
+
+/*
+ * Scheduling effect (nextbsd#539 part F).  sched_kick asks the
+ * importance taskqueue to re-evaluate demotions after a task's app type
+ * or boost changed; it takes no lock but the taskqueue's, so it is called
+ * with the task lock dropped.  sched_fork undoes, in a forked child, a
+ * demotion it inherited with its parent's p_nice.
+ */
+struct proc;
+extern void		task_importance_sched_kick(task_t task);
+extern void		task_importance_sched_fork(struct proc *p1,
+				task_t parent_task, struct proc *p2);
 
 #endif	/* _KERN_TASK_H_ */
