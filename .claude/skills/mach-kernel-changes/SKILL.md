@@ -149,17 +149,19 @@ from. Wait for the `kernel` job on both arches.
 
 ### UserPrefix and the libmach client
 
-Only `mach_port.defs` has `UserPrefix _kernelrpc_` (`mach_port.defs:88`), so
-its generated client sits under libmach's public trap wrappers instead of
-colliding with them.
+`mach_port.defs`, `task.defs`, `host_priv.defs` and `mach_host.defs` set
+`UserPrefix _kernelrpc_` (`mach_port.defs:88`, `task.defs:109`,
+`host_priv.defs:127`, `mach_host.defs:105`). Their generated clients sit under
+libmach's public wrappers instead of colliding with them: libmach defines
+`task_get/set_special_port`, `task_policy_*`, `task_set_exception_ports`,
+`host_*` and `semaphore_*` itself, and those wrappers call the
+`_kernelrpc_*` client (nextbsd-userland #84 / #93). `UserPrefix` changes only
+client symbol names; the generated server files are byte-identical with or
+without it.
 
-`task.defs:84-89` says "nothing in libmach defines task_*". **That is false
-today.** libmach defines `task_get/set_special_port`, `task_policy_*`,
-`task_set_exception_ports` and `semaphore_*`
-(`nextbsd-userland/src/libmach/mach_traps.c:282-335, 406-435, 1416-1550`). A
-plain-name client generated from `task.defs`, `host_priv.defs` or
-`mach_host.defs` collides at link time. The recorded default (nextbsd-userland
-#84 / #93) is `_kernelrpc_` on those three as well.
+A new `.defs` that libmach also wraps needs the same prefix. `mach_vm.defs`,
+`vm_map.defs` and `clock.defs` deliberately have none (see the comment in
+each).
 
 ### A `.defs` change crosses repos the moment it merges
 
