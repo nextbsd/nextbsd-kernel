@@ -60,6 +60,7 @@
 #define _KERN_IPC_TT_H_
 
 #include <sys/mach/port.h>
+#include <sys/mach/time_value.h>
 #include <sys/mach/ipc_kobject.h>
 #include <sys/mach/ipc/ipc_space.h>
 #include <sys/mach/ipc/ipc_table.h>
@@ -128,6 +129,10 @@ extern ipc_port_t retrieve_thread_self_fast(
 extern task_name_t convert_port_to_task_name(
 	ipc_port_t	port);
 
+/* Drop the reference convert_port_to_task_name produced (MIG destructor) */
+extern void task_name_deallocate(
+	task_name_t	task_name);
+
 /* Convert from a port to a task */
 extern task_t convert_port_to_task(
 	ipc_port_t	port);
@@ -180,6 +185,23 @@ extern void set_security_token(task_t);
 struct ucred;
 extern void mach_audit_token_from_cred(struct ucred *, pid_t,
 	audit_token_t *);
+
+/*
+ * What task_info() reports about a task's process (nextbsd-kernel#303),
+ * read by mach_task_get_usage() (mach_task.c) under the proc lock.
+ */
+struct mach_task_usage {
+	uint64_t	virtual_size;		/* bytes */
+	uint64_t	resident_size;		/* bytes */
+	uint64_t	resident_size_max;	/* bytes */
+	time_value_t	user_time;		/* threads that have exited */
+	time_value_t	system_time;
+	time_value_t	live_user_time;		/* threads still alive */
+	time_value_t	live_system_time;
+	integer_t	suspend_count;
+	audit_token_t	audit_token;
+};
+extern kern_return_t mach_task_get_usage(task_t, struct mach_task_usage *);
 
 
 extern void ipc_thr_act_init(thread_act_t);

@@ -1133,6 +1133,47 @@ convert_port_to_task(
 	return task;
 }
 
+/*
+ *	Routine:	convert_port_to_task_name
+ *	Purpose:
+ *		Convert from a port to a task name.
+ *		Doesn't consume the port ref; produces a task name ref,
+ *		which may be null.
+ *	Conditions:
+ *		Nothing locked.
+ *
+ *	XNU accepts an active IKOT_TASK or IKOT_TASK_NAME port. NextBSD has
+ *	no task name ports yet (no IKOT_TASK_NAME kobject type, and
+ *	task_name_for_pid() returns ENOSYS), so only a task port names a
+ *	task here, and the lookup is convert_port_to_task()'s: the reference
+ *	is taken under the port lock, and a dead or non-task port gives
+ *	TASK_NULL (nextbsd-kernel#303). When name ports are added, accept
+ *	IKOT_TASK_NAME in the same locked check.
+ *
+ *	The MIG task_name_t destructor, task_name_deallocate(), drops the
+ *	reference (task_info, 3405, is the only routine that uses it).
+ */
+task_name_t
+convert_port_to_task_name(
+	ipc_port_t	port)
+{
+
+	return ((task_name_t)convert_port_to_task(port));
+}
+
+/*
+ *	Routine:	task_name_deallocate
+ *	Purpose:
+ *		Drop the reference convert_port_to_task_name() produced.
+ */
+void
+task_name_deallocate(
+	task_name_t	task_name)
+{
+
+	task_deallocate((task_t)task_name);
+}
+
 boolean_t
 ref_task_port_locked( ipc_port_t port, task_t *ptask )
 {
