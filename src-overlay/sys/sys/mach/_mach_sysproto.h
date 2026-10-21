@@ -183,6 +183,17 @@ struct host_self_trap_args {
 struct mach_wait_quiet_args {
 	char timeout_l_[PADL_(uint64_t)]; uint64_t timeout; char timeout_r_[PADR_(uint64_t)];
 };
+/*
+ * task_set_importance_watchports_np — record the calling task's process
+ * type and importance watch ports for its next exec (nextbsd#539 part E;
+ * NextBSD's form of xnu-2422's posix_spawn PSPA_IMP_WATCHPORTS and
+ * psa_apptype under POSIX_SPAWN_SETEXEC). See src/mach_traps.c.
+ */
+struct task_set_importance_watchports_np_args {
+	char names_l_[PADL_(mach_port_name_t *)]; mach_port_name_t * names; char names_r_[PADR_(mach_port_name_t *)];
+	char count_l_[PADL_(int)]; int count; char count_r_[PADR_(int)];
+	char proctype_l_[PADL_(int)]; int proctype; char proctype_r_[PADR_(int)];
+};
 struct mach_msg_trap_args {
 	char msg_l_[PADL_(mach_msg_header_t *)]; mach_msg_header_t * msg; char msg_r_[PADR_(mach_msg_header_t *)];
 	char option_l_[PADL_(mach_msg_option_t)]; mach_msg_option_t option; char option_r_[PADR_(mach_msg_option_t)];

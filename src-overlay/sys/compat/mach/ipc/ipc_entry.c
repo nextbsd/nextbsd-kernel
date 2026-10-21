@@ -977,6 +977,16 @@ ipc_entry_exec_hook(void *arg __unused, struct proc *p,
 			if (thread != THREAD_NULL)
 				ipc_thread_reset(thread);
 		}
+		/*
+		 * Spawn attributes the process recorded for this exec
+		 * (nextbsd#539 part E): the image is in place, so apply the
+		 * app type and bind the importance watch ports now, as
+		 * xnu-2422's posix_spawn does once the image is loaded. A
+		 * Linux image gets none of it; mach_task_orphan() drops
+		 * them.
+		 */
+		if (!to_linux)
+			task_importance_apply_spawn_attrs(task);
 		if (to_linux)
 			mach_task_orphan(p);
 	}

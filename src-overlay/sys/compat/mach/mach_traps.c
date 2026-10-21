@@ -57,6 +57,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/msg.h>
 #include <sys/ptrace.h>
 #include <sys/signalvar.h>
+#include <machine/atomic.h>
 
 #include <netinet/in.h>
 #include <sys/sysproto.h>
@@ -210,6 +211,156 @@ out:
 		mach_port_deallocate(self->itk_space, tret);
 		kr = KERN_INVALID_ADDRESS;
 	}
+	td->td_retval[0] = kr;
+	return (0);
+}
+
+/*
+ * task_set_importance_watchports_np (nextbsd#539 part E): record the
+ * calling task's process type and importance watch ports for its next
+ * exec.
+ *
+ * xnu-2422's launchd passes both to posix_spawn(POSIX_SPAWN_SETEXEC) with
+ * posix_spawnattr_setprocesstype_np() and
+ * posix_spawnattr_set_importancewatch_port_np(). NextBSD's launchd
+ * performs that spawn with execve(2), so the child calls this trap on its
+ * own task right before it, and the process_exec hook (ipc_entry.c)
+ * applies what is recorded once the new image is in place
+ * (task_importance_apply_spawn_attrs).
+ *
+ * names[0..count-1] are send rights in the caller's space. Each is copied
+ * in as xnu-2422's exec_handle_port_actions() copies a PSPA_IMP_WATCHPORTS
+ * action (MACH_MSG_TYPE_COPY_SEND), so the caller keeps its own right. A
+ * name that is not a send right, a dead name, or a port whose receive right
+ * the caller itself holds is skipped: a watch port is a listener whose
+ * receive right waits in launchd. Whether a port then qualifies (it must
+ * be tempowner) is decided at bind time, as in xnu-2422. proctype is a
+ * POSIX_SPAWN_PROC_TYPE_* value as xnu-2422 defines it; 0 or an unknown
+ * value leaves the app type alone. A second call replaces the first;
+ * count 0 and proctype 0 clear it.
+ *
+ * Never a reason to fail an exec: the only errors are a bad argument
+ * (KERN_INVALID_ARGUMENT, nothing recorded) and an unreadable names array
+ * (KERN_INVALID_ADDRESS), and launchd ignores both. The first skipped name
+ * or failed call is logged once per boot.
+ */
+#define	TASK_IMP_WATCHPORTS_MAX	1024
+
+/* xnu-2422 bsd/sys/spawn_internal.h */
+#define	XNU_POSIX_SPAWN_PROC_TYPE_APP_DEFAULT		0x00000100
+#define	XNU_POSIX_SPAWN_PROC_TYPE_APP_TAL		0x00000200
+#define	XNU_POSIX_SPAWN_PROC_TYPE_DAEMON_STANDARD	0x00000300
+#define	XNU_POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE	0x00000400
+#define	XNU_POSIX_SPAWN_PROC_TYPE_DAEMON_BACKGROUND	0x00000500
+#define	XNU_POSIX_SPAWN_PROC_TYPE_DAEMON_ADAPTIVE	0x00000600
+
+static int task_imp_watchports_logged;
+
+static void
+task_imp_watchports_log(struct thread *td, const char *what, int detail)
+{
+
+	if (atomic_cmpset_int(&task_imp_watchports_logged, 0, 1))
+		printf("mach importance: pid %d (%s): %s (%d); "
+		    "further watch port errors are not logged\n",
+		    td->td_proc->p_pid, td->td_proc->p_comm, what, detail);
+}
+
+static int
+task_imp_proctype_to_apptype(int proctype)
+{
+
+	switch (proctype) {
+	case XNU_POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE:
+		return (TASK_APPTYPE_DAEMON_INTERACTIVE);
+	case XNU_POSIX_SPAWN_PROC_TYPE_DAEMON_STANDARD:
+		return (TASK_APPTYPE_DAEMON_STANDARD);
+	case XNU_POSIX_SPAWN_PROC_TYPE_DAEMON_ADAPTIVE:
+		return (TASK_APPTYPE_DAEMON_ADAPTIVE);
+	case XNU_POSIX_SPAWN_PROC_TYPE_DAEMON_BACKGROUND:
+		return (TASK_APPTYPE_DAEMON_BACKGROUND);
+	case XNU_POSIX_SPAWN_PROC_TYPE_APP_DEFAULT:
+		return (TASK_APPTYPE_APP_DEFAULT);
+	case XNU_POSIX_SPAWN_PROC_TYPE_APP_TAL:
+		return (TASK_APPTYPE_APP_TAL);
+	default:
+		return (TASK_APPTYPE_NONE);
+	}
+}
+
+int
+sys_task_set_importance_watchports_np(struct thread *td,
+    struct task_set_importance_watchports_np_args *uap)
+{
+	task_t self = current_task();
+	ipc_space_t space = self->itk_space;
+	mach_port_name_t *names = NULL;
+	ipc_port_t *ports = NULL;
+	ipc_port_t port;
+	kern_return_t kr = KERN_SUCCESS;
+	int apptype, count, i, n;
+
+	count = uap->count;
+	if (count < 0 || count > TASK_IMP_WATCHPORTS_MAX ||
+	    (count > 0 && uap->names == NULL)) {
+		task_imp_watchports_log(td, "bad watch port count", count);
+		kr = KERN_INVALID_ARGUMENT;
+		goto out;
+	}
+	apptype = task_imp_proctype_to_apptype(uap->proctype);
+
+	n = 0;
+	if (count > 0) {
+		names = malloc(count * sizeof(*names), M_MACH_TMP, M_WAITOK);
+		if (copyin(uap->names, names, count * sizeof(*names)) != 0) {
+			task_imp_watchports_log(td, "unreadable watch port array",
+			    count);
+			kr = KERN_INVALID_ADDRESS;
+			goto out;
+		}
+		ports = malloc(count * sizeof(*ports), M_MACH_TMP,
+		    M_WAITOK | M_ZERO);
+		for (i = 0; i < count; i++) {
+			if (!MACH_PORT_NAME_VALID(names[i]))
+				continue;
+			port = IP_NULL;
+			if (ipc_object_copyin(space, names[i],
+			    MACH_MSG_TYPE_COPY_SEND, (ipc_object_t *)&port) !=
+			    KERN_SUCCESS) {
+				task_imp_watchports_log(td,
+				    "watch port is not a send right", names[i]);
+				continue;
+			}
+			if (!IP_VALID(port))
+				continue;	/* dead name */
+			ip_lock(port);
+			if (ip_active(port) && port->ip_receiver == space &&
+			    port->ip_receiver_name != MACH_PORT_NAME_NULL) {
+				/* The caller holds the receive right itself. */
+				ip_unlock(port);
+				ipc_port_release_send(port);
+				continue;
+			}
+			ip_unlock(port);
+			ports[n++] = port;
+		}
+		if (n == 0) {
+			free(ports, M_MACH_TMP);
+			ports = NULL;
+		}
+	}
+
+	if (apptype == TASK_APPTYPE_NONE && ports == NULL)
+		task_importance_drop_spawn_attrs(self);
+	else {
+		/* Takes over ports and the send rights in it. */
+		task_importance_set_spawn_attrs(self, apptype, ports, n);
+		ports = NULL;
+	}
+
+out:
+	if (names != NULL)
+		free(names, M_MACH_TMP);
 	td->td_retval[0] = kr;
 	return (0);
 }
