@@ -86,6 +86,9 @@
 #define MACH_EXCEPTION_CODES            0x80000000
 /*      Send 64-bit code and subcode in the exception header */
 
+#define MACH_EXCEPTION_MASK             MACH_EXCEPTION_CODES
+/*      Behavior modifier bits (nextbsd-userland#93; XNU ORs in more) */
+
 #define FIRST_EXCEPTION		1	/* ZERO is illegal */
 
 
