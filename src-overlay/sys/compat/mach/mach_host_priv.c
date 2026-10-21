@@ -54,14 +54,63 @@ host_get_clock_control(
 )
 UNSUPPORTED;
 
-int
+/*
+ *	Routine:	host_get_special_port [kernel call]
+ *	Purpose:
+ *		Return a send right for one of the host's special
+ *		ports (nextbsd-userland#93 group 5; Apple's
+ *		host_get_host_port() / host_get_host_priv_port()
+ *		macros are this with HOST_PORT / HOST_PRIV_PORT).
+ *		This tree does not keep the kernel ports in
+ *		realhost.special[] as XNU does, so they are taken
+ *		from realhost directly:
+ *
+ *		HOST_PORT		the unprivileged host port
+ *		HOST_PRIV_PORT		the host_priv port (the caller
+ *					already holds it)
+ *		HOST_BOOTSTRAP_PORT,	whatever userland registered
+ *		HOST_KEXTD_PORT		with host_set_special_port();
+ *					MACH_PORT_NULL if unset
+ *
+ *		Any other slot is KERN_INVALID_ARGUMENT. `node` is
+ *		ignored, as in XNU: there is only the local node.
+ *	Conditions:
+ *		Nothing locked.
+ *	Returns:
+ *		KERN_SUCCESS		*port holds a naked send right
+ *					(possibly IP_NULL).
+ *		KERN_INVALID_HOST	host_priv is not the host_priv port.
+ *		KERN_INVALID_ARGUMENT	Unsupported slot.
+ */
+kern_return_t
 host_get_special_port(
 	host_priv_t host_priv,
-	int node,
+	int node __unused,
 	int which,
 	mach_port_t *port
 )
-UNSUPPORTED;
+{
+
+	if (host_priv == HOST_NULL)
+		return (KERN_INVALID_HOST);
+
+	switch (which) {
+	case HOST_PORT:
+		*port = ipc_port_make_send(realhost.host_self);
+		break;
+	case HOST_PRIV_PORT:
+		*port = ipc_port_make_send(realhost.host_priv_self);
+		break;
+	default:
+		if (!host_special_port_settable(which))
+			return (KERN_INVALID_ARGUMENT);
+		host_lock(&realhost);
+		*port = ipc_port_copy_send(realhost.special[which]);
+		host_unlock(&realhost);
+		break;
+	}
+	return (KERN_SUCCESS);
+}
 
 int
 host_priv_statistics(
