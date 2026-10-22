@@ -54,6 +54,7 @@ struct _kernelrpc_mach_port_deallocate_trap_args;
 struct _kernelrpc_mach_port_insert_right_trap_args;
 struct _kernelrpc_mach_port_request_notification_trap_args;
 struct _kernelrpc_mach_port_move_member_trap_args;
+struct _kernelrpc_mach_port_mod_refs_trap_args;
 struct mach_wait_quiet_args;
 struct task_for_pid_args;
 struct task_name_for_pid_args;
@@ -90,6 +91,8 @@ int sys__kernelrpc_mach_port_request_notification_trap(struct thread *,
     struct _kernelrpc_mach_port_request_notification_trap_args *);
 int sys__kernelrpc_mach_port_move_member_trap(struct thread *,
     struct _kernelrpc_mach_port_move_member_trap_args *);
+int sys__kernelrpc_mach_port_mod_refs_trap(struct thread *,
+    struct _kernelrpc_mach_port_mod_refs_trap_args *);
 int sys_mach_wait_quiet(struct thread *, struct mach_wait_quiet_args *);
 int sys_task_for_pid(struct thread *, struct task_for_pid_args *);
 int sys_task_name_for_pid(struct thread *, struct task_name_for_pid_args *);
@@ -279,6 +282,25 @@ sys__kernelrpc_mach_port_move_member_trap_guarded(struct thread *td,
 }
 
 /*
+ * mach_port_mod_refs (nextbsd#354) — needs Mach task state; the handler
+ * reaches current_task()->itk_space. On no-Mach-state return
+ * MACH_SEND_INVALID_DEST (0x10000003), what the handler returns for a
+ * target that is not the caller's task, so libmach falls back to MIG.
+ */
+static int
+sys__kernelrpc_mach_port_mod_refs_trap_guarded(struct thread *td,
+    struct _kernelrpc_mach_port_mod_refs_trap_args *uap)
+{
+	if (td->td_proc->p_machdata == NULL)
+		mach_task_init_lazy(td->td_proc);
+	if (td->td_proc->p_machdata == NULL) {
+		td->td_retval[0] = 0x10000003;	/* MACH_SEND_INVALID_DEST */
+		return (0);
+	}
+	return (sys__kernelrpc_mach_port_mod_refs_trap(td, uap));
+}
+
+/*
  * mach_wait_quiet — block until the device tree quiesces (mach.bus.busy
  * == 0). Unlike the Mach traps above, the handler reaches no Mach
  * task/thread state (it only sleeps on the busystate counter), so no
@@ -437,6 +459,14 @@ static struct sysent _kernelrpc_mach_port_move_member_sysent = {
 	.sy_flags	= 0,
 };
 
+/* mach_port_mod_refs sysent. 4 args: (target, name, right, delta). */
+static struct sysent _kernelrpc_mach_port_mod_refs_sysent = {
+	.sy_narg	= 4,
+	.sy_call	= (sy_call_t *)sys__kernelrpc_mach_port_mod_refs_trap_guarded,
+	.sy_auevent	= AUE_NULL,
+	.sy_flags	= 0,
+};
+
 /*
  * mach_wait_quiet sysent. 1 arg: (timeout) — a uint64_t nanosecond
  * budget (0 == wait indefinitely). Backs IOKitWaitQuiet /
@@ -520,6 +550,9 @@ static struct sysent _kernelrpc_mach_port_request_notification_old_sysent;
 static int _kernelrpc_mach_port_move_member_offset = NO_SYSCALL;
 static struct sysent _kernelrpc_mach_port_move_member_old_sysent;
 
+static int _kernelrpc_mach_port_mod_refs_offset = NO_SYSCALL;
+static struct sysent _kernelrpc_mach_port_mod_refs_old_sysent;
+
 static int mach_wait_quiet_offset = NO_SYSCALL;
 static struct sysent mach_wait_quiet_old_sysent;
 
@@ -596,6 +629,12 @@ SYSCTL_INT(_mach_syscall, OID_AUTO, mach_port_move_member, CTLFLAG_RD,
     &_kernelrpc_mach_port_move_member_offset, 0,
     "Dynamically-allocated FreeBSD syscall number for mach_port_move_member "
     "(3-arg syscall; -1 if registration failed)");
+
+/* Name matches libmach's resolve_syscall_once(..., "mach_port_mod_refs"). */
+SYSCTL_INT(_mach_syscall, OID_AUTO, mach_port_mod_refs, CTLFLAG_RD,
+    &_kernelrpc_mach_port_mod_refs_offset, 0,
+    "Dynamically-allocated FreeBSD syscall number for mach_port_mod_refs "
+    "(4-arg syscall; -1 if registration failed)");
 
 SYSCTL_INT(_mach_syscall, OID_AUTO, mach_wait_quiet, CTLFLAG_RD,
     &mach_wait_quiet_offset, 0,
@@ -715,6 +754,9 @@ mach_syscall_wire_register(void *arg __unused)
 	wire_one("mach_port_move_member", &_kernelrpc_mach_port_move_member_offset,
 	    &_kernelrpc_mach_port_move_member_sysent,
 	    &_kernelrpc_mach_port_move_member_old_sysent);
+	wire_one("mach_port_mod_refs", &_kernelrpc_mach_port_mod_refs_offset,
+	    &_kernelrpc_mach_port_mod_refs_sysent,
+	    &_kernelrpc_mach_port_mod_refs_old_sysent);
 	wire_one("mach_wait_quiet", &mach_wait_quiet_offset,
 	    &mach_wait_quiet_sysent, &mach_wait_quiet_old_sysent);
 	wire_one("task_for_pid", &task_for_pid_offset,
@@ -747,6 +789,9 @@ mach_syscall_wire_deregister(void *arg __unused)
 	    &task_for_pid_old_sysent);
 	unwire_one("mach_wait_quiet", &mach_wait_quiet_offset,
 	    &mach_wait_quiet_old_sysent);
+	unwire_one("mach_port_mod_refs",
+	    &_kernelrpc_mach_port_mod_refs_offset,
+	    &_kernelrpc_mach_port_mod_refs_old_sysent);
 	unwire_one("mach_port_move_member",
 	    &_kernelrpc_mach_port_move_member_offset,
 	    &_kernelrpc_mach_port_move_member_old_sysent);
