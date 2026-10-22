@@ -1,0 +1,58 @@
+From 73cd4045082571060c10912cfdbf5f24d35b34dd Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 21 Oct 2026 20:25:03 -0500
+Subject: [PATCH] NextBSD: post VQ_UPDATE to EVFILT_FS when a mount is updated
+
+Darwin defines VQ_UPDATE (0x0100, "filesystem information has changed")
+and mount_common() posts vfs_event_signal(NULL, VQ_UPDATE, 0) when an
+MNT_UPDATE mount succeeds, e.g. remounting / read-write. launchd PID 1
+watches for it on EVFILT_FS: on VQ_UPDATE it checks that /var/log is
+writable and sets launchd_var_available, which is what lets it open its
+debug, perf and shutdown logs under /private/var/log/com.apple.launchd.
+
+The VQ_* set inherited from FreeBSD has no VQ_UPDATE; 0x0100 is an
+unused placeholder (VQ_FLAG0100). Define VQ_UPDATE there with Darwin's
+value and signal it at the end of a successful vfs_domount_update().
+filt_fsevent() ORs (kn_sfflags & hint) into kn_fflags, so only knotes
+that asked for VQ_UPDATE see it.
+
+Refs nextbsd/nextbsd-userland#354. Carried out-of-tree for NextBSD.
+---
+ sys/kern/vfs_mount.c | 7 +++++++
+ sys/sys/mount.h      | 2 +-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/sys/kern/vfs_mount.c b/sys/kern/vfs_mount.c
+index aaee203..6f6182a 100644
+--- a/sys/kern/vfs_mount.c
++++ b/sys/kern/vfs_mount.c
+@@ -1587,6 +1587,13 @@ end:
+ 	vp->v_iflag &= ~VI_MOUNT;
+ 	VI_UNLOCK(vp);
+ 	vrele(vp);
++	/*
++	 * NextBSD: tell EVFILT_FS listeners that a mount was updated, as
++	 * Darwin's mount_common() does for MNT_UPDATE.  launchd uses it to
++	 * learn that / (and so /var) became writable.
++	 */
++	if (error == 0)
++		vfs_event_signal(NULL, VQ_UPDATE, 0);
+ 	return (error != 0 ? error : export_error);
+ }
+ 
+diff --git a/sys/sys/mount.h b/sys/sys/mount.h
+index 18f8519..5426f22 100644
+--- a/sys/sys/mount.h
++++ b/sys/sys/mount.h
+@@ -737,7 +737,7 @@ struct vfsquery {
+ #define VQ_ASSIST	0x0040	/* filesystem needs assistance from external
+ 				   program */
+ #define VQ_NOTRESPLOCK	0x0080	/* server lockd down */
+-#define VQ_FLAG0100	0x0100	/* placeholder */
++#define VQ_UPDATE	0x0100	/* filesystem information has changed */
+ #define VQ_FLAG0200	0x0200	/* placeholder */
+ #define VQ_FLAG0400	0x0400	/* placeholder */
+ #define VQ_FLAG0800	0x0800	/* placeholder */
+-- 
+2.54.0 (Apple Git-157)
+
