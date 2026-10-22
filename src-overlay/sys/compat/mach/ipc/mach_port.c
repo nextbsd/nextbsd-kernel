@@ -897,6 +897,18 @@ mach_port_set_seqno(
  *	Routine:	mach_port_gst_helper
  *	Purpose:
  *		A helper function for mach_port_get_set_status.
+ *		Stores up to maxnames member names and returns the
+ *		total member count in *actualp, which may exceed
+ *		maxnames (the caller then grows the buffer and
+ *		retries), as XNU's ipc_mqueue_set_gather_member_names.
+ *	Conditions:
+ *		The port set is locked.
+ *
+ *	It used to set *actualp = actual + 1 without advancing actual,
+ *	so every member landed in names[0] and the count was at most 1:
+ *	only the last-added member was ever reported. launchd's demand
+ *	port set then never saw its other members' messages and spun on
+ *	the readable set (nextbsd-userland#354 follow-up).
  */
 
 static void
@@ -908,9 +920,7 @@ mach_port_gst_helper(
 {
 	mach_port_name_t name;
 	ipc_port_t		port;
-	ipc_entry_num_t actual = *actualp;
-
-	assert(port != IP_NULL);
+	ipc_entry_num_t actual = 0;
 
 	TAILQ_FOREACH(port, &pset->ips_ports, ip_next) {
 		assert(ip_active(port));
@@ -919,8 +929,9 @@ mach_port_gst_helper(
 		assert(port->ip_pset == pset);
 		if (actual < maxnames)
 			names[actual] = name;
-		*actualp = actual+1;
+		actual++;
 	}
+	*actualp = actual;
 }
 
 /*
@@ -982,7 +993,7 @@ mach_port_get_set_status(
 
 		/* the port set must be active */
 		names = (mach_port_name_t *) addr;
-		maxnames = size / sizeof(mach_port_t);
+		maxnames = size / sizeof(mach_port_name_t);
 		actual = 0;
 
 		mach_port_gst_helper(pset, maxnames, names, &actual);
@@ -995,7 +1006,7 @@ mach_port_get_set_status(
 		/* didn't have enough memory; allocate more */
 
 		free(addr, M_MACH_VM);
-		size = round_page(actual * sizeof(mach_port_t)) + PAGE_SIZE;
+		size = round_page(actual * sizeof(mach_port_name_t)) + PAGE_SIZE;
 	}
 
 	if (actual == 0) {
@@ -1005,15 +1016,17 @@ mach_port_get_set_status(
 	} else {
 		vm_size_t size_used;
 
-		size_used = actual * sizeof(mach_port_t);
+		size_used = actual * sizeof(mach_port_name_t);
 
 		/*
-		 *	Make used memory pageable and get it into
-		 *	copied-in form.  Free any unused memory.
+		 *	Get the used memory into copied-in form. On
+		 *	success and on failure alike vm_map_copyin()
+		 *	frees the kernel_map source buffer.
 		 */
 		kr = vm_map_copyin(kernel_map, (vm_offset_t)addr, size_used,
 				   FALSE, &memory);
-		assert(kr == KERN_SUCCESS);
+		if (kr != KERN_SUCCESS)
+			return KERN_RESOURCE_SHORTAGE;
 	}
 
 	*members = (mach_port_name_t *) memory;
