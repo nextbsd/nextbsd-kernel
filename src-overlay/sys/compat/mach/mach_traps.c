@@ -680,17 +680,41 @@ sys__kernelrpc_mach_port_request_notification_trap(struct thread *td,
 	return (0);
 }
 
+/*
+ * mach_port_mod_refs (nextbsd#354), as xnu-2422's
+ * _kernelrpc_mach_port_mod_refs_trap() in osfmk/ipc/mach_kernelrpc.c: the
+ * trap only acts on the caller's own space. target must be a send right to
+ * the caller's own task; anything else (another task, a dead or non-task
+ * port, a bad name) returns MACH_SEND_INVALID_DEST, which is libmach's cue to
+ * retry over MIG, as Apple's libsyscall does. It used to ignore target and
+ * act on the caller's space whatever task was named.
+ *
+ * right and delta are validated by mach_port_mod_refs() / ipc_right_delta()
+ * with XNU's codes (KERN_INVALID_VALUE, KERN_INVALID_NAME,
+ * KERN_INVALID_RIGHT, KERN_UREFS_OVERFLOW).
+ */
 int
 sys__kernelrpc_mach_port_mod_refs_trap(struct thread *td, struct _kernelrpc_mach_port_mod_refs_trap_args *uap)
 {
-	ipc_space_t space = current_task()->itk_space;
-	/*
-	  mach_port_name_t target = uap->target;
-	  mach_port_name_t *name = uap->name;
-	  mach_port_right_t right = uap->right;
-	  mach_port_delta_t delta = uap->delta;
-	*/
-	td->td_retval[0] = mach_port_mod_refs(space, uap->name, uap->right, uap->delta);
+	task_t self = current_task();
+	ipc_port_t port;
+	task_t task;
+	kern_return_t rv = MACH_SEND_INVALID_DEST;
+
+	/* Same check as task_for_pid's target_tport. */
+	if (ipc_port_translate_send(self->itk_space, uap->target,
+	    &port) != KERN_SUCCESS)
+		goto done;
+	task = (ip_active(port) && ip_kotype(port) == IKOT_TASK) ?
+	    (task_t)port->ip_kobject : TASK_NULL;
+	ip_unlock(port);
+	if (task != self)
+		goto done;
+
+	rv = mach_port_mod_refs(self->itk_space, uap->name, uap->right,
+	    uap->delta);
+done:
+	td->td_retval[0] = rv;
 	return (0);
 }
 
