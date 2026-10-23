@@ -248,6 +248,20 @@ jobs:
           test -f /usr/src/sys/kern/vfs_pivot.c
           echo "==> vfs.pivot wired: $(grep -c 'kern/vfs_pivot.c' /usr/src/sys/conf/files) entry; source present"
 
+      # Darwin kernel events (PF_SYSTEM / SYSPROTO_EVENT, #293). The domain and
+      # its EVENTHANDLER subscribers are laid into /usr/src/sys/net by the
+      # overlay cp above; append their files fragment so they compile into the
+      # kernel. They self-register (DOMAIN_SET + EVENTHANDLER_DEFINE, no base
+      # patch) and deliver nothing until a socket sets a filter. KERNEL build only
+      # -- same rule as the vfs.pivot wiring above.
+      - name: Wire in kernel events (PF_SYSTEM, #293)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.kev" >> /usr/src/sys/conf/files
+          test -f /usr/src/sys/net/kern_event_sock.c
+          test -f /usr/src/sys/net/kev_net.c
+          echo "==> kernel events wired: $(grep -cE 'net/(kern_event_sock|kev_net)\.c' /usr/src/sys/conf/files) entries; sources present"
+
       # Static Linuxulator: the 64-bit Linux ABI + linprocfs/linsysfs (#60).
       # Upstream ships these only as sys/modules/*, and there has never been a
       # static path for the 64-bit ABI (COMPAT_LINUX is commented out in
