@@ -56,3 +56,4 @@
 0063-devfs-route-EVFILT_VNODE-on-device-files-to-the-vnod.patch
 0064-NextBSD-post-VQ_UPDATE-to-EVFILT_FS-on-mount-update.patch
 0065-NextBSD-add-arp_collision_event-eventhandler.patch
+0066-NextBSD-add-rt_ifmsg_event-eventhandler-fired-by-rt_ifmsg.patch
