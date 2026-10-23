@@ -30,6 +30,7 @@
  * interface and address EVENTHANDLERs, nextbsd-kernel#293:
  *
  *   ifnet_arrival_event	KEV_DL_IF_ATTACHED, then PROTO_ATTACHED per family
+ *   ether_ifattach_event	the same, for an interface in ether_ifattach()
  *   ifnet_departure_event	KEV_DL_IF_DETACHING, PROTO_DETACHED per family,
  *				then IF_DETACHED
  *   ifnet_link_event		KEV_DL_LINK_ON / LINK_OFF (UNKNOWN is skipped)
@@ -43,12 +44,16 @@
  *
  * Darwin has no PROTO_* source here, so they are synthesized at arrival and
  * departure. A rename fires departure then arrival, so it is reported as a
- * detach then an attach. IPv4 uses ifaddr_event_ext, not rt_addrmsg, which
- * fires again when the interface comes up. Link-local and autoconf IPv6
- * addresses are reported when added, while still tentative. As on Darwin,
- * NEW_USER_ADDR is not posted when an address is added but when DAD finishes
- * or finds a duplicate, for every address kind, with IN6_IFF_DUPLICATED in
- * ia6_flags on failure; nothing is posted when DAD is skipped.
+ * detach then an attach. ether_ifattach() fires arrival from if_attach()
+ * before it has set the link-layer address, so for that interface the
+ * attach is posted from ether_ifattach_event instead, once the MAC is in
+ * place as on Darwin; each attach is still posted once. IPv4 uses
+ * ifaddr_event_ext, not rt_addrmsg, which fires again when the interface
+ * comes up. Link-local and autoconf IPv6 addresses are reported when
+ * added, while still tentative. As on Darwin, NEW_USER_ADDR is not posted
+ * when an address is added but when DAD finishes or finds a duplicate, for
+ * every address kind, with IN6_IFF_DUPLICATED in ia6_flags on failure;
+ * nothing is posted when DAD is skipped.
  *
  * Every field is copied out of the ifnet before posting; nothing keeps ifp.
  */
@@ -195,7 +200,7 @@ kev_net_proto(struct ifnet *ifp, u_int32_t code, u_int32_t family,
 }
 
 static void
-kev_net_arrival(void *arg __unused, struct ifnet *ifp)
+kev_net_attached(void *arg __unused, struct ifnet *ifp)
 {
 	u_int32_t n = 0;
 
@@ -206,6 +211,28 @@ kev_net_arrival(void *arg __unused, struct ifnet *ifp)
 #ifdef INET6
 	kev_net_proto(ifp, KEV_DL_PROTO_ATTACHED, AF_INET6, ++n);
 #endif
+}
+EVENTHANDLER_DEFINE(ether_ifattach_event, kev_net_attached, NULL,
+    EVENTHANDLER_PRI_ANY);
+
+/*
+ * Inside ether_ifattach(), if_addrlen is already 6 but the AF_LINK address
+ * if_attach() just allocated is still zeroed (sdl_alen 0); the
+ * ether_ifattach_event that follows posts once it is filled in. A vnet
+ * move or rename keeps the address, so it is posted here. No other
+ * if_attach() caller uses an Ethernet-sized address.
+ */
+static void
+kev_net_arrival(void *arg, struct ifnet *ifp)
+{
+	struct sockaddr_dl *sdl;
+
+	if (ifp->if_addrlen == ETHER_ADDR_LEN && ifp->if_addr != NULL) {
+		sdl = (struct sockaddr_dl *)ifp->if_addr->ifa_addr;
+		if (sdl->sdl_alen == 0)
+			return;
+	}
+	kev_net_attached(arg, ifp);
 }
 EVENTHANDLER_DEFINE(ifnet_arrival_event, kev_net_arrival, NULL,
     EVENTHANDLER_PRI_ANY);
