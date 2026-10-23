@@ -36,15 +36,19 @@
  *   iflladdr_event		KEV_DL_LINK_ADDRESS_CHANGED
  *   rt_ifmsg_event		KEV_DL_SIFFLAGS / SIFMTU (patched into rt_ifmsg)
  *   ifaddr_event_ext		KEV_INET_NEW_ADDR / ADDR_DELETED
- *   rt_addrmsg (AF_INET6)	KEV_INET6_NEW_{LL,RTADV,USER}_ADDR / ADDR_DELETED
+ *   rt_addrmsg (AF_INET6)	KEV_INET6_NEW_{LL,RTADV}_ADDR / ADDR_DELETED
+ *   nd6_dad_event		KEV_INET6_NEW_USER_ADDR (base patch)
  *   arp_collision_event	KEV_INET_ARPCOLLISION (base patch)
  *   inet6 ::/0 rib_subscribe	KEV_INET6_DEFROUTER
  *
  * Darwin has no PROTO_* source here, so they are synthesized at arrival and
  * departure. A rename fires departure then arrival, so it is reported as a
  * detach then an attach. IPv4 uses ifaddr_event_ext, not rt_addrmsg, which
- * fires again when the interface comes up. IPv6 addresses are reported when
- * added, while still tentative.
+ * fires again when the interface comes up. Link-local and autoconf IPv6
+ * addresses are reported when added, while still tentative. As on Darwin,
+ * NEW_USER_ADDR is not posted when an address is added but when DAD finishes
+ * or finds a duplicate, for every address kind, with IN6_IFF_DUPLICATED in
+ * ia6_flags on failure; nothing is posted when DAD is skipped.
  *
  * Every field is copied out of the ifnet before posting; nothing keeps ifp.
  */
@@ -85,6 +89,7 @@
 #endif
 #ifdef INET6
 #include <netinet6/in6_var.h>
+#include <netinet6/nd6.h>
 #endif
 
 /* Darwin's IFNET_FAMILY_* values for net_event_data.if_family. */
@@ -453,6 +458,29 @@ kev_net_walltime(time_t t)
 }
 
 static void
+kev_net_in6_fill(struct ifnet *ifp, struct in6_ifaddr *ia,
+    struct kev_in6_data *id)
+{
+
+	memset(id, 0, sizeof(*id));
+	kev_net_fill(ifp, &id->link_data);
+	id->ia_addr = ia->ia_addr;
+	id->ia_net = ia->ia_net;
+	id->ia_dstaddr = ia->ia_dstaddr;
+	id->ia_prefixmask = ia->ia_prefixmask;
+	kev_net_unembed(&id->ia_addr);
+	kev_net_unembed(&id->ia_dstaddr);
+	id->ia_plen = ia->ia_plen;
+	id->ia6_flags = ia->ia6_flags;
+	id->ia_lifetime.ia6t_expire =
+	    kev_net_walltime(ia->ia6_lifetime.ia6t_expire);
+	id->ia_lifetime.ia6t_preferred =
+	    kev_net_walltime(ia->ia6_lifetime.ia6t_preferred);
+	id->ia_lifetime.ia6t_vltime = ia->ia6_lifetime.ia6t_vltime;
+	id->ia_lifetime.ia6t_pltime = ia->ia6_lifetime.ia6t_pltime;
+}
+
+static void
 kev_net_inet6(void *arg __unused, struct ifaddr *ifa, int cmd)
 {
 	struct in6_ifaddr *ia;
@@ -472,29 +500,30 @@ kev_net_inet6(void *arg __unused, struct ifaddr *ifa, int cmd)
 	else if ((ia->ia6_flags & IN6_IFF_AUTOCONF) != 0)
 		code = KEV_INET6_NEW_RTADV_ADDR;
 	else
-		code = KEV_INET6_NEW_USER_ADDR;
+		return;		/* NEW_USER_ADDR waits for DAD */
 
-	memset(&id, 0, sizeof(id));
-	kev_net_fill(ifp, &id.link_data);
-	id.ia_addr = ia->ia_addr;
-	id.ia_net = ia->ia_net;
-	id.ia_dstaddr = ia->ia_dstaddr;
-	id.ia_prefixmask = ia->ia_prefixmask;
-	kev_net_unembed(&id.ia_addr);
-	kev_net_unembed(&id.ia_dstaddr);
-	id.ia_plen = ia->ia_plen;
-	id.ia6_flags = ia->ia6_flags;
-	id.ia_lifetime.ia6t_expire =
-	    kev_net_walltime(ia->ia6_lifetime.ia6t_expire);
-	id.ia_lifetime.ia6t_preferred =
-	    kev_net_walltime(ia->ia6_lifetime.ia6t_preferred);
-	id.ia_lifetime.ia6t_vltime = ia->ia6_lifetime.ia6t_vltime;
-	id.ia_lifetime.ia6t_pltime = ia->ia6_lifetime.ia6t_pltime;
+	kev_net_in6_fill(ifp, ia, &id);
 	if (ifp->if_addr != NULL && ifp->if_addrlen == ETHER_ADDR_LEN)
 		memcpy(id.ia_mac, IF_LLADDR(ifp), ETHER_ADDR_LEN);
 	kev_net_post(ifp, KEV_INET6_SUBCLASS, code, &id, sizeof(id));
 }
 EVENTHANDLER_DEFINE(rt_addrmsg, kev_net_inet6, NULL, EVENTHANDLER_PRI_ANY);
+
+/*
+ * DAD finished (nd6_nbr.c), in the net epoch under the DAD queue lock.
+ * Darwin fills ia_mac with the link-layer address seen during DAD, which
+ * NextBSD's DAD does not record, so it is left zero.
+ */
+static void
+kev_net_dad(void *arg __unused, struct ifaddr *ifa, int duplicated __unused)
+{
+	struct kev_in6_data id;
+
+	kev_net_in6_fill(ifa->ifa_ifp, (struct in6_ifaddr *)ifa, &id);
+	kev_net_post(ifa->ifa_ifp, KEV_INET6_SUBCLASS, KEV_INET6_NEW_USER_ADDR,
+	    &id, sizeof(id));
+}
+EVENTHANDLER_DEFINE(nd6_dad_event, kev_net_dad, NULL, EVENTHANDLER_PRI_ANY);
 
 /*
  * The IPv6 default route was added, changed or removed. The payload is a

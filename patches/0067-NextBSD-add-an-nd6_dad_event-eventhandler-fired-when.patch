@@ -1,0 +1,80 @@
+From 8dfc8882c77021a92e29c615d9cff4cbe6b03720 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 23 Oct 2026 09:28:52 -0500
+Subject: [PATCH] NextBSD: add an nd6_dad_event eventhandler fired when DAD
+ finishes
+
+IPv6 duplicate address detection changes an address's state silently:
+on success nd6_dad_timer() clears IN6_IFF_TENTATIVE, and on failure
+nd6_dad_duplicated() sets IN6_IFF_DUPLICATED and only logs. Invoke a new
+nd6_dad_event eventhandler at both points, with duplicated 0 or 1, so
+kernel subsystems can react to the outcome. Nothing is invoked when DAD
+is skipped.
+
+NextBSD's kernel event layer (net/kev_net.c) uses it to post Darwin's
+KEV_INET6_NEW_USER_ADDR at the same points xnu does, carrying ia6_flags
+so configd/ipconfigd can see IN6_IFF_DUPLICATED. With no handler
+registered the invoke is a no-op.
+
+The handler runs from the DAD callout inside the net epoch with the DAD
+queue lock held, so it must not sleep.
+
+Refs nextbsd/nextbsd-kernel#295. Carried out-of-tree for NextBSD.
+---
+ sys/netinet6/nd6.h     | 12 ++++++++++++
+ sys/netinet6/nd6_nbr.c |  2 ++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/sys/netinet6/nd6.h b/sys/netinet6/nd6.h
+index e484c70..551d9a9 100644
+--- a/sys/netinet6/nd6.h
++++ b/sys/netinet6/nd6.h
+@@ -183,6 +183,8 @@ struct	in6_ndifreq {
+ #define ND6_INFINITE_LIFETIME		0xffffffff
+ 
+ #ifdef _KERNEL
++#include <sys/eventhandler.h>
++
+ /* node constants */
+ #define MAX_REACHABLE_TIME		3600000	/* msec */
+ #define REACHABLE_TIME			30000	/* msec */
+@@ -394,6 +396,16 @@ void nd6_dad_init(void);
+ void nd6_dad_start(struct ifaddr *, int);
+ void nd6_dad_stop(struct ifaddr *);
+ 
++/*
++ * DAD finished for an address: duplicated is 0 when no duplicate was found
++ * and IN6_IFF_TENTATIVE was cleared, 1 when IN6_IFF_DUPLICATED was set.
++ * Invoked from the DAD callout inside the net epoch with the DAD queue lock
++ * held; handlers must not sleep.
++ * Not invoked when DAD is skipped.
++ */
++typedef void (*nd6_dad_event_fn)(void *, struct ifaddr *, int);
++EVENTHANDLER_DECLARE(nd6_dad_event, nd6_dad_event_fn);
++
+ /* nd6_rtr.c */
+ void nd6_rs_input(struct mbuf *, int, int);
+ void nd6_ra_input(struct mbuf *, int, int);
+diff --git a/sys/netinet6/nd6_nbr.c b/sys/netinet6/nd6_nbr.c
+index 29151b2..319ca0f 100644
+--- a/sys/netinet6/nd6_nbr.c
++++ b/sys/netinet6/nd6_nbr.c
+@@ -1463,6 +1463,7 @@ nd6_dad_timer(void *arg)
+ 				ia->ia6_flags &= ~IN6_IFF_TENTATIVE;
+ 				if ((ND_IFINFO(ifp)->flags & ND6_IFF_STABLEADDR) && !(ia->ia6_flags & IN6_IFF_TEMPORARY))
+ 					atomic_store_int(&DAD_FAILURES(ifp), 0);
++				EVENTHANDLER_INVOKE(nd6_dad_event, ifa, 0);
+ 			}
+ 
+ 			nd6log((LOG_DEBUG,
+@@ -1502,6 +1503,7 @@ nd6_dad_duplicated(struct ifaddr *ifa, struct dadq *dp)
+ 
+ 	ia->ia6_flags &= ~IN6_IFF_TENTATIVE;
+ 	ia->ia6_flags |= IN6_IFF_DUPLICATED;
++	EVENTHANDLER_INVOKE(nd6_dad_event, ifa, 1);
+ 
+ 	log(LOG_ERR, "%s: DAD complete for %s - duplicate found\n",
+ 	    if_name(ifp), ip6_sprintf(ip6buf, &ia->ia_addr.sin6_addr));
+-- 
+2.54.0 (Apple Git-157)
+
