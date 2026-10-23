@@ -1,0 +1,63 @@
+From 53afd1e3be05cb35329086b4f8a7968ef12321dd Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 23 Oct 2026 09:32:11 -0500
+Subject: [PATCH] NextBSD: add an arp_collision_event eventhandler for
+ duplicate IPv4 addresses
+
+in_arpinput() notices when another host sends ARP from one of our IPv4
+addresses, but only logs it through the rate-limited ARP_LOG. Invoke a
+new arp_collision_event eventhandler next to that log with the
+receiving interface, the claimed address and the sender's hardware
+address and length. The log line is unchanged.
+
+NextBSD's kernel event layer uses it to post Darwin's
+KEV_INET_ARPCOLLISION on PF_SYSTEM sockets (nextbsd/nextbsd-kernel#296).
+With no handler registered the invoke is a no-op.
+
+Refs nextbsd/nextbsd-kernel#296. Carried out-of-tree for NextBSD.
+---
+ sys/netinet/if_ether.c | 2 ++
+ sys/netinet/if_ether.h | 7 +++++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/sys/netinet/if_ether.c b/sys/netinet/if_ether.c
+index dc6ef34..e6ca27e 100644
+--- a/sys/netinet/if_ether.c
++++ b/sys/netinet/if_ether.c
+@@ -923,6 +923,8 @@ match:
+ 		ARP_LOG(LOG_ERR, "%*D is using my IP address %s on %s!\n",
+ 		   ifp->if_addrlen, (u_char *)ar_sha(ah), ":",
+ 		   inet_ntoa_r(isaddr, addrbuf), ifp->if_xname);
++		EVENTHANDLER_INVOKE(arp_collision_event, ifp, isaddr,
++		    (const u_char *)ar_sha(ah), ifp->if_addrlen);
+ 		itaddr = myaddr;
+ 		ARPSTAT_INC(dupips);
+ 		goto reply;
+diff --git a/sys/netinet/if_ether.h b/sys/netinet/if_ether.h
+index 96879d8..2db4ed1 100644
+--- a/sys/netinet/if_ether.h
++++ b/sys/netinet/if_ether.h
+@@ -108,6 +108,8 @@ struct sockaddr_inarp {
+ #define RTF_ANNOUNCE	RTF_PROTO2	/* announce new arp entry */
+ 
+ #ifdef	_KERNEL
++#include <sys/_eventhandler.h>
++
+ extern u_char	ether_ipmulticast_min[ETHER_ADDR_LEN];
+ extern u_char	ether_ipmulticast_max[ETHER_ADDR_LEN];
+ 
+@@ -121,6 +123,11 @@ void	arprequest(struct ifnet *, const struct in_addr *,
+ 	    const struct in_addr *, u_char *);
+ void	arp_ifinit(struct ifnet *, struct ifaddr *);
+ void	arp_announce_ifaddr(struct ifnet *, struct in_addr addr, u_char *);
++
++/* Another host claims one of our addresses (ifp, address, its hw address) */
++typedef void (*arp_collision_event_fn)(void *, struct ifnet *,
++    struct in_addr, const u_char *, int);
++EVENTHANDLER_DECLARE(arp_collision_event, arp_collision_event_fn);
+ #endif
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+
