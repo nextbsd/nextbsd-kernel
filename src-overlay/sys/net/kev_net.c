@@ -36,6 +36,8 @@
  *   iflladdr_event		KEV_DL_LINK_ADDRESS_CHANGED
  *   ifaddr_event_ext		KEV_INET_NEW_ADDR / ADDR_DELETED
  *   rt_addrmsg (AF_INET6)	KEV_INET6_NEW_{LL,RTADV,USER}_ADDR / ADDR_DELETED
+ *   arp_collision_event	KEV_INET_ARPCOLLISION (base patch)
+ *   inet6 ::/0 rib_subscribe	KEV_INET6_DEFROUTER
  *
  * Darwin has no PROTO_* source here, so they are synthesized at arrival and
  * departure. A rename fires departure then arrival, so it is reported as a
@@ -48,10 +50,12 @@
 
 #include "opt_inet.h"
 #include "opt_inet6.h"
+#include "opt_route.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/limits.h>
 #include <sys/ctype.h>
 #include <sys/eventhandler.h>
 #include <sys/socket.h>
@@ -65,12 +69,15 @@
 #include <net/if_private.h>
 #include <net/if_types.h>
 #include <net/route.h>
+#include <net/route/nhop.h>
+#include <net/route/route_ctl.h>
 #include <net/vnet.h>
 #include <net/net_kev.h>
 
 #include <netinet/in.h>
 #ifdef INET
 #include <netinet/in_var.h>
+#include <netinet/if_ether.h>
 #endif
 #ifdef INET6
 #include <netinet6/in6_var.h>
@@ -269,6 +276,32 @@ kev_net_inet(void *arg __unused, struct ifnet *ifp, struct ifaddr *ifa,
 }
 EVENTHANDLER_DEFINE(ifaddr_event_ext, kev_net_inet, NULL,
     EVENTHANDLER_PRI_ANY);
+
+/*
+ * Another host is using one of our addresses. The hardware address follows
+ * the struct, and the length is sizeof plus hw_len, as on Darwin. The
+ * ARP_LOG beside the hook is untouched.
+ */
+static void
+kev_net_arpcollision(void *arg __unused, struct ifnet *ifp,
+    struct in_addr addr, const u_char *hw, int hwlen)
+{
+	u_char buf[sizeof(struct kev_in_collision) + UCHAR_MAX]
+	    __aligned(sizeof(u_int32_t));
+	struct kev_in_collision *ic = (struct kev_in_collision *)buf;
+
+	if (hwlen < 0 || hwlen > UCHAR_MAX)
+		return;
+	memset(ic, 0, sizeof(*ic));
+	kev_net_fill(ifp, &ic->link_data);
+	ic->ia_ipaddr = addr;
+	ic->hw_len = (u_char)hwlen;
+	memcpy(ic->hw_addr, hw, hwlen);
+	kev_net_post(ifp, KEV_INET_SUBCLASS, KEV_INET_ARPCOLLISION, ic,
+	    sizeof(*ic) + hwlen);
+}
+EVENTHANDLER_DEFINE(arp_collision_event, kev_net_arpcollision, NULL,
+    EVENTHANDLER_PRI_ANY);
 #endif /* INET */
 
 #ifdef INET6
@@ -339,4 +372,72 @@ kev_net_inet6(void *arg __unused, struct ifaddr *ifa, int cmd)
 	kev_net_post(ifp, KEV_INET6_SUBCLASS, code, &id, sizeof(id));
 }
 EVENTHANDLER_DEFINE(rt_addrmsg, kev_net_inet6, NULL, EVENTHANDLER_PRI_ANY);
+
+/*
+ * The IPv6 default route was added, changed or removed. The payload is a
+ * kev_in6_data for the router's interface with the router in ia_addr (left
+ * zero for an interface route). Each multipath member is reported on its own.
+ */
+static void
+kev_net_defrouter_nh(const struct rib_cmd_info *rc, void *arg __unused)
+{
+	struct nhop_object *nh;
+	struct ifnet *ifp;
+	struct kev_in6_data id;
+
+	nh = rc->rc_cmd == RTM_DELETE ? rc->rc_nh_old : rc->rc_nh_new;
+	if (nh == NULL || (ifp = nh->nh_ifp) == NULL)
+		return;
+
+	memset(&id, 0, sizeof(id));
+	kev_net_fill(ifp, &id.link_data);
+	if ((nh->nh_flags & NHF_GATEWAY) != 0 &&
+	    nh->gw_sa.sa_family == AF_INET6) {
+		id.ia_addr = nh->gw6_sa;
+		kev_net_unembed(&id.ia_addr);
+	}
+	kev_net_post(ifp, KEV_INET6_SUBCLASS, KEV_INET6_DEFROUTER, &id,
+	    sizeof(id));
+}
+
+static void
+kev_net_defrouter(struct rib_head *rnh __unused, struct rib_cmd_info *rc,
+    void *arg __unused)
+{
+	struct in6_addr dst;
+	uint32_t scopeid;
+	int plen;
+
+	rt_get_inet6_prefix_plen(rc->rc_rt, &dst, &plen, &scopeid);
+	if (plen != 0)
+		return;
+#ifdef ROUTE_MPATH
+	if ((rc->rc_cmd != RTM_DELETE && NH_IS_NHGRP(rc->rc_nh_new)) ||
+	    (rc->rc_cmd != RTM_ADD && NH_IS_NHGRP(rc->rc_nh_old))) {
+		rib_decompose_notification(rc, kev_net_defrouter_nh, NULL);
+		return;
+	}
+#endif
+	kev_net_defrouter_nh(rc, NULL);
+}
+
+/*
+ * Subscribe to every inet6 FIB of each vnet once its tables exist. FIBs
+ * added later through net.fibs are not covered. The subscriptions are
+ * freed with the tables when the vnet goes away.
+ */
+static void
+kev_net_defrouter_init(const void *unused __unused)
+{
+	struct rib_head *rnh;
+
+	for (uint32_t fib = 0; fib < V_rt_numfibs; fib++) {
+		rnh = rt_tables_get_rnh_safe(fib, AF_INET6);
+		if (rnh != NULL)
+			(void)rib_subscribe_internal(rnh, kev_net_defrouter,
+			    NULL, RIB_NOTIFY_DELAYED, true);
+	}
+}
+VNET_SYSINIT(kev_net_defrouter_init, SI_SUB_PROTO_DOMAIN, SI_ORDER_ANY,
+    kev_net_defrouter_init, NULL);
 #endif /* INET6 */
