@@ -34,6 +34,7 @@
  *				then IF_DETACHED
  *   ifnet_link_event		KEV_DL_LINK_ON / LINK_OFF (UNKNOWN is skipped)
  *   iflladdr_event		KEV_DL_LINK_ADDRESS_CHANGED
+ *   rt_ifmsg_event		KEV_DL_SIFFLAGS / SIFMTU (patched into rt_ifmsg)
  *   ifaddr_event_ext		KEV_INET_NEW_ADDR / ADDR_DELETED
  *   rt_addrmsg (AF_INET6)	KEV_INET6_NEW_{LL,RTADV,USER}_ADDR / ADDR_DELETED
  *   arp_collision_event	KEV_INET_ARPCOLLISION (base patch)
@@ -58,6 +59,9 @@
 #include <sys/limits.h>
 #include <sys/ctype.h>
 #include <sys/eventhandler.h>
+#include <sys/lock.h>
+#include <sys/malloc.h>
+#include <sys/mutex.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/kern_event.h>
@@ -244,6 +248,125 @@ kev_net_lladdr(void *arg __unused, struct ifnet *ifp)
 }
 EVENTHANDLER_DEFINE(iflladdr_event, kev_net_lladdr, NULL,
     EVENTHANDLER_PRI_ANY);
+
+/*
+ * KEV_DL_SIFFLAGS / KEV_DL_SIFMTU, nextbsd-kernel#294. rt_ifmsg() fires on
+ * a flag change (if_up/if_down, if_setflag), on an MTU change and on a link
+ * state change; the last two both pass mask 0. Keep the last-seen flags and
+ * MTU per if_index and post only what actually moved, so a link change
+ * alone posts nothing here (ifnet_link_event covers it). The cache is
+ * seeded at arrival and dropped at departure, so a reused index starts
+ * fresh. An index with no entry (allocation failed) falls back to the mask.
+ */
+struct kev_net_ifstate {
+	int		valid;
+	int		flags;
+	u_long		mtu;
+};
+
+static MALLOC_DEFINE(M_KEVNET, "kev_net", "kernel event interface state");
+static struct mtx kev_net_ifs_mtx;
+MTX_SYSINIT(kev_net_ifs, &kev_net_ifs_mtx, "kev_net ifstate", MTX_DEF);
+static struct kev_net_ifstate *kev_net_ifs;
+static u_int kev_net_nifs;
+
+/* Return the entry for idx, growing the table if needed; NULL on failure. */
+static struct kev_net_ifstate *
+kev_net_ifstate(u_int idx)
+{
+	struct kev_net_ifstate *n;
+	u_int cnt;
+
+	mtx_assert(&kev_net_ifs_mtx, MA_OWNED);
+	if (idx < kev_net_nifs)
+		return (&kev_net_ifs[idx]);
+	for (cnt = MAX(kev_net_nifs, 16); cnt <= idx; cnt *= 2)
+		;
+	n = malloc(cnt * sizeof(*n), M_KEVNET, M_NOWAIT | M_ZERO);
+	if (n == NULL)
+		return (NULL);
+	if (kev_net_ifs != NULL) {
+		memcpy(n, kev_net_ifs, kev_net_nifs * sizeof(*n));
+		free(kev_net_ifs, M_KEVNET);
+	}
+	kev_net_ifs = n;
+	kev_net_nifs = cnt;
+	return (&kev_net_ifs[idx]);
+}
+
+static void
+kev_net_ifs_seed(void *arg __unused, struct ifnet *ifp)
+{
+	struct kev_net_ifstate *st;
+
+	mtx_lock(&kev_net_ifs_mtx);
+	st = kev_net_ifstate(ifp->if_index);
+	if (st != NULL) {
+		st->valid = 1;
+		st->flags = ifp->if_flags;
+		st->mtu = ifp->if_mtu;
+	}
+	mtx_unlock(&kev_net_ifs_mtx);
+}
+
+static void
+kev_net_ifs_drop(void *arg __unused, struct ifnet *ifp)
+{
+
+	mtx_lock(&kev_net_ifs_mtx);
+	if (ifp->if_index < kev_net_nifs)
+		kev_net_ifs[ifp->if_index].valid = 0;
+	mtx_unlock(&kev_net_ifs_mtx);
+}
+
+static void
+kev_net_ifmsg(void *arg __unused, struct ifnet *ifp, int mask)
+{
+	struct kev_net_ifstate *st;
+	int flags, sflags, smtu;
+	u_long mtu;
+
+	flags = ifp->if_flags;
+	mtu = ifp->if_mtu;
+	mtx_lock(&kev_net_ifs_mtx);
+	st = kev_net_ifstate(ifp->if_index);
+	if (st != NULL && st->valid) {
+		sflags = (st->flags != flags);
+		smtu = (st->mtu != mtu);
+	} else {
+		sflags = (mask != 0);
+		smtu = 0;
+	}
+	if (st != NULL) {
+		st->valid = 1;
+		st->flags = flags;
+		st->mtu = mtu;
+	}
+	mtx_unlock(&kev_net_ifs_mtx);
+
+	if (sflags)
+		kev_net_dl(ifp, KEV_DL_SIFFLAGS);
+	if (smtu)
+		kev_net_dl(ifp, KEV_DL_SIFMTU);
+}
+
+/*
+ * Registered by hand: EVENTHANDLER_DEFINE names its tag and SYSINIT after
+ * the event, so a second arrival/departure handler here cannot use it.
+ */
+static void
+kev_net_ifmsg_init(void *arg __unused)
+{
+
+	EVENTHANDLER_REGISTER(ifnet_arrival_event, kev_net_ifs_seed, NULL,
+	    EVENTHANDLER_PRI_ANY);
+	EVENTHANDLER_REGISTER(ifnet_departure_event, kev_net_ifs_drop, NULL,
+	    EVENTHANDLER_PRI_ANY);
+	EVENTHANDLER_REGISTER(rt_ifmsg_event, kev_net_ifmsg, NULL,
+	    EVENTHANDLER_PRI_ANY);
+}
+SYSINIT(kev_net_ifmsg, SI_SUB_CONFIGURE, SI_ORDER_ANY, kev_net_ifmsg_init,
+    NULL);
 
 #ifdef INET
 /*

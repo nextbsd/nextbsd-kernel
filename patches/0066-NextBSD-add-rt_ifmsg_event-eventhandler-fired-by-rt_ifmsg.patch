@@ -1,0 +1,58 @@
+From 76053eaf514daa98a76dca7fd6bd8e8def3fb026 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 23 Oct 2026 09:27:44 -0500
+Subject: [PATCH] NextBSD: add an rt_ifmsg_event eventhandler fired by
+ rt_ifmsg()
+
+rt_ifmsg() announces interface flag, MTU and link state changes, but
+only to rtsock (RTM_IFINFO) and netlink. Invoke a new rt_ifmsg_event
+eventhandler there as well, with the same ifp and if_flags_mask, so
+kernel subsystems can react without a routing socket.
+
+NextBSD's kernel events (net/kev_net.c) use it to post Darwin's
+KEV_DL_SIFFLAGS and KEV_DL_SIFMTU on the PF_SYSTEM event socket
+(nextbsd/nextbsd-kernel#294). The list is defined in route.c and
+invoked directly, so with no handler registered it is a no-op.
+
+Refs nextbsd/nextbsd-kernel#294. Carried out-of-tree for NextBSD.
+---
+ sys/net/if_var.h | 3 +++
+ sys/net/route.c  | 2 ++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/sys/net/if_var.h b/sys/net/if_var.h
+index 961259b..d4784f5 100644
+--- a/sys/net/if_var.h
++++ b/sys/net/if_var.h
+@@ -375,6 +375,9 @@ EVENTHANDLER_DECLARE(ifnet_link_event, ifnet_link_event_handler_t);
+ 
+ typedef void (*ifnet_event_fn)(void *, if_t ifp, int event);
+ EVENTHANDLER_DECLARE(ifnet_event, ifnet_event_fn);
++/* rt_ifmsg(): interface flags or MTU changed, or link state (mask 0) */
++typedef void (*rt_ifmsg_event_handler_t)(void *, if_t, int);
++EVENTHANDLER_DECLARE(rt_ifmsg_event, rt_ifmsg_event_handler_t);
+ 
+ /*
+  * interface groups
+diff --git a/sys/net/route.c b/sys/net/route.c
+index d2c9f3e..5ee4338 100644
+--- a/sys/net/route.c
++++ b/sys/net/route.c
+@@ -80,6 +80,7 @@ SYSCTL_VNET_PCPUSTAT(_net_route, OID_AUTO, stats, struct rtstat,
+     rtstat, "route statistics");
+ 
+ EVENTHANDLER_LIST_DEFINE(rt_addrmsg);
++EVENTHANDLER_LIST_DEFINE(rt_ifmsg_event);
+ 
+ static int rt_ifdelroute(const struct rtentry *rt, const struct nhop_object *,
+     void *arg);
+@@ -702,5 +703,6 @@ rt_ifmsg(struct ifnet *ifp, int if_flags_mask)
+ {
+ 	rtsock_callback_p->ifmsg_f(ifp, if_flags_mask);
+ 	netlink_callback_p->ifmsg_f(ifp, if_flags_mask);
++	EVENTHANDLER_DIRECT_INVOKE(rt_ifmsg_event, ifp, if_flags_mask);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
