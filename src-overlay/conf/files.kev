@@ -1,0 +1,10 @@
+# NextBSD kernel events -- the Darwin PF_SYSTEM domain and its SYSPROTO_EVENT
+# socket (net/kern_event_sock.c), fed by the interface and address
+# EVENTHANDLERs (net/kev_net.c), nextbsd-kernel#293. Self-registering domain
+# and handlers, no base patch; `standard` (always compiled), and inert until a
+# socket sets a filter. Sources are laid into /usr/src/sys by the overlay cp in
+# build.yml. KERNEL build only -- the modules build shares patches/series but
+# not the overlay or these fragments (same rule as vfs_pivot). Never name
+# these kern/kern_event*.c: build.yml appends to the base kern/kern_event.c.
+net/kern_event_sock.c		standard
+net/kev_net.c			standard
