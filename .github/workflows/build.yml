@@ -208,11 +208,14 @@ jobs:
       # shares the series but does not lay in the overlay, so it must never see
       # this source listed in sys/conf/files. It hangs hw.iokit.registry off the
       # shared hw.iokit node defined (now non-static) by iokit_catalogue.c.
+      # The same fragment lists dev/iokit/iokit_hid.c (`optional evdev`, #335),
+      # which publishes evdev input nodes as IOHIDDevice entries.
       - name: Wire in-kernel IORegistry (K1, #214)
         run: |
           set -eu
           cat "$GITHUB_WORKSPACE/src-overlay/conf/files.ioregistry" >> /usr/src/sys/conf/files
           test -f /usr/src/sys/dev/iokit/iokit_registry.c
+          test -f /usr/src/sys/dev/iokit/iokit_hid.c
           test -f /usr/src/sys/sys/ioregistry.h
           echo "==> ioregistry wired: $(grep -c 'dev/iokit/iokit_registry.c' /usr/src/sys/conf/files) entry; source + header present"
 
