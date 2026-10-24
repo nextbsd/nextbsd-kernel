@@ -216,6 +216,7 @@ jobs:
           cat "$GITHUB_WORKSPACE/src-overlay/conf/files.ioregistry" >> /usr/src/sys/conf/files
           test -f /usr/src/sys/dev/iokit/iokit_registry.c
           test -f /usr/src/sys/dev/iokit/iokit_hid.c
+          test -f /usr/src/sys/dev/iokit/iokit_drm.c
           test -f /usr/src/sys/sys/ioregistry.h
           echo "==> ioregistry wired: $(grep -c 'dev/iokit/iokit_registry.c' /usr/src/sys/conf/files) entry; source + header present"
 

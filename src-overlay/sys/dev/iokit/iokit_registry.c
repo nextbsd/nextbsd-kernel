@@ -65,6 +65,11 @@ extern void iokit_notify_release_port(void *port);
 extern int iokit_notify_send(void *port_ref, uint32_t kind, uint64_t id,
     const char *name, const char *classname, uint32_t pci_vendor,
     uint32_t pci_device);
+extern int iokit_notify_send_interest(void *port_ref, uint32_t message,
+    uint64_t id, uint64_t arg0, uint64_t arg1, const char *devnode);
+
+/* Darwin's kIOMessageServiceIsTerminated; == IOKIT_NOTIFY_MSG_* there. */
+#define	IOREG_MSG_SERVICE_IS_TERMINATED	0xe0000010
 #endif
 
 static MALLOC_DEFINE(M_IOREG, "ioregistry", "in-kernel IOKit registry id map");
@@ -141,18 +146,26 @@ static uint64_t ioreg_next_id = 1;	/* 0 is reserved as "invalid" */
  * emission never contends the id map — but the Mach send is NEVER done while
  * holding it (the send is performed on a snapshot after the lock is dropped;
  * see ioreg_emit_event).
+ *
+ * An interest watch (#338, IOREGIOCINTEREST) shares the list: `target` is the
+ * one entry it follows and `mask` is 0, so the match/terminate pass never
+ * selects it. It receives ioreg_message_device() messages for `target`, and
+ * kIOMessageServiceIsTerminated when `target` departs, after which it is
+ * dropped. Match watches have target == 0.
  */
 struct ioreg_watch {
 	TAILQ_ENTRY(ioreg_watch) link;
 	struct ioreg_criteria criteria;	/* flat match criteria (by value) */
 	uint32_t	mask;		/* OR of IOREG_EVENT_* to deliver */
 	void		*port;		/* opaque retained send right */
+	uint64_t	target;		/* interest watch: entry id; else 0 */
 };
 static TAILQ_HEAD(, ioreg_watch) ioreg_watches =
     TAILQ_HEAD_INITIALIZER(ioreg_watches);
 static struct sx ioreg_watch_lock;
 SX_SYSINIT(ioreg_watch_lock, &ioreg_watch_lock, "ioregwatch");
 static u_int ioreg_watch_count;		/* # registered watches (debug) */
+static u_int ioreg_interest_count;	/* # of those that are interest */
 
 /* ---- id map helpers (all callers hold ioreg_lock) ---- */
 
@@ -1020,7 +1033,7 @@ ioreg_emit_event_node(const struct ioreg_node *n, const char *desc __unused,
 {
 #ifdef COMPAT_MACH
 	struct ioreg_watch *w, *tw;
-	struct { void *ref; } *snap;
+	struct { void *ref; bool term; } *snap;
 	u_int nsnap, cap, i;
 
 	/* Cheap, racy early-out: skip the alloc+lock when no watch is registered
@@ -1041,6 +1054,25 @@ ioreg_emit_event_node(const struct ioreg_node *n, const char *desc __unused,
 		if (iokit_notify_port_dead(w->port)) {
 			TAILQ_REMOVE(&ioreg_watches, w, link);
 			ioreg_watch_count--;
+			if (w->target != 0)
+				ioreg_interest_count--;
+			ioreg_watch_free(w);
+			continue;
+		}
+		/* An interest watch (#338) only hears its target's departure:
+		 * hand its stored send right to pass 2 for a final
+		 * kIOMessageServiceIsTerminated and drop the watch. */
+		if (w->target != 0) {
+			if (kind != IOREG_EVENT_DEPART || w->target != n->id ||
+			    nsnap >= cap)
+				continue;
+			TAILQ_REMOVE(&ioreg_watches, w, link);
+			ioreg_watch_count--;
+			ioreg_interest_count--;
+			snap[nsnap].ref = w->port;
+			snap[nsnap].term = true;
+			nsnap++;
+			w->port = NULL;
 			ioreg_watch_free(w);
 			continue;
 		}
@@ -1053,15 +1085,22 @@ ioreg_emit_event_node(const struct ioreg_node *n, const char *desc __unused,
 		if (nsnap >= cap)	/* list can't grow under the xlock */
 			break;
 		snap[nsnap].ref = iokit_notify_copy_port(w->port);
+		snap[nsnap].term = false;
 		if (snap[nsnap].ref != NULL)
 			nsnap++;
 	}
 	sx_xunlock(&ioreg_watch_lock);
 
-	/* Pass 2: send with no lock held. iokit_notify_send consumes each ref. */
-	for (i = 0; i < nsnap; i++)
-		(void)iokit_notify_send(snap[i].ref, kind, n->id, n->name,
-		    n->classname, n->pci_vendor, n->pci_device);
+	/* Pass 2: send with no lock held. Both senders consume each ref. */
+	for (i = 0; i < nsnap; i++) {
+		if (snap[i].term)
+			(void)iokit_notify_send_interest(snap[i].ref,
+			    IOREG_MSG_SERVICE_IS_TERMINATED, n->id, 0, 0, NULL);
+		else
+			(void)iokit_notify_send(snap[i].ref, kind, n->id,
+			    n->name, n->classname, n->pci_vendor,
+			    n->pci_device);
+	}
 
 	free(snap, M_IOREG);
 #else
@@ -1137,6 +1176,133 @@ ioreg_test_event(struct ioreg_test_event *te)
 }
 
 /*
+ * IOREGIOCINTEREST (#338): register an interest watch on one live entry. The
+ * port is resolved first (no registry lock held). The liveness check and the
+ * insertion then happen under the watch lock, which every departure takes
+ * after marking its entry detached, so a departure either fails the check
+ * (ENOENT) or finds the watch and terminates it. Lock order: watch lock, then
+ * ioreg_lock; nothing takes them the other way round (emission always drops
+ * ioreg_lock first).
+ */
+static int
+ioreg_interest_register(struct ioreg_interest_reg *ir)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_watch *w;
+	struct ioreg_ent *e;
+	void *port = NULL;
+	bool live;
+	int error;
+
+	if (ir->notify_port == 0 || ir->interest != IOREG_INTEREST_GENERAL)
+		return (EINVAL);
+	if (ir->id == 0)
+		return (ENOENT);
+
+	error = iokit_notify_copyin_port(ir->notify_port, &port);
+	if (error != 0)
+		return (error);
+
+	w = malloc(sizeof(*w), M_IOREG, M_WAITOK | M_ZERO);
+	w->port = port;
+	w->target = ir->id;
+
+	sx_xlock(&ioreg_watch_lock);
+	sx_slock(&ioreg_lock);
+	e = ioreg_find_id_locked(ir->id);
+	live = (e != NULL && e->state == IOREG_STATE_LIVE);
+	sx_sunlock(&ioreg_lock);
+	if (live) {
+		TAILQ_INSERT_TAIL(&ioreg_watches, w, link);
+		ioreg_watch_count++;
+		ioreg_interest_count++;
+		w = NULL;
+	}
+	sx_xunlock(&ioreg_watch_lock);
+	if (w != NULL) {
+		ioreg_watch_free(w);	/* releases the send right */
+		return (ENOENT);
+	}
+	return (0);
+#else
+	(void)ir;
+	return (ENOSYS);
+#endif
+}
+
+#ifdef COMPAT_MACH
+/*
+ * Send `message` to every interest watch on entry `id`, pruning dead ones on
+ * the way. Same two-pass discipline as ioreg_emit_event_node: snapshot send
+ * refs under the watch lock, send with no lock held.
+ */
+static void
+ioreg_message_id(uint64_t id, uint32_t message, uint64_t arg0, uint64_t arg1,
+    const char *devnode)
+{
+	struct ioreg_watch *w, *tw;
+	void **snap;
+	u_int nsnap, cap, i;
+
+	sx_xlock(&ioreg_watch_lock);
+	cap = ioreg_interest_count;
+	if (cap == 0) {
+		sx_xunlock(&ioreg_watch_lock);
+		return;
+	}
+	snap = malloc((size_t)cap * sizeof(*snap), M_IOREG, M_WAITOK);
+	nsnap = 0;
+	TAILQ_FOREACH_SAFE(w, &ioreg_watches, link, tw) {
+		if (w->target == 0)
+			continue;
+		if (iokit_notify_port_dead(w->port)) {
+			TAILQ_REMOVE(&ioreg_watches, w, link);
+			ioreg_watch_count--;
+			ioreg_interest_count--;
+			ioreg_watch_free(w);
+			continue;
+		}
+		if (w->target != id || nsnap >= cap)
+			continue;
+		snap[nsnap] = iokit_notify_copy_port(w->port);
+		if (snap[nsnap] != NULL)
+			nsnap++;
+	}
+	sx_xunlock(&ioreg_watch_lock);
+
+	for (i = 0; i < nsnap; i++)
+		(void)iokit_notify_send_interest(snap[i], message, id, arg0,
+		    arg1, devnode);
+	free(snap, M_IOREG);
+}
+#endif
+
+/*
+ * ioreg_message_device: see sys/ioregistry.h. `dev` is only compared against
+ * the map, so a stale pointer from a queued producer is harmless.
+ */
+void
+ioreg_message_device(device_t dev, uint32_t message, uint64_t arg0,
+    uint64_t arg1, const char *devnode)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_ent *e;
+	uint64_t id;
+
+	if (dev == NULL || ioreg_interest_count == 0)
+		return;
+	sx_slock(&ioreg_lock);
+	e = ioreg_find_dev_locked(dev);
+	id = (e != NULL && e->state == IOREG_STATE_LIVE) ? e->id : 0;
+	sx_sunlock(&ioreg_lock);
+	if (id != 0)
+		ioreg_message_id(id, message, arg0, arg1, devnode);
+#else
+	(void)dev; (void)message; (void)arg0; (void)arg1; (void)devnode;
+#endif
+}
+
+/*
  * Drop every registered watch (releasing its send right + criteria). Called at
  * MOD_UNLOAD so the module can be unloaded without leaking ipc_port_t refs.
  */
@@ -1151,6 +1317,7 @@ ioreg_watch_flush(void)
 		ioreg_watch_free(w);
 	}
 	ioreg_watch_count = 0;
+	ioreg_interest_count = 0;
 	sx_xunlock(&ioreg_watch_lock);
 }
 
@@ -1183,6 +1350,9 @@ ioreg_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		return (ioreg_watch_register((struct ioreg_watch_reg *)data, td));
 	case IOREGIOCTESTEVENT:
 		return (ioreg_test_event((struct ioreg_test_event *)data));
+	case IOREGIOCINTEREST:
+		return (ioreg_interest_register(
+		    (struct ioreg_interest_reg *)data));
 	default:
 		return (ENOTTY);
 	}

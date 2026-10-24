@@ -182,3 +182,57 @@ iokit_notify_send(void *vport_ref, uint32_t kind, uint64_t id,
 	ipc_mqueue_send_always(kmsg);
 	return (0);
 }
+
+/*
+ * Build and push one ioreg_interest_msg (#338), CONSUMING `vport_ref` exactly
+ * as iokit_notify_send does. Same returns: 0 on send, ENXIO for a dead port,
+ * ENOMEM on kmsg exhaustion; the ref is released in every case.
+ */
+int
+iokit_notify_send_interest(void *vport_ref, uint32_t message, uint64_t id,
+    uint64_t arg0, uint64_t arg1, const char *devnode)
+{
+	ipc_port_t port = (ipc_port_t)vport_ref;
+	ipc_kmsg_t kmsg;
+	ioreg_interest_msg *m;
+
+	if (!IP_VALID(port))
+		return (ENXIO);
+	if (!ip_active(port)) {
+		ipc_port_release_send(port);
+		return (ENXIO);
+	}
+
+	kmsg = ikm_alloc(sizeof *m);
+	if (kmsg == IKM_NULL) {
+		ipc_port_release_send(port);
+		return (ENOMEM);
+	}
+	ikm_init(kmsg, sizeof *m);
+	m = (ioreg_interest_msg *) kmsg->ikm_header;
+
+	m->hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_PORT_SEND, 0);
+	m->hdr.msgh_local_port = MACH_PORT_NULL;
+	m->hdr.msgh_remote_port = (mach_port_t) port;	/* ref consumed by send */
+	m->hdr.msgh_voucher_port = 0;
+	m->hdr.msgh_id = IOKIT_NOTIFY_INTEREST_MSGID;
+	m->hdr.msgh_size = (mach_msg_size_t)
+	    (sizeof(*m) - sizeof(mach_msg_format_0_trailer_t));
+	m->NDR = NDR_record;
+
+	m->message = message;
+	m->_pad = 0;
+	m->id = id;
+	m->argument[0] = arg0;
+	m->argument[1] = arg1;
+	notify_strcopy(m->devnode, devnode, sizeof m->devnode);
+
+	/* Initialize the trailer (see file header / PR#18). */
+	m->trailer.msgh_seqno = 0;
+	m->trailer.msgh_sender = KERNEL_SECURITY_TOKEN;
+	m->trailer.msgh_trailer_type = MACH_MSG_TRAILER_FORMAT_0;
+	m->trailer.msgh_trailer_size = MACH_MSG_TRAILER_MINIMUM_SIZE;
+
+	ipc_mqueue_send_always(kmsg);
+	return (0);
+}

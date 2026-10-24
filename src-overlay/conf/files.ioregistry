@@ -11,3 +11,9 @@ dev/iokit/iokit_registry.c	standard
 # because it subscribes to evdev's evdev_registered / evdev_unregistering
 # eventhandlers (patches/0068) and calls evdev_foreach().
 dev/iokit/iokit_hid.c		optional evdev
+# DRM -> IORegistry bridge (#338): turns drm-kmod's drm_connector_hotplug
+# eventhandler (graphics/drm-kmod-patches in nextbsd-kernel-extensions) into
+# kIOMessageServicePropertyChange interest messages on the GPU's entry.
+# `standard`: drm.ko is a kext that invokes the eventhandler by name, so
+# nothing here links against it.
+dev/iokit/iokit_drm.c		standard
