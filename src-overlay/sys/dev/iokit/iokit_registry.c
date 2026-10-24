@@ -15,6 +15,13 @@
  * so an in-flight userland iterator never dangles (mirrors hwregd's
  * linger-until-unreferenced semantics).
  *
+ * Virtual entries (#333): an in-kernel producer can also publish entries that
+ * have no device_t (ioreg_publish_virtual / ioreg_retire_virtual, declared in
+ * sys/ioregistry.h). These are the one exception to "no shadow tree": the
+ * registry keeps a snapshot for each (struct ioreg_virt) and lists it next to
+ * the newbus children of its parent. Entries with no driver parent hang off a
+ * synthetic IOResources node under the root, as on Darwin.
+ *
  * See sys/sys/ioregistry.h and the design in
  * pkgdemon.github.io/nextbsd-inkernel-iokit-feasibility.html.
  */
@@ -64,19 +71,54 @@ static MALLOC_DEFINE(M_IOREG, "ioregistry", "in-kernel IOKit registry id map");
 #define	IOREG_MAX_DEPTH	64
 
 /*
- * The device_t -> stable id map. Entries live as long as the device, then
- * linger (state == IOREG_STATE_DETACHED) so userland ids don't dangle. They are
- * reclaimed only at MOD_UNLOAD; the live device population bounds the table, and
- * detached entries are rare and small, so an unbounded linger is acceptable for
- * a read-only debug/introspection facility (a later PR can age them out).
+ * The stable id map. A NEWBUS entry lives as long as its device, then lingers
+ * (state == IOREG_STATE_DETACHED) so userland ids don't dangle; those are
+ * reclaimed only at MOD_UNLOAD (the live device population bounds them, and
+ * detached newbus entries are rare and small).
+ *
+ * A VIRTUAL entry (#333) has no device_t; `virt` holds its snapshot. Virtual
+ * entries are also on one of two side lists: ioreg_virt_live while published
+ * (so a children/lookup/dump walk scans only virtual entries, not the whole
+ * map) and ioreg_virt_linger, oldest first, once retired. Producers such as
+ * uinput can churn (one entry per Bluetooth reconnect), so lingering virtual
+ * entries are freed oldest-first past IOREG_VIRT_LINGER_MAX; a freed id then
+ * returns ENOENT. Ids are never reused.
+ *
+ * Everything here, including each snapshot and its property bag, is guarded
+ * by ioreg_lock.
  */
+#define	IOREG_KIND_NEWBUS	0
+#define	IOREG_KIND_VIRTUAL	1
+
+#define	IOREG_VIRT_LINGER_MAX	256
+
+/* Darwin's IOResources: the default parent of driverless entries. Its path is
+ * fixed because the root bus is always root0. */
+#define	IOREG_RESOURCES_NAME	"IOResources"
+#define	IOREG_RESOURCES_PATH	"/root0/IOResources"
+
+struct ioreg_virt {
+	struct ioreg_node node;		/* snapshot: parent_id, name, class, path */
+	nvlist_t	*props;		/* extra keys, owned; may be NULL */
+	bool		permanent;	/* IOResources: never retired */
+};
+
 struct ioreg_ent {
 	LIST_ENTRY(ioreg_ent) link;
-	device_t	dev;		/* NULL once detached */
+	TAILQ_ENTRY(ioreg_ent) vlink;	/* VIRTUAL: live or linger list */
+	device_t	dev;		/* NEWBUS: NULL once detached */
+	struct ioreg_virt *virt;	/* VIRTUAL: snapshot */
 	uint64_t	id;		/* stable, never reused */
 	int		state;		/* IOREG_STATE_* */
+	int		kind;		/* IOREG_KIND_* */
 };
 static LIST_HEAD(, ioreg_ent) ioreg_map = LIST_HEAD_INITIALIZER(ioreg_map);
+static TAILQ_HEAD(, ioreg_ent) ioreg_virt_live =
+    TAILQ_HEAD_INITIALIZER(ioreg_virt_live);
+static TAILQ_HEAD(, ioreg_ent) ioreg_virt_linger =
+    TAILQ_HEAD_INITIALIZER(ioreg_virt_linger);
+static u_int ioreg_virt_nlinger;
+static struct ioreg_ent *ioreg_resources;	/* created on first use */
 static struct sx ioreg_lock;
 SX_SYSINIT(ioreg_lock, &ioreg_lock, "ioregistry");
 static uint64_t ioreg_next_id = 1;	/* 0 is reserved as "invalid" */
@@ -116,7 +158,7 @@ ioreg_find_dev_locked(device_t dev)
 
 	sx_assert(&ioreg_lock, SX_LOCKED);
 	LIST_FOREACH(e, &ioreg_map, link)
-		if (e->dev == dev)
+		if (e->kind == IOREG_KIND_NEWBUS && e->dev == dev)
 			return (e);
 	return (NULL);
 }
@@ -155,8 +197,179 @@ ioreg_id_for_locked(device_t dev)
 	e->dev = dev;
 	e->id = ioreg_next_id++;
 	e->state = IOREG_STATE_LIVE;
+	e->kind = IOREG_KIND_NEWBUS;
 	LIST_INSERT_HEAD(&ioreg_map, e, link);
 	return (e->id);
+}
+
+/*
+ * The root device_t: root0, or (should the devclass be missing) the top of
+ * any live newbus entry's ancestry. Virtual and detached entries have no
+ * device_t, so the fallback skips them.
+ */
+static device_t
+ioreg_root_dev(void)
+{
+	struct ioreg_ent *e;
+	device_t d;
+
+	d = devclass_get_device(devclass_find("root"), 0);
+	if (d != NULL)
+		return (d);
+	sx_xlock(&ioreg_lock);
+	LIST_FOREACH(e, &ioreg_map, link) {
+		if (e->kind == IOREG_KIND_NEWBUS && e->dev != NULL) {
+			d = e->dev;
+			break;
+		}
+	}
+	sx_xunlock(&ioreg_lock);
+	if (d == NULL)
+		return (NULL);
+	for (; device_get_parent(d) != NULL; d = device_get_parent(d))
+		;
+	return (d);
+}
+
+/* ---- virtual entries (#333; all helpers run under the ioreg_lock xlock) ---- */
+
+/*
+ * IOResources may be created before root0 exists (a producer's early SYSINIT
+ * can race the root bus module, both at SI_SUB_DRIVERS/SI_ORDER_FIRST). It is
+ * then parented on first query, once root0 is there.
+ */
+static void
+ioreg_resources_link_locked(void)
+{
+	device_t root;
+
+	sx_assert(&ioreg_lock, SX_XLOCKED);
+	if (ioreg_resources == NULL ||
+	    ioreg_resources->virt->node.parent_id != 0)
+		return;
+	root = devclass_get_device(devclass_find("root"), 0);
+	if (root != NULL)
+		ioreg_resources->virt->node.parent_id =
+		    ioreg_id_for_locked(root);
+}
+
+/* Fill a node descriptor from a virtual entry's snapshot. */
+static void
+ioreg_virt_fill_node_locked(struct ioreg_ent *e, struct ioreg_node *n)
+{
+	sx_assert(&ioreg_lock, SX_XLOCKED);
+	if (e == ioreg_resources)
+		ioreg_resources_link_locked();
+	*n = e->virt->node;
+	n->id = e->id;
+	n->state = e->state;
+	n->devstate = (e->state == IOREG_STATE_LIVE) ? DS_ATTACHED :
+	    DS_NOTPRESENT;
+}
+
+/*
+ * Return the ids of the live virtual children of `pid` as an M_IOREG array
+ * (NULL when there are none; the caller frees it), count in *np.
+ */
+static uint64_t *
+ioreg_virt_children_locked(uint64_t pid, int *np)
+{
+	struct ioreg_ent *e;
+	uint64_t *ids;
+	int n, i;
+
+	sx_assert(&ioreg_lock, SX_XLOCKED);
+	*np = 0;
+	if (TAILQ_EMPTY(&ioreg_virt_live))
+		return (NULL);
+	ioreg_resources_link_locked();
+	n = 0;
+	TAILQ_FOREACH(e, &ioreg_virt_live, vlink)
+		if (e->virt->node.parent_id == pid)
+			n++;
+	if (n == 0)
+		return (NULL);
+	ids = malloc((size_t)n * sizeof(uint64_t), M_IOREG, M_WAITOK);
+	i = 0;
+	TAILQ_FOREACH(e, &ioreg_virt_live, vlink)
+		if (e->virt->node.parent_id == pid && i < n)
+			ids[i++] = e->id;
+	*np = i;
+	return (ids);
+}
+
+/*
+ * Insert a live virtual entry. `props` (may be NULL) is owned by the entry
+ * from here on. The path is the parent's path plus "/name".
+ */
+static struct ioreg_ent *
+ioreg_virt_insert_locked(uint64_t pid, const char *ppath, const char *name,
+    const char *classname, nvlist_t *props, bool permanent)
+{
+	struct ioreg_ent *e;
+	struct ioreg_node *n;
+
+	sx_assert(&ioreg_lock, SX_XLOCKED);
+	e = malloc(sizeof(*e), M_IOREG, M_WAITOK | M_ZERO);
+	e->virt = malloc(sizeof(*e->virt), M_IOREG, M_WAITOK | M_ZERO);
+	e->id = ioreg_next_id++;
+	e->state = IOREG_STATE_LIVE;
+	e->kind = IOREG_KIND_VIRTUAL;
+	e->virt->props = props;
+	e->virt->permanent = permanent;
+	n = &e->virt->node;
+	n->parent_id = pid;
+	strlcpy(n->name, name, sizeof(n->name));
+	strlcpy(n->classname, classname, sizeof(n->classname));
+	if (strcmp(ppath, "/") == 0)
+		ppath = "";
+	snprintf(n->path, sizeof(n->path), "%s/%s", ppath, name);
+	LIST_INSERT_HEAD(&ioreg_map, e, link);
+	TAILQ_INSERT_TAIL(&ioreg_virt_live, e, vlink);
+	return (e);
+}
+
+/* Free a virtual entry that is already off the map and the side lists. */
+static void
+ioreg_virt_free(struct ioreg_ent *e)
+{
+	if (e->virt->props != NULL)
+		nvlist_destroy(e->virt->props);
+	free(e->virt, M_IOREG);
+	free(e, M_IOREG);
+}
+
+/*
+ * Copy a producer's extra keys into a property bag. The registry's own keys
+ * win; only the types libIOKit converts (string, number, bool) are copied.
+ */
+static void
+ioreg_bag_merge(nvlist_t *bag, const nvlist_t *extra)
+{
+	const char *key;
+	void *cookie;
+	int type;
+
+	cookie = NULL;
+	while ((key = nvlist_next(extra, &type, &cookie)) != NULL) {
+		if (nvlist_exists(bag, key))
+			continue;
+		switch (type) {
+		case NV_TYPE_STRING:
+			nvlist_add_string(bag, key,
+			    nvlist_get_string(extra, key));
+			break;
+		case NV_TYPE_NUMBER:
+			nvlist_add_number(bag, key,
+			    nvlist_get_number(extra, key));
+			break;
+		case NV_TYPE_BOOL:
+			nvlist_add_bool(bag, key, nvlist_get_bool(extra, key));
+			break;
+		default:
+			break;
+		}
+	}
 }
 
 /* ---- newbus accessors -> ioreg_node ---- */
@@ -299,22 +512,12 @@ ioreg_build_bag(device_t dev, uint64_t id, uint64_t parent_id, int state)
 static int
 ioreg_get_root(uint64_t *out)
 {
-	device_t root, d;
+	device_t root;
 
-	root = devclass_get_device(devclass_find("root"), 0);
+	root = ioreg_root_dev();
 	if (root == NULL) {
-		/* Fall back: climb from any known device to its topmost parent. */
-		sx_xlock(&ioreg_lock);
-		struct ioreg_ent *e = LIST_FIRST(&ioreg_map);
-		device_t any = (e != NULL) ? e->dev : NULL;
-		sx_xunlock(&ioreg_lock);
-		if (any == NULL) {
-			*out = 0;
-			return (0);
-		}
-		for (d = any; device_get_parent(d) != NULL; d = device_get_parent(d))
-			;
-		root = d;
+		*out = 0;
+		return (0);
 	}
 	sx_xlock(&ioreg_lock);
 	*out = ioreg_id_for_locked(root);
@@ -327,45 +530,58 @@ ioreg_get_root(uint64_t *out)
  * live tree, mints ids for any newly seen children, copies up to c->max ids out
  * to the user array, and reports the true child count. The id xlock is dropped
  * before copyout (copyout may fault/sleep); the child id list is captured into a
- * small kernel array first.
+ * small kernel array first. Live virtual children (#333) follow the newbus ones.
  */
 static int
 ioreg_children(struct ioreg_children *c)
 {
 	device_t parent;
 	device_t *kids;
-	uint64_t *ids;
-	int nkids, i, error;
-	uint32_t ncopy;
+	uint64_t *ids, *vkids;
+	int nkids, nvkids, i, error;
+	uint32_t ncopy, total;
 
-	/* Resolve the parent device_t under the lock; reject lingering/unknown. */
+	/* Resolve the parent under the lock; reject lingering/unknown. A virtual
+	 * parent has no newbus children, only virtual ones. */
 	sx_xlock(&ioreg_lock);
 	{
 		struct ioreg_ent *e = ioreg_find_id_locked(c->id);
 
-		if (e == NULL || e->dev == NULL) {
+		if (e == NULL || e->state != IOREG_STATE_LIVE ||
+		    (e->kind == IOREG_KIND_NEWBUS && e->dev == NULL)) {
 			sx_xunlock(&ioreg_lock);
 			return (ENOENT);
 		}
-		parent = e->dev;
+		parent = e->dev;	/* NULL for a virtual entry */
 	}
 	sx_xunlock(&ioreg_lock);
 
-	error = device_get_children(parent, &kids, &nkids);
-	if (error != 0)
-		return (error);
-	if (nkids < 0)
-		nkids = 0;
+	kids = NULL;
+	nkids = 0;
+	if (parent != NULL) {
+		error = device_get_children(parent, &kids, &nkids);
+		if (error != 0)
+			return (error);
+		if (nkids < 0)
+			nkids = 0;
+	}
 
-	ids = malloc((size_t)nkids * sizeof(uint64_t) + 1, M_IOREG, M_WAITOK);
 	sx_xlock(&ioreg_lock);
+	vkids = ioreg_virt_children_locked(c->id, &nvkids);
+	total = (uint32_t)nkids + (uint32_t)nvkids;
+	ids = malloc((size_t)total * sizeof(uint64_t) + 1, M_IOREG, M_WAITOK);
 	for (i = 0; i < nkids; i++)
 		ids[i] = ioreg_id_for_locked(kids[i]);
 	sx_xunlock(&ioreg_lock);
-	free(kids, M_TEMP);
+	if (kids != NULL)
+		free(kids, M_TEMP);
+	if (vkids != NULL) {
+		memcpy(ids + nkids, vkids, (size_t)nvkids * sizeof(uint64_t));
+		free(vkids, M_IOREG);
+	}
 
-	c->count = (uint32_t)nkids;
-	ncopy = (c->max < (uint32_t)nkids) ? c->max : (uint32_t)nkids;
+	c->count = total;
+	ncopy = (c->max < total) ? c->max : total;
 	error = 0;
 	if (ncopy > 0 && c->children != 0)
 		error = copyout(ids, (void *)(uintptr_t)c->children,
@@ -391,6 +607,12 @@ ioreg_node(struct ioreg_node *n)
 		if (e == NULL) {
 			sx_xunlock(&ioreg_lock);
 			return (ENOENT);
+		}
+		if (e->kind == IOREG_KIND_VIRTUAL) {
+			/* Live or lingering: the snapshot answers. */
+			ioreg_virt_fill_node_locked(e, n);
+			sx_xunlock(&ioreg_lock);
+			return (0);
 		}
 		state = e->state;
 		dev = e->dev;
@@ -430,17 +652,34 @@ ioreg_props(struct ioreg_props *p)
 	device_t dev;
 	uint64_t id, parent_id;
 	int state, error;
-	nvlist_t *nvl;
+	nvlist_t *nvl, *extra;
 	void *packed;
 	size_t plen;
 	uint32_t outlen;
+	struct ioreg_node vn;
 
 	id = p->id;
+	extra = NULL;
 	sx_xlock(&ioreg_lock);
 	{
 		struct ioreg_ent *e = ioreg_find_id_locked(id);
 		struct ioreg_ent *pe;
 
+		if (e != NULL && e->kind == IOREG_KIND_VIRTUAL) {
+			/* Live or lingering: build from the snapshot. The
+			 * extra keys are cloned so the bag is built unlocked
+			 * (aging may free the original once we drop it). */
+			ioreg_virt_fill_node_locked(e, &vn);
+			if (e->virt->props != NULL)
+				extra = nvlist_clone(e->virt->props);
+			sx_xunlock(&ioreg_lock);
+			nvl = ioreg_build_bag_node(&vn, NULL);
+			if (nvl != NULL && extra != NULL)
+				ioreg_bag_merge(nvl, extra);
+			if (extra != NULL)
+				nvlist_destroy(extra);
+			goto pack;
+		}
 		if (e == NULL || e->dev == NULL) {
 			sx_xunlock(&ioreg_lock);
 			return (ENOENT);
@@ -461,6 +700,7 @@ ioreg_props(struct ioreg_props *p)
 	sx_xunlock(&ioreg_lock);
 
 	nvl = ioreg_build_bag(dev, id, parent_id, state);
+pack:
 	if (nvl == NULL)
 		return (ENOMEM);
 	if (nvlist_error(nvl) != 0) {
@@ -529,18 +769,58 @@ ioreg_dev_matches_crit(device_t dev, uint64_t id, uint64_t parent_id, int state,
 }
 
 /*
+ * Lookup walk over a live virtual entry and its live virtual children (#333).
+ * Same contract as ioreg_lookup_walk below.
+ */
+static void
+ioreg_lookup_walk_virt(uint64_t id, const struct ioreg_criteria *crit,
+    uint64_t *ids, uint32_t cap, uint32_t *count, int depth)
+{
+	struct ioreg_ent *e;
+	struct ioreg_node n;
+	uint64_t *vkids;
+	int nvkids, i;
+
+	if (depth > IOREG_MAX_DEPTH)
+		return;
+
+	sx_xlock(&ioreg_lock);
+	e = ioreg_find_id_locked(id);
+	if (e == NULL || e->kind != IOREG_KIND_VIRTUAL ||
+	    e->state != IOREG_STATE_LIVE) {
+		sx_xunlock(&ioreg_lock);
+		return;
+	}
+	ioreg_virt_fill_node_locked(e, &n);
+	vkids = ioreg_virt_children_locked(id, &nvkids);
+	sx_xunlock(&ioreg_lock);
+
+	if (ioreg_node_matches_crit(&n, crit)) {
+		if (*count < cap && ids != NULL)
+			ids[*count] = id;
+		(*count)++;
+	}
+	for (i = 0; i < nvkids; i++)
+		ioreg_lookup_walk_virt(vkids[i], crit, ids, cap, count,
+		    depth + 1);
+	if (vkids != NULL)
+		free(vkids, M_IOREG);
+}
+
+/*
  * Recursively collect matching node ids into `ids` (capacity in *cap entries,
  * which may be 0 to count-only). *count is the running total of matches found
  * (incremented even past capacity, so the caller learns the true count). Walks
- * the live tree from `dev`. Mints ids as needed (own xlock per device).
+ * the live tree from `dev`, newbus children first, then virtual children.
+ * Mints ids as needed (own xlock per device).
  */
 static void
 ioreg_lookup_walk(device_t dev, const struct ioreg_criteria *crit, uint64_t *ids,
     uint32_t cap, uint32_t *count, int depth)
 {
 	device_t *kids;
-	int nkids, i;
-	uint64_t id, parent_id;
+	int nkids, nvkids, i;
+	uint64_t id, parent_id, *vkids;
 	int state;
 
 	if (depth > IOREG_MAX_DEPTH)
@@ -559,6 +839,7 @@ ioreg_lookup_walk(device_t dev, const struct ioreg_criteria *crit, uint64_t *ids
 		}
 	}
 	state = IOREG_STATE_LIVE;
+	vkids = ioreg_virt_children_locked(id, &nvkids);
 	sx_xunlock(&ioreg_lock);
 
 	if (ioreg_dev_matches_crit(dev, id, parent_id, state, crit)) {
@@ -573,6 +854,11 @@ ioreg_lookup_walk(device_t dev, const struct ioreg_criteria *crit, uint64_t *ids
 			    depth + 1);
 		free(kids, M_TEMP);
 	}
+	for (i = 0; i < nvkids; i++)
+		ioreg_lookup_walk_virt(vkids[i], crit, ids, cap, count,
+		    depth + 1);
+	if (vkids != NULL)
+		free(vkids, M_IOREG);
 }
 
 /*
@@ -586,7 +872,7 @@ ioreg_lookup(struct ioreg_lookup *lu)
 {
 	const struct ioreg_criteria *crit = &lu->criteria;
 	uint64_t *ids = NULL;
-	device_t root, d;
+	device_t root;
 	uint32_t count, ncopy;
 	int error;
 
@@ -596,18 +882,7 @@ ioreg_lookup(struct ioreg_lookup *lu)
 	lu->criteria.driver[sizeof(lu->criteria.driver) - 1] = '\0';
 
 	/* Find the root device_t (same logic as IOREGIOCROOT). */
-	root = devclass_get_device(devclass_find("root"), 0);
-	if (root == NULL) {
-		sx_xlock(&ioreg_lock);
-		struct ioreg_ent *e = LIST_FIRST(&ioreg_map);
-		d = (e != NULL) ? e->dev : NULL;
-		sx_xunlock(&ioreg_lock);
-		if (d != NULL) {
-			for (; device_get_parent(d) != NULL; d = device_get_parent(d))
-				;
-			root = d;
-		}
-	}
+	root = ioreg_root_dev();
 	if (root == NULL) {
 		lu->count = 0;
 		return (0);
@@ -884,11 +1159,58 @@ ioreg_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 /* ---- hw.iokit.registry: read-only text dump (debug + hwregd transition) ---- */
 
 static void
+ioreg_sysctl_line(struct sbuf *sb, uint64_t id, const struct ioreg_node *n,
+    int depth)
+{
+	int i;
+
+	for (i = 0; i < depth; i++)
+		sbuf_cat(sb, "  ");
+	sbuf_printf(sb, "[%ju] %s class=%s driver=%s",
+	    (uintmax_t)id, n->name[0] ? n->name : "?",
+	    n->classname[0] ? n->classname : "-",
+	    n->driver[0] ? n->driver : "-");
+	if (n->pci_vendor != 0 || n->pci_device != 0)
+		sbuf_printf(sb, " pci=%04x:%04x", n->pci_vendor, n->pci_device);
+	sbuf_cat(sb, "\n");
+}
+
+/* Dump a live virtual entry and its live virtual children (#333). */
+static void
+ioreg_sysctl_walk_virt(struct sbuf *sb, uint64_t id, int depth)
+{
+	struct ioreg_ent *e;
+	struct ioreg_node n;
+	uint64_t *vkids;
+	int nvkids, i;
+
+	if (depth > IOREG_MAX_DEPTH)
+		return;
+
+	sx_xlock(&ioreg_lock);
+	e = ioreg_find_id_locked(id);
+	if (e == NULL || e->kind != IOREG_KIND_VIRTUAL ||
+	    e->state != IOREG_STATE_LIVE) {
+		sx_xunlock(&ioreg_lock);
+		return;
+	}
+	ioreg_virt_fill_node_locked(e, &n);
+	vkids = ioreg_virt_children_locked(id, &nvkids);
+	sx_xunlock(&ioreg_lock);
+
+	ioreg_sysctl_line(sb, id, &n, depth);
+	for (i = 0; i < nvkids; i++)
+		ioreg_sysctl_walk_virt(sb, vkids[i], depth + 1);
+	if (vkids != NULL)
+		free(vkids, M_IOREG);
+}
+
+static void
 ioreg_sysctl_walk(struct sbuf *sb, device_t dev, int depth)
 {
 	device_t *kids;
-	int nkids, i;
-	uint64_t id;
+	int nkids, nvkids, i;
+	uint64_t id, *vkids;
 	struct ioreg_node n;
 
 	if (depth > IOREG_MAX_DEPTH)
@@ -896,45 +1218,31 @@ ioreg_sysctl_walk(struct sbuf *sb, device_t dev, int depth)
 
 	sx_xlock(&ioreg_lock);
 	id = ioreg_id_for_locked(dev);
+	vkids = ioreg_virt_children_locked(id, &nvkids);
 	sx_xunlock(&ioreg_lock);
 
 	ioreg_fill_node(dev, id, 0, IOREG_STATE_LIVE, &n);
-	for (i = 0; i < depth; i++)
-		sbuf_cat(sb, "  ");
-	sbuf_printf(sb, "[%ju] %s class=%s driver=%s",
-	    (uintmax_t)id, n.name[0] ? n.name : "?",
-	    n.classname[0] ? n.classname : "-",
-	    n.driver[0] ? n.driver : "-");
-	if (n.pci_vendor != 0 || n.pci_device != 0)
-		sbuf_printf(sb, " pci=%04x:%04x", n.pci_vendor, n.pci_device);
-	sbuf_cat(sb, "\n");
+	ioreg_sysctl_line(sb, id, &n, depth);
 
 	if (device_get_children(dev, &kids, &nkids) == 0) {
 		for (i = 0; i < nkids; i++)
 			ioreg_sysctl_walk(sb, kids[i], depth + 1);
 		free(kids, M_TEMP);
 	}
+	for (i = 0; i < nvkids; i++)
+		ioreg_sysctl_walk_virt(sb, vkids[i], depth + 1);
+	if (vkids != NULL)
+		free(vkids, M_IOREG);
 }
 
 static int
 ioreg_sysctl_dump(SYSCTL_HANDLER_ARGS)
 {
 	struct sbuf sb;
-	device_t root, d;
+	device_t root;
 	int error;
 
-	root = devclass_get_device(devclass_find("root"), 0);
-	if (root == NULL) {
-		sx_xlock(&ioreg_lock);
-		struct ioreg_ent *e = LIST_FIRST(&ioreg_map);
-		d = (e != NULL) ? e->dev : NULL;
-		sx_xunlock(&ioreg_lock);
-		if (d != NULL) {
-			for (; device_get_parent(d) != NULL; d = device_get_parent(d))
-				;
-			root = d;
-		}
-	}
+	root = ioreg_root_dev();
 
 	sbuf_new(&sb, NULL, 1024, SBUF_AUTOEXTEND);
 	if (root != NULL)
@@ -951,7 +1259,7 @@ ioreg_sysctl_dump(SYSCTL_HANDLER_ARGS)
 SYSCTL_PROC(_hw_iokit, OID_AUTO, registry,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
     ioreg_sysctl_dump, "A",
-    "IOKit registry (live newbus device tree)");
+    "IOKit registry (live newbus device tree plus virtual entries)");
 
 /* ---- id-map maintenance + event emission via newbus eventhandlers ---- */
 
@@ -970,15 +1278,168 @@ static eventhandler_tag ioreg_match_end_tag;
  * under the bus topology lock (these handlers are all serialized by it), but we
  * guard with a mutex too and splice-then-emit-lockless so the Mach send never
  * runs under a lock. K-PR2 (#225).
+ *
+ * A virtual entry published during a probe/attach (#333) is queued here too,
+ * by id (dev == NULL), so its ARRIVE follows its newbus parent's. The mutex is
+ * initialized by MTX_SYSINIT, not MOD_LOAD, so a producer may publish before
+ * this module's MOD_LOAD has run.
  */
 struct ioreg_pend {
 	STAILQ_ENTRY(ioreg_pend) link;
-	device_t	dev;
+	device_t	dev;		/* NULL: virtual entry `vid` */
+	uint64_t	vid;
 };
 static STAILQ_HEAD(, ioreg_pend) ioreg_pending =
     STAILQ_HEAD_INITIALIZER(ioreg_pending);
 static struct mtx ioreg_pend_mtx;
+MTX_SYSINIT(ioreg_pend_mtx, &ioreg_pend_mtx, "ioregpend", MTX_DEF);
 static int ioreg_match_depth;		/* in-flight probe->attach nesting */
+
+/*
+ * Send ARRIVE+MATCHED for virtual entry `id` if it is still live (it may have
+ * been retired, or even aged out, while its notification was queued).
+ */
+static void
+ioreg_virt_announce(uint64_t id)
+{
+	struct ioreg_ent *e;
+	struct ioreg_node n;
+
+	if (ioreg_watch_count == 0)
+		return;
+	sx_xlock(&ioreg_lock);
+	e = ioreg_find_id_locked(id);
+	if (e == NULL || e->kind != IOREG_KIND_VIRTUAL ||
+	    e->state != IOREG_STATE_LIVE) {
+		sx_xunlock(&ioreg_lock);
+		return;
+	}
+	ioreg_virt_fill_node_locked(e, &n);
+	sx_xunlock(&ioreg_lock);
+	ioreg_emit_event_node(&n, NULL, IOREG_EVENT_ARRIVE);
+	ioreg_emit_event_node(&n, NULL, IOREG_EVENT_MATCHED);
+}
+
+/*
+ * Announce a freshly published virtual entry: queue it behind an in-flight
+ * newbus probe/attach (sent at quiesce, after its parent's ARRIVE), or send
+ * now when the tree is settled.
+ */
+static void
+ioreg_virt_arrive(uint64_t id)
+{
+	struct ioreg_pend *p;
+
+	if (ioreg_watch_count == 0)
+		return;
+	p = malloc(sizeof(*p), M_IOREG, M_WAITOK | M_ZERO);
+	p->vid = id;
+	mtx_lock(&ioreg_pend_mtx);
+	if (ioreg_match_depth > 0) {
+		STAILQ_INSERT_TAIL(&ioreg_pending, p, link);
+		p = NULL;
+	}
+	mtx_unlock(&ioreg_pend_mtx);
+	if (p != NULL) {
+		free(p, M_IOREG);
+		ioreg_virt_announce(id);
+	}
+}
+
+/*
+ * ioreg_publish_virtual: see sys/ioregistry.h. The parent is `parent`'s newbus
+ * node (its id is minted here if this is its first sighting) or, for NULL, the
+ * synthetic IOResources node, which is created on first use.
+ */
+uint64_t
+ioreg_publish_virtual(device_t parent, const char *name, const char *classname,
+    nvlist_t *props)
+{
+	struct ioreg_ent *e;
+	char *ppath;
+	uint64_t pid, id, resid;
+
+	if (name == NULL || name[0] == '\0' || classname == NULL ||
+	    classname[0] == '\0') {
+		if (props != NULL)
+			nvlist_destroy(props);
+		return (0);
+	}
+	if (props != NULL && nvlist_error(props) != 0) {
+		nvlist_destroy(props);
+		props = NULL;
+	}
+
+	ppath = malloc(IOREG_PATH_MAX, M_IOREG, M_WAITOK | M_ZERO);
+	if (parent != NULL)
+		ioreg_build_path(parent, ppath, IOREG_PATH_MAX);
+
+	resid = 0;
+	sx_xlock(&ioreg_lock);
+	if (parent != NULL) {
+		pid = ioreg_id_for_locked(parent);
+	} else {
+		if (ioreg_resources == NULL) {
+			ioreg_resources = ioreg_virt_insert_locked(0, "",
+			    IOREG_RESOURCES_NAME, IOREG_RESOURCES_NAME, NULL,
+			    true);
+			strlcpy(ioreg_resources->virt->node.path,
+			    IOREG_RESOURCES_PATH,
+			    sizeof(ioreg_resources->virt->node.path));
+			ioreg_resources_link_locked();
+			resid = ioreg_resources->id;
+		}
+		pid = ioreg_resources->id;
+		strlcpy(ppath, ioreg_resources->virt->node.path,
+		    IOREG_PATH_MAX);
+	}
+	e = ioreg_virt_insert_locked(pid, ppath, name, classname, props, false);
+	id = e->id;
+	sx_xunlock(&ioreg_lock);
+	free(ppath, M_IOREG);
+
+	if (resid != 0)
+		ioreg_virt_arrive(resid);
+	ioreg_virt_arrive(id);
+	return (id);
+}
+
+/*
+ * ioreg_retire_virtual: see sys/ioregistry.h. DEPART is sent directly, as for
+ * a newbus detach; a still-queued ARRIVE for the id is dropped at flush time
+ * because the entry is no longer live.
+ */
+int
+ioreg_retire_virtual(uint64_t id)
+{
+	struct ioreg_ent *e, *old;
+	struct ioreg_node n;
+
+	sx_xlock(&ioreg_lock);
+	e = ioreg_find_id_locked(id);
+	if (e == NULL || e->kind != IOREG_KIND_VIRTUAL ||
+	    e->state != IOREG_STATE_LIVE || e->virt->permanent) {
+		sx_xunlock(&ioreg_lock);
+		return (ENOENT);
+	}
+	e->state = IOREG_STATE_DETACHED;
+	ioreg_virt_fill_node_locked(e, &n);
+	TAILQ_REMOVE(&ioreg_virt_live, e, vlink);
+	TAILQ_INSERT_TAIL(&ioreg_virt_linger, e, vlink);
+	ioreg_virt_nlinger++;
+	/* Age out the oldest lingerers so producer churn can't grow the map. */
+	while (ioreg_virt_nlinger > IOREG_VIRT_LINGER_MAX) {
+		old = TAILQ_FIRST(&ioreg_virt_linger);
+		TAILQ_REMOVE(&ioreg_virt_linger, old, vlink);
+		LIST_REMOVE(old, link);
+		ioreg_virt_nlinger--;
+		ioreg_virt_free(old);
+	}
+	sx_xunlock(&ioreg_lock);
+
+	ioreg_emit_event_node(&n, NULL, IOREG_EVENT_DEPART);
+	return (0);
+}
 
 /*
  * device_attach: mint (or revive) the id eagerly so the id space tracks the live
@@ -1091,6 +1552,12 @@ ioreg_on_match_end(void *arg __unused, device_t dev __unused)
 		STAILQ_REMOVE_HEAD(&drain, link);
 		pdev = p->dev;
 
+		if (pdev == NULL) {
+			ioreg_virt_announce(p->vid);
+			free(p, M_IOREG);
+			continue;
+		}
+
 		sx_xlock(&ioreg_lock);
 		e = ioreg_find_dev_locked(pdev);
 		id = (e != NULL && e->dev == pdev) ? e->id : 0;
@@ -1127,13 +1594,10 @@ ioreg_modevent(module_t mod __unused, int type, void *data __unused)
 
 	switch (type) {
 	case MOD_LOAD:
-		mtx_init(&ioreg_pend_mtx, "ioregpend", NULL, MTX_DEF);
 		ioreg_dev = make_dev(&ioreg_cdevsw, 0, UID_ROOT, GID_WHEEL,
 		    0644, "ioregistry");
-		if (ioreg_dev == NULL) {
-			mtx_destroy(&ioreg_pend_mtx);
+		if (ioreg_dev == NULL)
 			return (ENXIO);
-		}
 		ioreg_attach_tag = EVENTHANDLER_REGISTER(device_attach,
 		    ioreg_on_attach, NULL, EVENTHANDLER_PRI_ANY);
 		ioreg_detach_tag = EVENTHANDLER_REGISTER(device_detach,
@@ -1163,12 +1627,18 @@ ioreg_modevent(module_t mod __unused, int type, void *data __unused)
 			free(p, M_IOREG);
 		}
 		mtx_unlock(&ioreg_pend_mtx);
-		mtx_destroy(&ioreg_pend_mtx);
 		sx_xlock(&ioreg_lock);
 		while ((e = LIST_FIRST(&ioreg_map)) != NULL) {
 			LIST_REMOVE(e, link);
-			free(e, M_IOREG);
+			if (e->kind == IOREG_KIND_VIRTUAL)
+				ioreg_virt_free(e);
+			else
+				free(e, M_IOREG);
 		}
+		TAILQ_INIT(&ioreg_virt_live);
+		TAILQ_INIT(&ioreg_virt_linger);
+		ioreg_virt_nlinger = 0;
+		ioreg_resources = NULL;
 		sx_xunlock(&ioreg_lock);
 		return (0);
 	default:

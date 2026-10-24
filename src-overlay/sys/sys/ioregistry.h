@@ -197,4 +197,37 @@ struct ioreg_test_event {
 #define	IOREGIOCWATCH	_IOW('R', 6, struct ioreg_watch_reg) /* register notify */
 #define	IOREGIOCTESTEVENT _IOW('R', 7, struct ioreg_test_event) /* inject event */
 
+#ifdef _KERNEL
+/*
+ * Virtual registry entries (#333, part of #331). An entry with no newbus
+ * device_t behind it — e.g. an evdev input node — published by an in-kernel
+ * producer. The registry owns a snapshot of the entry (name, class, path and
+ * an optional property bag) and serves it through IOREGIOCCHILDREN,
+ * IOREGIOCLOOKUP, IOREGIOCNODE, IOREGIOCPROPS, IOREGIOCWATCH and
+ * hw.iokit.registry exactly like a newbus node; userland sees no new ABI.
+ *
+ * ioreg_publish_virtual() inserts a live entry under `parent` (its newbus
+ * node), or under the synthetic "IOResources" node (a child of the root,
+ * created on first use, as on Darwin) when `parent` is NULL. `props` is an
+ * optional bag of extra keys (strings, numbers, bools); ownership passes to
+ * the registry in every case. The registry's own keys (id, name, class, ...)
+ * win over a caller key of the same name. Returns the new entry's stable id,
+ * or 0 on bad arguments. ARRIVE+MATCHED go to matching watches, coalesced
+ * with an in-flight newbus probe/attach like a device_attach.
+ *
+ * ioreg_retire_virtual() sends DEPART and marks the entry detached. Its
+ * snapshot stays readable (IOREGIOCNODE / IOREGIOCPROPS) while it lingers;
+ * the oldest lingering virtual entries are freed past a fixed cap, after which
+ * the id returns ENOENT. Ids are never reused. Returns 0, or ENOENT if `id`
+ * is not a live virtual entry.
+ *
+ * Both may sleep (sx + M_WAITOK); call them from a sleepable context.
+ */
+struct _device;
+struct nvlist;
+uint64_t ioreg_publish_virtual(struct _device *parent, const char *name,
+	    const char *classname, struct nvlist *props);
+int	ioreg_retire_virtual(uint64_t id);
+#endif /* _KERNEL */
+
 #endif /* _SYS_IOREGISTRY_H_ */
