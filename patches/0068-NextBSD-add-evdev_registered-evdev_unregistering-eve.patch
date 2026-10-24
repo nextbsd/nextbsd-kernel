@@ -1,0 +1,146 @@
+From 87ad03938d21dd23050be4d3f1ce4b2dfc05b0d7 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 24 Oct 2026 16:58:54 -0500
+Subject: [PATCH] NextBSD: add evdev_registered/evdev_unregistering
+ eventhandlers and evdev_foreach()
+
+evdev devices are cdevs, not newbus devices, and uinput devices have no
+newbus device at all, so nothing in the kernel can follow them as they
+come and go. Keep every registered evdev device on a list, using the
+so far unused ev_link field, and invoke two new eventhandlers:
+evdev_registered once the device's cdev and sysctls exist, and
+evdev_unregistering before either is torn down. evdev_foreach() walks
+the list so a subscriber that starts after some devices registered
+(for example from a SYSINIT) can catch up.
+
+The list is protected by an sx. Registration already sleeps
+(make_dev_s(MAKEDEV_WAITOK), destroy_dev()), so callers hold at most
+sleepable locks or Giant (kbdmux, atkbd, psm), and the handlers run
+under the lock may sleep as well. The handlers are invoked with the
+list held exclusive and evdev_foreach() holds it shared, which
+serializes a subscriber's catch-up walk against new arrivals and
+departures. Handlers and evdev_foreach() callbacks must not take Giant
+or driver locks, nor register or unregister an evdev device.
+
+NextBSD's IORegistry uses this to publish evdev nodes, including
+uinput, with match and terminate notifications
+(nextbsd/nextbsd-kernel#331). The eventhandlers are looked up by name,
+so with nothing subscribed the invokes are no-ops and evdev.ko still
+builds and links on its own.
+
+Refs nextbsd/nextbsd-kernel#332. Carried out-of-tree for NextBSD.
+---
+ sys/dev/evdev/evdev.c | 37 +++++++++++++++++++++++++++++++++++++
+ sys/dev/evdev/evdev.h | 13 +++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/sys/dev/evdev/evdev.c b/sys/dev/evdev/evdev.c
+index 4dcd6f2..7a725a4 100644
+--- a/sys/dev/evdev/evdev.c
++++ b/sys/dev/evdev/evdev.c
+@@ -32,6 +32,7 @@
+ #include <sys/ck.h>
+ #include <sys/conf.h>
+ #include <sys/epoch.h>
++#include <sys/eventhandler.h>
+ #include <sys/kdb.h>
+ #include <sys/kernel.h>
+ #include <sys/malloc.h>
+@@ -88,6 +89,18 @@ SYSCTL_INT(_kern_evdev, OID_AUTO, sysmouse_t_axis, CTLFLAG_RWTUN,
+ SYSCTL_NODE(_kern_evdev, OID_AUTO, input, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+     "Evdev input devices");
+ 
++/*
++ * Registered devices, linked on ev_link.  An sx rather than a mutex:
++ * registration already sleeps (make_dev_s(MAKEDEV_WAITOK), destroy_dev()),
++ * so callers hold at most sleepable locks or Giant (kbdmux, atkbd, psm),
++ * and the handlers invoked under it may sleep too.  Lock order is driver
++ * locks, then evdev_list_lock, then whatever the handlers take; handlers
++ * must not take Giant or driver locks.
++ */
++static LIST_HEAD(, evdev_dev) evdev_list = LIST_HEAD_INITIALIZER(evdev_list);
++static struct sx evdev_list_lock;
++SX_SYSINIT(evdev_list, &evdev_list_lock, "evdev list");
++
+ static void evdev_start_repeat(struct evdev_dev *, uint16_t);
+ static void evdev_stop_repeat(struct evdev_dev *);
+ static int evdev_check_event(struct evdev_dev *, uint16_t, uint16_t, int32_t);
+@@ -332,6 +345,12 @@ evdev_register_common(struct evdev_dev *evdev)
+ 	/* Create sysctls (for device enumeration without /dev/input access rights) */
+ 	evdev_sysctl_create(evdev);
+ 
++	/* Publish on the device list and tell subscribers */
++	sx_xlock(&evdev_list_lock);
++	LIST_INSERT_HEAD(&evdev_list, evdev, ev_link);
++	EVENTHANDLER_INVOKE(evdev_registered, evdev);
++	sx_xunlock(&evdev_list_lock);
++
+ bail_out:
+ 	if (ret != 0)
+ 		sx_destroy(&evdev->ev_list_lock);
+@@ -366,6 +385,18 @@ evdev_register_mtx(struct evdev_dev *evdev, struct mtx *mtx)
+ 	return (evdev_register_common(evdev));
+ }
+ 
++/* Call fn for every registered device, with the evdev list held shared */
++void
++evdev_foreach(void (*fn)(struct evdev_dev *, void *), void *arg)
++{
++	struct evdev_dev *evdev;
++
++	sx_slock(&evdev_list_lock);
++	LIST_FOREACH(evdev, &evdev_list, ev_link)
++		fn(evdev, arg);
++	sx_sunlock(&evdev_list_lock);
++}
++
+ int
+ evdev_unregister(struct evdev_dev *evdev)
+ {
+@@ -374,6 +405,12 @@ evdev_unregister(struct evdev_dev *evdev)
+ 	debugf(evdev, "%s: unregistered evdev provider: %s\n",
+ 	    evdev->ev_shortname, evdev->ev_name);
+ 
++	/* Tell subscribers while the cdev and sysctls are still valid */
++	sx_xlock(&evdev_list_lock);
++	EVENTHANDLER_INVOKE(evdev_unregistering, evdev);
++	LIST_REMOVE(evdev, ev_link);
++	sx_xunlock(&evdev_list_lock);
++
+ 	sysctl_ctx_free(&evdev->ev_sysctl_ctx);
+ 
+ 	EVDEV_LIST_LOCK(evdev);
+diff --git a/sys/dev/evdev/evdev.h b/sys/dev/evdev/evdev.h
+index d5aa58f..6d73aa7 100644
+--- a/sys/dev/evdev/evdev.h
++++ b/sys/dev/evdev/evdev.h
+@@ -28,6 +28,7 @@
+ #define	_DEV_EVDEV_EVDEV_H
+ 
+ #include <sys/types.h>
++#include <sys/_eventhandler.h>
+ #include <sys/epoch.h>
+ #include <sys/kbio.h>
+ #include <dev/evdev/input.h>
+@@ -157,6 +158,18 @@ void evdev_set_cdev_mode(struct evdev_dev *, uid_t, gid_t, int);
+ void *evdev_get_softc(struct evdev_dev *);
+ bool evdev_is_grabbed(struct evdev_dev *);
+ 
++/*
++ * Registered device list and notifications.  evdev_registered is invoked
++ * once the device's cdev and sysctls exist, evdev_unregistering before
++ * either is torn down.  Both run, and evdev_foreach() walks the list, with
++ * the evdev list sx held (exclusive / shared), so handlers and the callback
++ * may sleep but must not register or unregister an evdev device.
++ */
++typedef void (*evdev_event_fn)(void *, struct evdev_dev *);
++EVENTHANDLER_DECLARE(evdev_registered, evdev_event_fn);
++EVENTHANDLER_DECLARE(evdev_unregistering, evdev_event_fn);
++void evdev_foreach(void (*)(struct evdev_dev *, void *), void *);
++
+ /* Multitouch related functions: */
+ int evdev_mt_id_to_slot(struct evdev_dev *, int32_t);
+ int evdev_mt_push_slot(struct evdev_dev *, int, union evdev_mt_slot *);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -58,3 +58,4 @@
 0065-NextBSD-add-arp_collision_event-eventhandler.patch
 0066-NextBSD-add-rt_ifmsg_event-eventhandler-fired-by-rt_ifmsg.patch
 0067-NextBSD-add-an-nd6_dad_event-eventhandler-fired-when.patch
+0068-NextBSD-add-evdev_registered-evdev_unregistering-eve.patch
