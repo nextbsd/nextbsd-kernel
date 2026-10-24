@@ -10,7 +10,9 @@
  * PR1 (#214) is kernel-only and read-only: it builds no shadow tree, it walks
  * the live newbus topology on demand. A stable uint64 registry id is minted per
  * device_t (and lingers, marked detached, after the device goes away) so a
- * userland iterator never dangles. The libIOKit migration (later PR) consumes
+ * userland iterator never dangles. A lingering id still reads back as the
+ * device it was (name, class, driver, path, PCI ids; snapshotted at detach,
+ * #334) until it ages out, after which it returns ENOENT. The libIOKit migration (later PR) consumes
  * this ABI; keep these structs frozen once shipped.
  *
  * See pkgdemon.github.io/nextbsd-inkernel-iokit-feasibility.html.
@@ -54,7 +56,8 @@ struct ioreg_criteria {
  * Node lifecycle state (ioreg_node.state). Distinct from the newbus
  * device_state_t: this is the registry id's own liveness, so a userland
  * iterator can tell a live node from one that detached but has not yet aged
- * out (linger-until-unreferenced, mirroring hwregd).
+ * out (linger-until-unreferenced, mirroring hwregd). A DETACHED node carries
+ * the snapshot taken at departure, with devstate DS_NOTPRESENT.
  */
 #define	IOREG_STATE_LIVE	0	/* device_t currently present */
 #define	IOREG_STATE_DETACHED	1	/* device gone; id lingering */
@@ -217,8 +220,8 @@ struct ioreg_test_event {
  *
  * ioreg_retire_virtual() sends DEPART and marks the entry detached. Its
  * snapshot stays readable (IOREGIOCNODE / IOREGIOCPROPS) while it lingers;
- * the oldest lingering virtual entries are freed past a fixed cap, after which
- * the id returns ENOENT. Ids are never reused. Returns 0, or ENOENT if `id`
+ * the oldest lingering entries (virtual and departed newbus alike) are freed
+ * past a fixed cap, after which the id returns ENOENT. Ids are never reused. Returns 0, or ENOENT if `id`
  * is not a live virtual entry.
  *
  * Both may sleep (sx + M_WAITOK); call them from a sleepable context.

@@ -13,7 +13,10 @@
  * are minted lazily during a walk, maintained by the device_attach/device_detach
  * eventhandlers, and an id LINGERS (marked detached) after its device goes away
  * so an in-flight userland iterator never dangles (mirrors hwregd's
- * linger-until-unreferenced semantics).
+ * linger-until-unreferenced semantics). At detach the departing device's name,
+ * class, driver, path and description are snapshotted (#334), so a lingering
+ * id still answers IOREGIOCNODE / IOREGIOCPROPS with what it was, as a
+ * terminated IOService stays readable on Darwin.
  *
  * Virtual entries (#333): an in-kernel producer can also publish entries that
  * have no device_t (ioreg_publish_virtual / ioreg_retire_virtual, declared in
@@ -72,17 +75,18 @@ static MALLOC_DEFINE(M_IOREG, "ioregistry", "in-kernel IOKit registry id map");
 
 /*
  * The stable id map. A NEWBUS entry lives as long as its device, then lingers
- * (state == IOREG_STATE_DETACHED) so userland ids don't dangle; those are
- * reclaimed only at MOD_UNLOAD (the live device population bounds them, and
- * detached newbus entries are rare and small).
+ * (state == IOREG_STATE_DETACHED) so userland ids don't dangle. At detach its
+ * device_t is dropped and `virt` takes a snapshot of the departed node (#334),
+ * which IOREGIOCNODE / IOREGIOCPROPS then serve.
  *
- * A VIRTUAL entry (#333) has no device_t; `virt` holds its snapshot. Virtual
- * entries are also on one of two side lists: ioreg_virt_live while published
- * (so a children/lookup/dump walk scans only virtual entries, not the whole
- * map) and ioreg_virt_linger, oldest first, once retired. Producers such as
- * uinput can churn (one entry per Bluetooth reconnect), so lingering virtual
- * entries are freed oldest-first past IOREG_VIRT_LINGER_MAX; a freed id then
- * returns ENOENT. Ids are never reused.
+ * A VIRTUAL entry (#333) has no device_t; `virt` holds its snapshot. Live
+ * virtual entries are on ioreg_virt_live (so a children/lookup/dump walk scans
+ * only virtual entries, not the whole map).
+ *
+ * Every lingering entry, newbus or virtual, is on ioreg_linger, oldest first.
+ * Producers such as uinput can churn (one entry per Bluetooth reconnect), and
+ * so can hotplug, so lingerers are freed oldest-first past IOREG_LINGER_MAX; a
+ * freed id then returns ENOENT. Ids are never reused.
  *
  * Everything here, including each snapshot and its property bag, is guarded
  * by ioreg_lock.
@@ -90,7 +94,7 @@ static MALLOC_DEFINE(M_IOREG, "ioregistry", "in-kernel IOKit registry id map");
 #define	IOREG_KIND_NEWBUS	0
 #define	IOREG_KIND_VIRTUAL	1
 
-#define	IOREG_VIRT_LINGER_MAX	256
+#define	IOREG_LINGER_MAX	256
 
 /* Darwin's IOResources: the default parent of driverless entries. Its path is
  * fixed because the root bus is always root0. */
@@ -98,16 +102,17 @@ static MALLOC_DEFINE(M_IOREG, "ioregistry", "in-kernel IOKit registry id map");
 #define	IOREG_RESOURCES_PATH	"/root0/IOResources"
 
 struct ioreg_virt {
-	struct ioreg_node node;		/* snapshot: parent_id, name, class, path */
+	struct ioreg_node node;		/* snapshot: parent_id, name, class,
+					   driver (newbus), path, pci_* */
 	nvlist_t	*props;		/* extra keys, owned; may be NULL */
 	bool		permanent;	/* IOResources: never retired */
 };
 
 struct ioreg_ent {
 	LIST_ENTRY(ioreg_ent) link;
-	TAILQ_ENTRY(ioreg_ent) vlink;	/* VIRTUAL: live or linger list */
+	TAILQ_ENTRY(ioreg_ent) vlink;	/* live virtual list or linger list */
 	device_t	dev;		/* NEWBUS: NULL once detached */
-	struct ioreg_virt *virt;	/* VIRTUAL: snapshot */
+	struct ioreg_virt *virt;	/* VIRTUAL, or departed NEWBUS: snapshot */
 	uint64_t	id;		/* stable, never reused */
 	int		state;		/* IOREG_STATE_* */
 	int		kind;		/* IOREG_KIND_* */
@@ -115,9 +120,9 @@ struct ioreg_ent {
 static LIST_HEAD(, ioreg_ent) ioreg_map = LIST_HEAD_INITIALIZER(ioreg_map);
 static TAILQ_HEAD(, ioreg_ent) ioreg_virt_live =
     TAILQ_HEAD_INITIALIZER(ioreg_virt_live);
-static TAILQ_HEAD(, ioreg_ent) ioreg_virt_linger =
-    TAILQ_HEAD_INITIALIZER(ioreg_virt_linger);
-static u_int ioreg_virt_nlinger;
+static TAILQ_HEAD(, ioreg_ent) ioreg_linger =
+    TAILQ_HEAD_INITIALIZER(ioreg_linger);
+static u_int ioreg_nlinger;
 static struct ioreg_ent *ioreg_resources;	/* created on first use */
 static struct sx ioreg_lock;
 SX_SYSINIT(ioreg_lock, &ioreg_lock, "ioregistry");
@@ -253,7 +258,8 @@ ioreg_resources_link_locked(void)
 		    ioreg_id_for_locked(root);
 }
 
-/* Fill a node descriptor from a virtual entry's snapshot. */
+/* Fill a node descriptor from an entry's snapshot (virtual, or departed
+ * newbus). */
 static void
 ioreg_virt_fill_node_locked(struct ioreg_ent *e, struct ioreg_node *n)
 {
@@ -329,14 +335,38 @@ ioreg_virt_insert_locked(uint64_t pid, const char *ppath, const char *name,
 	return (e);
 }
 
-/* Free a virtual entry that is already off the map and the side lists. */
+/* Free an entry (and its snapshot, if any) already off the map and lists. */
 static void
-ioreg_virt_free(struct ioreg_ent *e)
+ioreg_ent_free(struct ioreg_ent *e)
 {
-	if (e->virt->props != NULL)
-		nvlist_destroy(e->virt->props);
-	free(e->virt, M_IOREG);
+	if (e->virt != NULL) {
+		if (e->virt->props != NULL)
+			nvlist_destroy(e->virt->props);
+		free(e->virt, M_IOREG);
+	}
 	free(e, M_IOREG);
+}
+
+/*
+ * Put a just-departed entry (already marked detached, snapshot in place) on
+ * the linger list, then age out the oldest lingerers so churn can't grow the
+ * map.
+ */
+static void
+ioreg_linger_locked(struct ioreg_ent *e)
+{
+	struct ioreg_ent *old;
+
+	sx_assert(&ioreg_lock, SX_XLOCKED);
+	TAILQ_INSERT_TAIL(&ioreg_linger, e, vlink);
+	ioreg_nlinger++;
+	while (ioreg_nlinger > IOREG_LINGER_MAX) {
+		old = TAILQ_FIRST(&ioreg_linger);
+		TAILQ_REMOVE(&ioreg_linger, old, vlink);
+		LIST_REMOVE(old, link);
+		ioreg_nlinger--;
+		ioreg_ent_free(old);
+	}
 }
 
 /*
@@ -608,8 +638,9 @@ ioreg_node(struct ioreg_node *n)
 			sx_xunlock(&ioreg_lock);
 			return (ENOENT);
 		}
-		if (e->kind == IOREG_KIND_VIRTUAL) {
-			/* Live or lingering: the snapshot answers. */
+		if (e->virt != NULL) {
+			/* Virtual (live or lingering) or departed newbus:
+			 * the snapshot answers. */
 			ioreg_virt_fill_node_locked(e, n);
 			sx_xunlock(&ioreg_lock);
 			return (0);
@@ -665,10 +696,11 @@ ioreg_props(struct ioreg_props *p)
 		struct ioreg_ent *e = ioreg_find_id_locked(id);
 		struct ioreg_ent *pe;
 
-		if (e != NULL && e->kind == IOREG_KIND_VIRTUAL) {
-			/* Live or lingering: build from the snapshot. The
-			 * extra keys are cloned so the bag is built unlocked
-			 * (aging may free the original once we drop it). */
+		if (e != NULL && e->virt != NULL) {
+			/* Virtual (live or lingering) or departed newbus:
+			 * build from the snapshot. The extra keys are cloned
+			 * so the bag is built unlocked (aging may free the
+			 * original once we drop it). */
 			ioreg_virt_fill_node_locked(e, &vn);
 			if (e->virt->props != NULL)
 				extra = nvlist_clone(e->virt->props);
@@ -1412,7 +1444,7 @@ ioreg_publish_virtual(device_t parent, const char *name, const char *classname,
 int
 ioreg_retire_virtual(uint64_t id)
 {
-	struct ioreg_ent *e, *old;
+	struct ioreg_ent *e;
 	struct ioreg_node n;
 
 	sx_xlock(&ioreg_lock);
@@ -1425,16 +1457,7 @@ ioreg_retire_virtual(uint64_t id)
 	e->state = IOREG_STATE_DETACHED;
 	ioreg_virt_fill_node_locked(e, &n);
 	TAILQ_REMOVE(&ioreg_virt_live, e, vlink);
-	TAILQ_INSERT_TAIL(&ioreg_virt_linger, e, vlink);
-	ioreg_virt_nlinger++;
-	/* Age out the oldest lingerers so producer churn can't grow the map. */
-	while (ioreg_virt_nlinger > IOREG_VIRT_LINGER_MAX) {
-		old = TAILQ_FIRST(&ioreg_virt_linger);
-		TAILQ_REMOVE(&ioreg_virt_linger, old, vlink);
-		LIST_REMOVE(old, link);
-		ioreg_virt_nlinger--;
-		ioreg_virt_free(old);
-	}
+	ioreg_linger_locked(e);
 	sx_xunlock(&ioreg_lock);
 
 	ioreg_emit_event_node(&n, NULL, IOREG_EVENT_DEPART);
@@ -1472,15 +1495,24 @@ ioreg_on_attach(void *arg __unused, device_t dev)
 
 /*
  * device_detach: once the device is actually gone (EVHDEV_DETACH_COMPLETE),
- * emit a DEPART (while the node is still in the id map) then mark it detached
- * and drop the device_t pointer so the id lingers for in-flight userland
- * iterators rather than dangling (K1). There is no match bracketing around a
- * detach, so DEPART is emitted directly. BEGIN/FAILED are ignored (still present).
+ * snapshot the departing node, drop the device_t pointer and mark the id
+ * detached, so the id lingers for in-flight userland iterators rather than
+ * dangling (K1) and still reads back as the device it was (#334): name, class,
+ * driver, path, PCI ids and description. At DETACH_COMPLETE newbus has not yet
+ * cleared the devclass, driver or description, so the accessors still return
+ * them. The entry then ages out with the other lingerers. DEPART is emitted
+ * after the snapshot is in place, so a client that reads the id from its
+ * notification callback gets the snapshot. There is no match bracketing around
+ * a detach, so DEPART is emitted directly. BEGIN/FAILED are ignored (still
+ * present).
  */
 static void
 ioreg_on_detach(void *arg __unused, device_t dev, enum evhdev_detach state)
 {
 	struct ioreg_ent *e;
+	struct ioreg_virt *snap;
+	struct ioreg_node n;
+	const char *desc;
 	uint64_t id, parent_id;
 
 	if (state != EVHDEV_DETACH_COMPLETE)
@@ -1500,20 +1532,43 @@ ioreg_on_detach(void *arg __unused, device_t dev, enum evhdev_detach state)
 		}
 	}
 	sx_xunlock(&ioreg_lock);
+	if (id == 0)
+		return;
 
-	/* Emit DEPART while dev is still valid (id map drop happens just below);
-	 * the device_t is alive here (detach completed but the struct lives). */
-	if (id != 0)
-		ioreg_emit_event(dev, id, parent_id, IOREG_STATE_DETACHED,
-		    IOREG_EVENT_DEPART);
+	/* Build the snapshot unlocked (newbus reads, M_WAITOK allocations). */
+	ioreg_fill_node(dev, id, parent_id, IOREG_STATE_DETACHED, &n);
+	snap = malloc(sizeof(*snap), M_IOREG, M_WAITOK | M_ZERO);
+	snap->node = n;
+	desc = device_get_desc(dev);
+	if (desc != NULL && desc[0] != '\0') {
+		snap->props = nvlist_create(0);
+		if (snap->props != NULL) {
+			nvlist_add_string(snap->props, "description", desc);
+			if (nvlist_error(snap->props) != 0) {
+				nvlist_destroy(snap->props);
+				snap->props = NULL;
+			}
+		}
+	}
 
 	sx_xlock(&ioreg_lock);
 	e = ioreg_find_dev_locked(dev);
-	if (e != NULL) {
+	if (e != NULL && e->id == id && e->virt == NULL) {
 		e->dev = NULL;
 		e->state = IOREG_STATE_DETACHED;
+		e->virt = snap;
+		snap = NULL;
+		ioreg_linger_locked(e);
 	}
 	sx_xunlock(&ioreg_lock);
+	if (snap != NULL) {
+		/* Not ours to keep (the entry went away under us). */
+		if (snap->props != NULL)
+			nvlist_destroy(snap->props);
+		free(snap, M_IOREG);
+	}
+
+	ioreg_emit_event_node(&n, desc, IOREG_EVENT_DEPART);
 }
 
 /* device_match_start: track probe->attach nesting depth (K-PR2). */
@@ -1630,14 +1685,11 @@ ioreg_modevent(module_t mod __unused, int type, void *data __unused)
 		sx_xlock(&ioreg_lock);
 		while ((e = LIST_FIRST(&ioreg_map)) != NULL) {
 			LIST_REMOVE(e, link);
-			if (e->kind == IOREG_KIND_VIRTUAL)
-				ioreg_virt_free(e);
-			else
-				free(e, M_IOREG);
+			ioreg_ent_free(e);
 		}
 		TAILQ_INIT(&ioreg_virt_live);
-		TAILQ_INIT(&ioreg_virt_linger);
-		ioreg_virt_nlinger = 0;
+		TAILQ_INIT(&ioreg_linger);
+		ioreg_nlinger = 0;
 		ioreg_resources = NULL;
 		sx_xunlock(&ioreg_lock);
 		return (0);
