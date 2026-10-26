@@ -254,6 +254,22 @@ device		snd_uaudio
 # and rng are the only virtio functions present). HDA is the supported path.
 device		snd_hda
 
+# cuse(3): character devices implemented in userspace, through /dev/cuse.
+# alsa-seq-server creates /dev/snd/seq with it (the ALSA sequencer: MIDI
+# applications and network MIDI); virtual_oss(8), the base audio mixer and
+# the Bluetooth A2DP path, creates its /dev/dsp* nodes with it; and the
+# webcam service will need it for V4L2 nodes (#343).
+#
+# Module-only on stock FreeBSD (sys/conf/files: fs/cuse/cuse.c optional cuse,
+# in neither amd64 GENERIC nor arm64 std.dev) and kldloaded on demand. NextBSD
+# ships no .ko tree (ci/assemble-image.sh:168), so without this line there is
+# no /dev/cuse at all and every consumer fails at cuse_init(). Same
+# unbaked-leaf class as wlan_xauth, hms and snd_uaudio above.
+#
+# Machine-independent, no MODULE_DEPENDs, so the one line covers amd64, arm64
+# and NEXTBSD-RPI5 (which includes this file). Sets kern.features.cuse.
+device		cuse
+
 # /dev/ptmx for the Linux ABI (#530). New ptys fail in /compat/linux -- zsh zpty,
 # in-chroot script/expect/emacs/python-pty, apt's opq log -- while inherited
 # session ptys work. The gap is one device node, not a missing subsystem:
