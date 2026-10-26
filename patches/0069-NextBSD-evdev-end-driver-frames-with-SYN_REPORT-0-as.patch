@@ -1,0 +1,65 @@
+From c8a4c3a357d5c1fdb4d1b0f6cad590a04877e4e1 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Mon, 26 Oct 2026 15:31:37 -0500
+Subject: [PATCH] NextBSD: evdev: end driver frames with SYN_REPORT 0, as Linux
+ does
+
+evdev_sync() ended every driver-initiated frame with SYN_REPORT value
+1. On Linux, input_sync() sends 0. The input core sends 1 only for a
+frame it inserts on its own, such as after a key auto-repeat event.
+
+libinput 1.29.0 and later rely on that difference: the touchpad
+dispatch (tp_interface_process) drops every frame whose SYN_REPORT
+value is 1 as a kernel-inserted frame (libinput issue #1145). With
+evdev_sync() sending 1, that is every frame from every touchpad
+driver: psm (Synaptics, Elantech), hmt, wsp, bcm5974. Touch, motion
+and the touchpad's own button clicks are all lost, while mice,
+TrackPoints and keyboards, which go through the fallback dispatch,
+keep working.
+
+Send 0 from evdev_sync(). Keep 1 at the two places where the evdev
+core inserts a frame itself, which is exactly the Linux meaning:
+evdev_repeat_callout() (key auto-repeat) and
+evdev_restore_after_kdb() (the stuck-key release after kdb).
+
+Audit of sys/ on releng/15.1: no driver pushes SYN_REPORT directly;
+drivers only declare EV_SYN support and end frames through
+evdev_sync(). uinput passes through whatever userland writes. Inside
+the kernel, evdev_sparse_event(), evdev_propagate_event() and the
+cdev client queue all test code == SYN_REPORT and never the value,
+so nothing changes in the kernel itself.
+
+Refs nextbsd/nextbsd-kernel#344. Carried out-of-tree for NextBSD;
+the same change is suitable for FreeBSD, where stock FreeBSD with
+libinput 1.29 or later has the same problem.
+---
+ sys/dev/evdev/evdev.h | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/sys/dev/evdev/evdev.h b/sys/dev/evdev/evdev.h
+index 6d73aa7d..7bfcd4bf 100644
+--- a/sys/dev/evdev/evdev.h
++++ b/sys/dev/evdev/evdev.h
+@@ -189,11 +189,18 @@ void evdev_support_nfingers(struct evdev_dev *, int);
+ void evdev_push_nfingers(struct evdev_dev *, int);
+ 
+ /* Event reporting shortcuts: */
++
++/*
++ * A driver-initiated frame ends with SYN_REPORT 0, as Linux's input_sync()
++ * does. SYN_REPORT 1 means a frame the input core inserted on its own (key
++ * auto-repeat, the key release after kdb), and libinput's touchpad code drops
++ * those frames.
++ */
+ static __inline int
+ evdev_sync(struct evdev_dev *evdev)
+ {
+ 
+-	return (evdev_push_event(evdev, EV_SYN, SYN_REPORT, 1));
++	return (evdev_push_event(evdev, EV_SYN, SYN_REPORT, 0));
+ }
+ 
+ static __inline int
+-- 
+2.54.0 (Apple Git-157)
+
