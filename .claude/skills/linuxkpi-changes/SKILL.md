@@ -1,6 +1,6 @@
 ---
 name: linuxkpi-changes
-description: Rules for touching sys/compat/linuxkpi in the NextBSD kernel patch series. Use before adding, editing, or removing any patch under patches/ that changes a LinuxKPI header or source — especially when adding KPI for a driver that lives in nextbsd-kernel-extensions. Covers the struct-layout and include-collision traps that have broken i915 and amdgpu, and the CI blind spot that let both reach main green.
+description: Rules for touching sys/compat/linuxkpi in the NextBSD kernel patch series. Use before adding, editing, or removing any patch under patches/ that changes a LinuxKPI header or source — especially when adding KPI for a driver that lives in nextbsd-kernel-extensions-graphics. Covers the struct-layout and include-collision traps that have broken i915 and amdgpu, and the CI blind spot that let both reach main green.
 ---
 
 # Changing LinuxKPI in the kernel
@@ -11,7 +11,7 @@ before adding one.
 
 ## The default answer is: don't put it here
 
-If the KPI exists to serve a driver in `nextbsd-kernel-extensions`, it belongs
+If the KPI exists to serve a driver in `nextbsd-kernel-extensions-graphics`, it belongs
 **in that module**, not in the kernel. Modules are built with their own include
 paths ahead of the kernel's:
 
@@ -21,7 +21,7 @@ paths ahead of the kernel's:
 
 so a header shipped with the module shadows the kernel's for objects compiled
 into that module and reaches nothing else. See the `module-private-linuxkpi`
-skill in nextbsd-kernel-extensions for how to do it.
+skill in nextbsd-kernel-extensions-graphics for how to do it.
 
 Only three things justify a kernel patch, and all three are the same thing:
 allocator plumbing that needs state private to `linux_pci.c` (the busdma tags,
@@ -73,11 +73,11 @@ reach `<linux/ioport.h>` on the path that collides, and it does not link
 prebuilt modules, so both failures above merged to main **green**.
 
 The check that catches them is `drm-kmod build` in
-**nextbsd-kernel-extensions**, a different repository. Before merging a patch
+**nextbsd-kernel-extensions-graphics**, a different repository. Before merging a patch
 that touches `sys/compat/linuxkpi/`, dispatch that workflow and read the
 result:
 
-	gh workflow run 286478657 --repo nextbsd/nextbsd-kernel-extensions --ref main
+	gh workflow run 286478657 --repo nextbsd/nextbsd-kernel-extensions-graphics --ref main
 
 Note the direction of the dependency: that job downloads the kernel obj from
 the `continuous` release and compiles against **those** headers. It therefore
@@ -114,4 +114,4 @@ stays, the declaration stays with it.
 - Does it change any existing struct? Stop.
 - Does the full series still apply? `while read p; do git apply patches/$p; done`
 - Does every non-static function it adds have a prototype?
-- Has `drm-kmod build` in nextbsd-kernel-extensions been run against it?
+- Has `drm-kmod build` in nextbsd-kernel-extensions-graphics been run against it?

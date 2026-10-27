@@ -34,7 +34,7 @@ script, not in a workflow step.
 
 - `repository_dispatch: toolchain-updated`: a chain run. It uses the
   SHA-pinned toolchain image and, after publishing, **dispatches
-  `kernel-updated` to nextbsd-kernel-extensions**. The chain starts at
+  `kernel-updated` to nextbsd-kernel-extensions-graphics**. The chain starts at
   freebsd-src's daily sync when `releng/15.1` moves, or by hand with
   freebsd-src's `Sync Fork` workflow and `force` checked.
 - `push` to `main` touching `patches/`, `config/`, `src-overlay/`, `ci/` or the

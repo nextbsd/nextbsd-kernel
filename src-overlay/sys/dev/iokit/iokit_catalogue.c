@@ -168,7 +168,7 @@ iocat_lookup_pci(uint32_t match_word, char *buf, size_t buflen,
 }
 
 /*
- * Add a device-tree personality (nextbsd-kernel-extensions#185).
+ * Add a device-tree personality (nextbsd-kernel-extensions-graphics#185).
  *
  * The PCI twin of this is iocat_add(). Kept separate rather than widening that
  * one, because struct iocat_add is duplicated into kextd and is an ABI -- see

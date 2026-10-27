@@ -37,7 +37,7 @@ Note dma_map_sgtable() is a header inline, so this only takes effect in
 modules recompiled against it -- prebuilt kexts keep the old check until
 rebuilt.
 
-Refs nextbsd-kernel#206, nextbsd-kernel-extensions#72.
+Refs nextbsd-kernel#206, nextbsd-kernel-extensions-graphics#72.
 ---
  .../linuxkpi/common/include/linux/dma-mapping.h      | 12 ++++++++++++
  1 file changed, 12 insertions(+)

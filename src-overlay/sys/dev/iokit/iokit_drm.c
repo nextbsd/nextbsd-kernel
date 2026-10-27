@@ -10,7 +10,7 @@
  *
  * Hook. drm.ko (drm-kmod, out of tree, loaded as a kext) invokes the
  * drm_connector_hotplug eventhandler next to each of those devctl_notify
- * calls in drm_sysfs.c; the patch lives in nextbsd-kernel-extensions
+ * calls in drm_sysfs.c; the patch lives in nextbsd-kernel-extensions-graphics
  * graphics/drm-kmod-patches. EVENTHANDLER_INVOKE finds the list by name at
  * run time, so drm.ko links nothing from here and loads on a kernel without
  * this file. The declaration below is the contract and must stay identical
