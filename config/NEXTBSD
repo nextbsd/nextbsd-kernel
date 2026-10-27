@@ -52,7 +52,7 @@ nodevice 	em
 # kext), so unbaked module deps can't be resolved at load time -- drm.ko fails
 # with "depends on iic - not available". Baking them here satisfies the linker.
 # drm's third missing dep, linuxkpi_video, has no config option and is wired in
-# via src-overlay/conf/files.linuxkpi_video (build.yml). (graphics autoload, #64)
+# via src-overlay/conf/files.linuxkpi_video (ci/prepare-src.sh). (graphics autoload, #64)
 device		iic
 options 	LINDEBUGFS
 
@@ -115,7 +115,7 @@ options 	FDESCFS
 # only as modules and there has never been a static path for the 64-bit ABI, so
 # the `optional compat_linux' entries these select are supplied by
 # src-overlay/conf/files.compat_linux and the declarations by
-# src-overlay/conf/options.compat_linux (wired in build.yml). NextBSD has no
+# src-overlay/conf/options.compat_linux (wired by ci/prepare-src.sh). NextBSD has no
 # /boot/kernel .ko tree and no kldload, so compiling in is the only route.
 # Both matrix legs now. files.compat_linux is amd64 (amd64/linux/* plus the
 # three x86/linux/* files); files.compat_linux.arm64 is arm64 (arm64/linux/*,
@@ -126,18 +126,18 @@ options 	FDESCFS
 # declares neither, so arm64 additionally gets options.compat_linux.arm64
 # appended to sys/conf/options.arm64 -- per-arch, never MI, or amd64 would see
 # a duplicate. On arm64 this reaches NEXTBSD-RPI5 too, which includes NEXTBSD.
-# Revert path when the kext-conversion project lands: drop the workflow wiring
-# and delete the two overlay fragments.
+# Revert path when the kext-conversion project lands: drop the Linuxulator
+# wiring in ci/prepare-src.sh and delete the two overlay fragments.
 #
 # COMPAT_LINUX / LINPROCFS / LINSYSFS are NOT named here on purpose. They are
-# appended to the copied config by the workflow's "Wire in the static
-# Linuxulator" step, on both legs -- the same pattern COMPAT_MACH uses,
-# and for the same reason: nextbsd-kernel-extensions reuses THIS file to build a
-# KBI-matched kernel and lays in none of src-overlay/, so any option declared
-# only by the overlay makes its config(8) die with `unknown option'. That is
-# exactly what happened when these three landed here (modules red on both legs
-# from 2026-08-03; nextbsd-kernel itself stayed green because it does apply the
-# overlay). Keep this file to options that stock FreeBSD declares.
+# appended to the copied config by ci/prepare-src.sh, next to the overlay
+# wiring that declares them, on both legs -- the same pattern COMPAT_MACH uses.
+# Any build that copies THIS file without running the script (the kext repos
+# did, until #325) dies in config(8) with `unknown option' on an option only
+# the overlay declares. That is exactly what happened when these three landed
+# here (modules red on both legs from 2026-08-03; nextbsd-kernel itself stayed
+# green because it does apply the overlay). Keep this file to options that
+# stock FreeBSD declares.
 
 # POSIX message queues -- a hard link-time dependency of the Linuxulator, not a
 # nicety. compat/linux/linux_misc.c:2989-3076 calls kern_kmq_open/sys_kmq_unlink/

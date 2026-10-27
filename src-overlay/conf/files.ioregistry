@@ -2,9 +2,8 @@
 # the kernel build. Source under sys/dev/iokit, laid in from the nextbsd-kernel
 # src-overlay. `standard`: always compiled into the kernel (read-only newbus
 # introspection; inert until queried via /dev/ioregistry or hw.iokit.registry).
-# Wired in build.yml, NOT in patches/series, so the modules build (which shares
-# the series but does not lay in the overlay) never sees an absent source — the
-# same reasoning as files.iocatalogue.
+# Wired by ci/prepare-src.sh, NOT in patches/series — the same reasoning as
+# files.iocatalogue.
 dev/iokit/iokit_registry.c	standard
 # evdev -> IORegistry bridge (#335, part of #331): publishes each
 # /dev/input/eventN (uinput included) as an IOHIDDevice entry. `optional evdev`

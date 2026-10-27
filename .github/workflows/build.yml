@@ -34,120 +34,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Apply patches
-        run: |
-          cd /usr/src
-          for p in $(cat "$GITHUB_WORKSPACE/patches/series"); do
-            echo "Applying $p"
-            git apply "$GITHUB_WORKSPACE/patches/$p"
-          done
-
-      - name: Rebrand kernel identity (NextBSD)
-        # Done with sed keyed on the stable variable NAMES, NOT a git-apply
-        # patch: a regex per line is immune to version-string bumps
-        # (15.0->15.1, p10->p11) and surrounding-code restructuring, whereas
-        # git apply needs matching context and broke on the p9->p10 bump.
-        #
-        # IMPORTANT: REVISION is left STOCK. The build derives the compiler
-        # target triple (x86_64-unknown-freebsd${OS_REVISION}) from REVISION,
-        # and that sets __FreeBSD__. A timestamp in REVISION poisons __FreeBSD__
-        # kernel-wide (e.g. smartpqi assigns it to a u_char -> -Werror). So the
-        # timestamp goes in RELEASE only (= osrelease / uname -r); REVISION
-        # stays 15.0 so __FreeBSD__ stays 15. Each sed line is self-contained
-        # because the version-extraction machinery evaluates these lines in
-        # isolation. date -u +FMT and date -u are GNU+BSD portable.
-        run: |
-          cd /usr/src
-          nv=sys/conf/newvers.sh
-          # Also reformat the version banner (VERINFO/VERSTR, both metadata
-          # branches) to a clean NextBSD string and drop the FreeBSD bits that
-          # don't fit out-of-tree: the #N build counter and the
-          # <hash>[-dirty] VCS tag (the tree is always "dirty" -- it's
-          # releng/15.1 + the NextBSD patch stack). Result (uname -v):
-          #   NextBSD Kernel Version <RELEASE>; <date>; <user>@<host>:<objdir>
-          # RELEASE (the build timestamp) leads, so nextbsd-version -k can still
-          # find it. Replaced lines are tab-indented inside an if/else; both
-          # branches get the same value, which is fine.
-          sed -i \
-            -e 's~^TYPE=.*~TYPE="NextBSD"~' \
-            -e 's~^RELEASE=.*~RELEASE=$(date -u +%Y%m%d-%H%M%S)~' \
-            -e 's~t=$(date)$~t=$(date -u)~' \
-            -e 's~^[[:space:]]*VERINFO=".*~VERINFO="${TYPE} Kernel Version ${RELEASE}; ${t}; ${u}@${h}:${d}"~' \
-            -e 's~^[[:space:]]*VERSTR=".*~VERSTR="${VERINFO}\\\\n"~' \
-            "$nv"
-          echo "=== newvers.sh identity after rebrand ==="
-          grep -nE '^TYPE=|^RELEASE=|t=\$\(date|VERINFO=|VERSTR=' "$nv" || true
-
-      # A syscalls.master patch changes the GENERATED syscall tables
-      # (init_sysent.c, sys/sys/syscall.h, sysproto.h, syscalls.c, ...).
-      # buildkernel compiles the committed generated files and does NOT
-      # regenerate them, so run the `sysent` target in the build env (where
-      # flua from the baked kernel-toolchain is on PATH) to regenerate them in
-      # the runner's /usr/src before building. No generated source is ever
-      # committed to this repo — it carries patches only. Idempotent when no
-      # patch touches syscalls.master.
-      - name: Regenerate syscall tables (sysent)
-        run: |
-          cd /usr/src
-          ./tools/build/make.py \
-            --cross-bindir="${CROSS_BINDIR}" \
-            TARGET="${{ matrix.target }}" \
-            TARGET_ARCH="${{ matrix.target_arch }}" \
-            buildenv BUILDENV_SHELL='make -C sys/kern sysent'
-
-      - name: Copy kernel config
-        run: cp "$GITHUB_WORKSPACE/config/NEXTBSD" /usr/src/sys/${{ matrix.target }}/conf/
-
-      # Build the out-of-tree Mach module INTO the kernel (options COMPAT_MACH,
-      # nextbsd#181). The mach sources are NextBSD-original (not freebsd-src),
-      # carried in src-overlay/ and laid into the throwaway clone here — the
-      # fork is never touched. The COMPAT_MACH wiring is done here, NOT in
-      # patches/series, on purpose: the modules build shares the series and
-      # must never see COMPAT_MACH (it would choke config with the source
-      # absent). config/NEXTBSD in the repo stays clean for the same reason.
-      - name: Build mach into the kernel (overlay + COMPAT_MACH wiring)
-        run: |
-          set -eu
-          cp -R "$GITHUB_WORKSPACE/src-overlay/sys/." /usr/src/sys/
-          # kern_event.c's knote_enqueue() is static; the kmod resolved it via
-          # the runtime kld symtab (which includes locals), but the in-kernel
-          # static link can't. Append a global wrapper in kern_event.c's own TU
-          # (it can call the static fn); ipc_pset.c calls mach_knote_enqueue.
-          printf '\n/* nextbsd#181: global wrapper so compat/mach can reach the static knote_enqueue */\nvoid mach_knote_enqueue(struct knote *kn);\nvoid mach_knote_enqueue(struct knote *kn) { knote_enqueue(kn); }\n' >> /usr/src/sys/kern/kern_event.c
-          grep -q '^COMPAT_MACH[[:space:]]' /usr/src/sys/conf/options || \
-            printf 'COMPAT_MACH\topt_compat_mach.h\n' >> /usr/src/sys/conf/options
-          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_mach" >> /usr/src/sys/conf/files
-          # COMPAT_MACH_C: extra flags for compat/mach/*.c. -Wno-error mirrors
-          # the out-of-tree kmod's WERROR= (the in-kernel build defaults to
-          # -Werror); -DCOMPAT_MACH is omitted (opt_compat_mach.h provides it).
-          # $S stays literal (single quotes) — it expands in the kernel Makefile.
-          printf '\n# mach compat subsystem (options COMPAT_MACH, nextbsd#181)\n' >> /usr/src/sys/conf/kern.pre.mk
-          printf 'COMPAT_MACH_C= -DMACH_INTERNAL= -DAUDIT -I$S/apple -include $S/compat/mach/compat_shim.h -Wno-error\n' >> /usr/src/sys/conf/kern.pre.mk
-          grep -q '^options[[:space:]]*COMPAT_MACH' \
-            /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD || \
-            printf 'options\tCOMPAT_MACH\n' >> /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD
-          echo "==> mach wired in; compat/mach .c files: $(grep -c 'optional compat_mach' /usr/src/sys/conf/files)"
-
-      # In-kernel IOKit catalogue (K2, nextbsd#215). iokit_catalogue.c +
-      # sys/iocatalogue.h are laid into /usr/src/sys by the overlay cp above;
-      # here we just append its files fragment to the kernel source list. It is
-      # `standard` (always compiled) and needs no option/config line. Wired here
-      # (not in patches/series) for the same reason as mach: the modules build
-      # shares the series but does not lay in the overlay, so it must never see
-      # this source listed in sys/conf/files.
-      # Generate the mach_port MIG server from its .defs, rather than
-      # compiling a copy that was generated in 2015 by a MIG we no longer have
-      # and checked in as source (nextbsd-kernel#125, #126). This is the same
-      # arrangement as the `sysent` step above, and follows the rule this
-      # workflow already states: "No generated source is ever committed to this
-      # repo -- it carries patches only."
-      #
-      # migcom lives in nextbsd-userland and must run on the BUILD HOST, so it
-      # is built from source here; the migcom inside nextbsd-userland-$ARCH.tar.gz
-      # is target-arch and unusable when the x86 runner cross-builds arm64. This
-      # mirrors Apple, where bootstrap_cmds is built before xnu. The same
-      # checkout also supplies std_types.defs / mach_types.defs -- the wire type
-      # vocabulary, which must be one copy shared by both sides of the RPC.
+      # migcom (built for the build host) and the MIG wire types; see the MIG
+      # section of ci/prepare-src.sh.
       - name: Checkout nextbsd-userland (migcom + wire types)
         uses: actions/checkout@v4
         with:
@@ -155,19 +43,17 @@ jobs:
           ref: main
           path: .userland
 
-      - name: Generate MIG servers from .defs
+      # All source preparation: patches/series, the NextBSD identity, the
+      # regenerated syscall tables, config/NEXTBSD (and NEXTBSD-RPI5 on arm64),
+      # src-overlay/ with its sys/conf wiring (Mach, IOKit catalogue and
+      # registry, linuxkpi_video, vfs.pivot, kernel events, the Linuxulator),
+      # and the generated MIG servers. One script, so the kext builds run
+      # exactly the same steps at the nextbsd-kernel commit they build
+      # against (#325).
+      - name: Prepare source (ci/prepare-src.sh)
         run: |
-          set -eu
-          # The toolchain image runs as root; there is no sudo. Only install
-          # if the generators are actually missing, and do not fail the step
-          # when the image already carries them.
-          if ! command -v bison >/dev/null 2>&1 && ! command -v byacc >/dev/null 2>&1; then
-            (pkg install -y bison || apt-get update && apt-get install -y bison) || true
-          fi
-          if ! command -v flex >/dev/null 2>&1 && ! command -v lex >/dev/null 2>&1; then
-            (pkg install -y flex || apt-get install -y flex) || true
-          fi
-          "$GITHUB_WORKSPACE/ci/gen-mig-servers.sh" /usr/src/sys "$GITHUB_WORKSPACE/.userland"
+          "$GITHUB_WORKSPACE/ci/prepare-src.sh" "${{ matrix.target }}" "${{ matrix.target_arch }}" \
+            "$GITHUB_WORKSPACE/.userland" /usr/src
 
       # msgh_id is subsystem base + index, so a misplaced or omitted `skip;`
       # silently renumbers every routine after it and the kernel then executes
@@ -191,166 +77,6 @@ jobs:
               "/usr/src/sys/compat/mach/${sub}_server.c" \
               "$GITHUB_WORKSPACE/src-overlay/sys/sys/mach/${sub}.msgids"
           done
-
-      - name: Wire in-kernel IOKit catalogue (K2, #215)
-        run: |
-          set -eu
-          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.iocatalogue" >> /usr/src/sys/conf/files
-          test -f /usr/src/sys/dev/iokit/iokit_catalogue.c
-          test -f /usr/src/sys/sys/iocatalogue.h
-          echo "==> iocatalogue wired: $(grep -c 'dev/iokit/iokit_catalogue.c' /usr/src/sys/conf/files) entry; source + header present"
-
-      # In-kernel IORegistry (K1, nextbsd#214). iokit_registry.c +
-      # sys/ioregistry.h are laid into /usr/src/sys by the overlay cp above; here
-      # we append its files fragment to the kernel source list. It is `standard`
-      # (always compiled) and needs no option/config line. Wired here (not in
-      # patches/series) for the same reason as the catalogue: the modules build
-      # shares the series but does not lay in the overlay, so it must never see
-      # this source listed in sys/conf/files. It hangs hw.iokit.registry off the
-      # shared hw.iokit node defined (now non-static) by iokit_catalogue.c.
-      # The same fragment lists dev/iokit/iokit_hid.c (`optional evdev`, #335),
-      # which publishes evdev input nodes as IOHIDDevice entries.
-      - name: Wire in-kernel IORegistry (K1, #214)
-        run: |
-          set -eu
-          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.ioregistry" >> /usr/src/sys/conf/files
-          test -f /usr/src/sys/dev/iokit/iokit_registry.c
-          test -f /usr/src/sys/dev/iokit/iokit_hid.c
-          test -f /usr/src/sys/dev/iokit/iokit_drm.c
-          test -f /usr/src/sys/sys/ioregistry.h
-          echo "==> ioregistry wired: $(grep -c 'dev/iokit/iokit_registry.c' /usr/src/sys/conf/files) entry; source + header present"
-
-      # Bake linuxkpi_video into the kernel (graphics autoload, #64). drm.ko
-      # (IOGraphics.kext) hard-MODULE_DEPENDs on linuxkpi_video -- drm-kmod's
-      # video helpers (drm_aperture/HDMI/cmdline) -- which FreeBSD ships module-
-      # only with no config option (no in-tree consumer). NextBSD ships no
-      # /boot/kernel .ko tree, so we compile its sources in here, gated on
-      # COMPAT_LINUXKPI. The source files are stock base sources (already in the
-      # clone); we only append the files fragment. KERNEL build only -- the
-      # modules build shares patches/series but does not lay the overlay or cat
-      # these fragments, so it keeps building linuxkpi_video as its own .ko (same
-      # rule as iocatalogue/ioregistry). iic + lindebugfs, drm's other two
-      # missing base deps, are baked via config/NEXTBSD (device iic + LINDEBUGFS).
-      - name: Wire in linuxkpi_video (drm dep; graphics autoload, #64)
-        run: |
-          set -eu
-          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.linuxkpi_video" >> /usr/src/sys/conf/files
-          for s in linux_hdmi linux_aperture linux_cmdline linuxkpi_videokmod; do
-            test -f "/usr/src/sys/compat/linuxkpi/common/src/$s.c"
-          done
-          echo "==> linuxkpi_video wired: $(grep -c 'linuxkpi_videokmod.c' /usr/src/sys/conf/files) entry; sources present"
-
-      # vfs.pivot primitive (live-root, #70). kern/vfs_pivot.c is laid into
-      # /usr/src/sys by the overlay cp above; append its files fragment so it
-      # compiles into the kernel. It self-registers a `sysctl vfs.pivot` (no base
-      # patch) and is inert until written. KERNEL build only -- same rule as the
-      # iocatalogue/ioregistry/linuxkpi_video wiring above.
-      - name: Wire in vfs.pivot primitive (live-root, #70)
-        run: |
-          set -eu
-          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.vfs_pivot" >> /usr/src/sys/conf/files
-          test -f /usr/src/sys/kern/vfs_pivot.c
-          echo "==> vfs.pivot wired: $(grep -c 'kern/vfs_pivot.c' /usr/src/sys/conf/files) entry; source present"
-
-      # Darwin kernel events (PF_SYSTEM / SYSPROTO_EVENT, #293). The domain and
-      # its EVENTHANDLER subscribers are laid into /usr/src/sys/net by the
-      # overlay cp above; append their files fragment so they compile into the
-      # kernel. They self-register (DOMAIN_SET + EVENTHANDLER_DEFINE, no base
-      # patch) and deliver nothing until a socket sets a filter. KERNEL build only
-      # -- same rule as the vfs.pivot wiring above.
-      - name: Wire in kernel events (PF_SYSTEM, #293)
-        run: |
-          set -eu
-          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.kev" >> /usr/src/sys/conf/files
-          test -f /usr/src/sys/net/kern_event_sock.c
-          test -f /usr/src/sys/net/kev_net.c
-          echo "==> kernel events wired: $(grep -cE 'net/(kern_event_sock|kev_net)\.c' /usr/src/sys/conf/files) entries; sources present"
-
-      # Static Linuxulator: the 64-bit Linux ABI + linprocfs/linsysfs (#60).
-      # Upstream ships these only as sys/modules/*, and there has never been a
-      # static path for the 64-bit ABI (COMPAT_LINUX is commented out in
-      # sys/conf/options.amd64 and absent from options.arm64; neither
-      # files.amd64 nor files.arm64 has any linux entries). NextBSD ships no
-      # /boot/kernel .ko tree (assemble-image.sh:168) and no kld tooling
-      # (kldload/kldstat/kldunload are superseded by kext*), so a module cannot
-      # be loaded here at all -- compiling in is the only route. Sources are
-      # stock base sources already in the clone; we append the declarations and
-      # the files fragment. KERNEL build only, same rule as linuxkpi_video.
-      #
-      # BOTH arches now. amd64 uses files.compat_linux (amd64/linux/* plus the
-      # three x86/linux/* files); arm64 uses files.compat_linux.arm64
-      # (arm64/linux/*, no x86 files, aarch64 VDSO flags). The split is per-file
-      # because config(8) reads one files.<arch> per target and has no
-      # equivalent of the Makefiles' `.if ${MACHINE_CPUARCH} == "amd64"'.
-      #
-      # On arm64 this also reaches NEXTBSD-RPI5: that config does `include
-      # NEXTBSD', and the options are appended to the copied
-      # sys/arm64/conf/NEXTBSD below, so the Pi kernel inherits them.
-      - name: Wire in the static Linuxulator (linux64 + linprocfs/linsysfs, #60)
-        run: |
-          set -eu
-          # COMPAT_LINUX is declared once, MI, so it covers both legs.
-          cat "$GITHUB_WORKSPACE/src-overlay/conf/options.compat_linux" >> /usr/src/sys/conf/options
-          # The three options go into the COPIED config here, not into
-          # config/NEXTBSD in the repo -- same rule as COMPAT_MACH above.
-          # nextbsd-kernel-extensions reuses config/NEXTBSD to build a KBI-matched
-          # kernel and lays in none of src-overlay/, so an option the overlay
-          # alone declares makes its config(8) die with `unknown option'. Naming
-          # them in the shared file is what broke that build on both legs from
-          # 2026-08-03.
-          case "${{ matrix.target }}" in
-            amd64)
-              cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux" \
-                >> /usr/src/sys/conf/files.amd64
-              # LINPROCFS/LINSYSFS are already declared live in options.amd64;
-              # redeclaring them is a "Duplicate option" failure in config(8).
-              ;;
-            arm64)
-              cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux.arm64" \
-                >> /usr/src/sys/conf/files.arm64
-              # options.arm64 declares NEITHER, so unlike amd64 they must be
-              # added -- per-arch, never MI, or amd64 gets a duplicate.
-              cat "$GITHUB_WORKSPACE/src-overlay/conf/options.compat_linux.arm64" \
-                >> /usr/src/sys/conf/options.arm64
-              ;;
-            *) echo "unhandled target ${{ matrix.target }}" >&2; exit 1 ;;
-          esac
-          for _o in COMPAT_LINUX LINPROCFS LINSYSFS; do
-            grep -qE "^options[[:space:]]+${_o}\b" \
-              /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD || \
-              printf 'options\t%s\n' "$_o" >> /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD
-          done
-          # We declare COMPAT_LINUX ourselves, so it must still be commented out
-          # (amd64) or absent (arm64) upstream, and the per-arch LINPROCFS/
-          # LINSYSFS state must be what each branch above assumes. Either
-          # assumption breaking on a FreeBSD bump is a "Duplicate option" or
-          # "unknown option" failure in config(8), so assert it here where the
-          # message is legible.
-          grep -qE '^#COMPAT_LINUX[[:space:]]' /usr/src/sys/conf/options.amd64
-          if [ "${{ matrix.target }}" = "amd64" ]; then
-            grep -qE '^LINPROCFS[[:space:]]' /usr/src/sys/conf/options.amd64
-            grep -qE '^LINSYSFS[[:space:]]'  /usr/src/sys/conf/options.amd64
-            _mdsrc="amd64/linux"
-          else
-            # Must be absent from the pristine file -- we append them ourselves,
-            # so an upstream addition would become a duplicate.
-            git -C /usr/src show HEAD:sys/conf/options.arm64 \
-              | grep -qE '^(LINPROCFS|LINSYSFS)[[:space:]]' && {
-                echo "options.arm64 now declares LINPROCFS/LINSYSFS upstream;" >&2
-                echo "drop options.compat_linux.arm64 or config(8) will duplicate." >&2
-                exit 1; } || true
-            _mdsrc="arm64/linux"
-          fi
-          for s in $_mdsrc/linux_sysvec.c $_mdsrc/linux_genassym.c \
-                   $_mdsrc/linux_locore.asm $_mdsrc/linux_vdso_gtod.c \
-                   $_mdsrc/linux_vdso.lds.s compat/linux/linux_vdso_inc.S \
-                   compat/linux/linux_elf64.c compat/linprocfs/linprocfs.c \
-                   compat/linsysfs/linsysfs.c; do
-            test -f "/usr/src/sys/$s" || { echo "MISSING /usr/src/sys/$s" >&2; exit 1; }
-          done
-          n=$(grep -c 'optional compat_linux' \
-                /usr/src/sys/conf/files.${{ matrix.target }} || true)
-          echo "==> Linuxulator wired (${{ matrix.target }}): $n entries in files.${{ matrix.target }}; sources present"
 
       - name: Build kernel (no modules)
         run: |
@@ -430,8 +156,7 @@ jobs:
         if: matrix.target == 'arm64'
         run: |
           cd /usr/src
-          cp "$GITHUB_WORKSPACE/config/NEXTBSD-RPI5" /usr/src/sys/arm64/conf/
-          cp "$GITHUB_WORKSPACE/config/rpi5.env" /usr/src/sys/arm64/conf/
+          # NEXTBSD-RPI5 and rpi5.env were laid in by ci/prepare-src.sh.
           ./tools/build/make.py \
             --cross-bindir="${CROSS_BINDIR}" \
             TARGET=arm64 TARGET_ARCH=aarch64 \
