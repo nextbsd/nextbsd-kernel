@@ -39,6 +39,17 @@ script, not in a workflow step.
   `amd64-latest` image; does **not** rebuild modules.
 - `workflow_dispatch` — manual.
 
+## KERNEL-BUILD-ID
+
+Each build stamps `<commit>.<run_id>.<run_attempt>` into
+`sys/NEXTBSD/KERNEL-BUILD-ID` in its obj tree, so it is in both
+`nextbsd-kernel-<arch>.tar.gz` and `kernel-obj-<arch>.tar.gz`, and publishes it
+as the `KERNEL-BUILD-ID` release asset. Both arches and NEXTBSD-RPI5 share the
+run's ID. It is stronger than `__FreeBSD_version`: the same commit rebuilt is a
+new ID. The kext repos copy the ID from the `kernel-obj` they built against
+into every kext tarball, and packaging and the image lanes refuse a kernel and
+kexts whose IDs differ (#326).
+
 The kernel is built with `NO_MODULES=yes`; the `/usr/obj` tree is uploaded as
 `kernel-obj-amd64` for the module job to layer onto.
 

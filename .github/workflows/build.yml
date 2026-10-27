@@ -226,6 +226,24 @@ jobs:
       # exec bit (bmake, cross-tools) survives inside the tar stream; a raw
       # upload-artifact tree comes back 0644 and breaks make.py's bmake
       # bootstrap downstream (PermissionError on /usr/obj/bmake-install/bin/bmake).
+      # KERNEL-BUILD-ID names this exact kernel build: the commit, plus the run
+      # and attempt, because NextBSD patches the kernel and the same commit
+      # rebuilt (new toolchain, new attempt) is a different binary as far as
+      # struct layouts go -- __FreeBSD_version can't tell them apart
+      # (nextbsd-kernel#326, nextbsd-kernel-extensions#46). Both arches and
+      # NEXTBSD-RPI5 share one ID, since they come from one run and one tree.
+      # It lives in the obj dir, so it rides in BOTH tarballs below at
+      # .../sys/NEXTBSD/KERNEL-BUILD-ID: the kext builds read it from
+      # kernel-obj and stamp it into every kext tarball; packaging and the
+      # image lanes compare the two and refuse a mismatch.
+      - name: Stamp KERNEL-BUILD-ID
+        run: |
+          set -eu
+          OBJ="/usr/obj/usr/src/${{ matrix.target }}.${{ matrix.target_arch }}/sys/NEXTBSD"
+          test -f "$OBJ/kernel" || { echo "no kernel at $OBJ" >&2; exit 1; }
+          echo "${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}" > "$OBJ/KERNEL-BUILD-ID"
+          echo "KERNEL-BUILD-ID: $(cat "$OBJ/KERNEL-BUILD-ID")"
+
       - name: Package obj tree (preserves exec bits)
         run: |
           # Full /usr/obj — consumed by nextbsd-kernel-extensions.
@@ -584,6 +602,19 @@ jobs:
           # has not yet moved to rpi5-kernel8-arm64.img keeps building. Delete
           # once nextbsd#414 and its follow-up have landed.
           cp out/rpi5-kernel8-arm64.img out/rpi500-kernel8-arm64.img
+          # One KERNEL-BUILD-ID for the whole run, also as its own asset so a
+          # consumer can check it without downloading a tarball. Each kernel
+          # tarball must carry that same ID (kernel-obj is packed from the same
+          # obj dir in the same step, and is too big to re-read here).
+          ID="${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}"
+          echo "$ID" > out/KERNEL-BUILD-ID
+          for t in out/nextbsd-kernel-*.tar.gz; do
+            f=$(tar -tzf "$t" | grep -m1 'sys/NEXTBSD/KERNEL-BUILD-ID$') \
+              || { echo "FAIL: $t carries no KERNEL-BUILD-ID" >&2; exit 1; }
+            got=$(tar -xzOf "$t" "$f")
+            [ "$got" = "$ID" ] || { echo "FAIL: $t has KERNEL-BUILD-ID $got, expected $ID" >&2; exit 1; }
+            echo "  $(basename "$t"): $got"
+          done
           ls -lh out/
 
       # Stable asset names (no datestamp) → each publish overwrites in place, so
@@ -601,12 +632,17 @@ jobs:
             `rpi500-kernel8-arm64.img` is a transition alias for the same
             file).
 
+            KERNEL-BUILD-ID: `${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}`
+            (also the `KERNEL-BUILD-ID` asset, and `.../sys/NEXTBSD/KERNEL-BUILD-ID`
+            in every tarball). Kexts built against this kernel carry the same ID.
+
             Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             Commit: ${{ github.sha }}
           prerelease: true
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
           files: |
+            out/KERNEL-BUILD-ID
             out/*.tar.gz
             out/rpi5-kernel8-arm64.img
             out/rpi500-kernel8-arm64.img
