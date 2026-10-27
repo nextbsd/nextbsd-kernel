@@ -329,41 +329,19 @@ jobs:
           # a kernel boot regression.
           gh release download continuous -R nextbsd/nextbsd-contrib \
             --pattern 'nextbsd-contrib-${{ matrix.target }}.tar.gz' --dir art --clobber
-          # The kext assets are a mix of arch-suffixed (graphics-kexts-amd64,
-          # graphics-kexts-arm64) and unsuffixed (intelwifi-kext, nvidia-kexts)
-          # names, and '*kext*.tar.gz' matches every one of them -- so before
-          # arm64 assembled anything, an amd64 image was being built with the
-          # arm64 graphics kexts laid in alongside its own. Harmless there
-          # (wrong-arch .ko files simply never load) but wrong, and actively
-          # wrong once both arches assemble. Drop the other arch's suffixed
-          # assets after download.
-          #
-          # And on arm64 drop the UNSUFFIXED ones too. They are amd64 -- the
-          # legacy graphics-kexts.tar.gz, intelwifi-kext, nvidia-kexts -- and
-          # `ls` orders "graphics-kexts.tar.gz" AFTER "graphics-kexts-arm64.tar.gz"
-          # ('-' 0x2d sorts before '.' 0x2e), so the amd64 bundle was extracted
-          # last and laid x86-64 objects over arm64's own. kldload then reported
-          #
-          #   linker_load_file: /System/Library/Extensions/DMABuf.kext/Contents/\
-          #       MacOS/DMABuf - unsupported file type
-          #
-          # and the whole graphics chain never loaded, so nothing on arm64 could
-          # ever exercise VirtIOGraphics. This is the same defect
-          # nextbsd-userland fixed in 64422f0 ("arm64 has never run its own
-          # kexts"); this repo kept the half of it that only drops the other
-          # arch's SUFFIXED assets. Keeping the unsuffixed ones on amd64 is
-          # correct -- there they are that arch's assets.
+          # Kexts by exact asset name, never a '*kext*' wildcard: the release
+          # once also held a stale, arch-less graphics-kexts.tar.gz (Aug 18,
+          # deleted in nextbsd/nextbsd#550) that a wildcard picked up and that
+          # `ls` ordered after graphics-kexts-<arch>.tar.gz, so assembly laid
+          # the old set over the current one (and on arm64, x86-64 objects over
+          # arm64's: "DMABuf - unsupported file type"). Graphics is per-arch;
+          # IntelWiFi, IntelEthernet and NVIDIA are amd64-only.
           gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
-            --pattern '*kext*.tar.gz' --dir art --clobber || true
-          _other=amd64; [ "${{ matrix.target }}" = amd64 ] && _other=arm64
-          rm -f art/*-"$_other".tar.gz
-          if [ "${{ matrix.target }}" != amd64 ]; then
-            for _k in art/*kext*.tar.gz; do
-              [ -e "$_k" ] || continue
-              case "$_k" in
-                *-"${{ matrix.target }}".tar.gz) ;;
-                *) echo "dropping non-arm64 kext asset $_k"; rm -f "$_k" ;;
-              esac
+            --pattern 'graphics-kexts-${{ matrix.target }}.tar.gz' --dir art --clobber || true
+          if [ "${{ matrix.target }}" = amd64 ]; then
+            for _k in intelwifi-kext intelethernet-kext nvidia-kexts; do
+              gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
+                --pattern "$_k.tar.gz" --dir art --clobber || true
             done
           fi
           export BASE_TGZ="$PWD/art/nextbsd-base-${{ matrix.target }}.tar.gz"
