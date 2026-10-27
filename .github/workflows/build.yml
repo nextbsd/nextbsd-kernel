@@ -3,6 +3,9 @@ on:
   repository_dispatch:
     types: [toolchain-updated]
   push:
+    # main only: a PR branch is built by its pull_request run, and a push run
+    # on the same branch was a second, identical build (nextbsd-kernel#324).
+    branches: [main]
     paths: ['patches/**', 'config/**', 'src-overlay/**', 'ci/**', '.github/workflows/build.yml']
   pull_request:
     # Validate the kernel build on PRs touching patches/config/workflow. PR
@@ -10,6 +13,14 @@ on:
     # github.event_name == 'repository_dispatch', which a pull_request is not.
     paths: ['patches/**', 'config/**', 'src-overlay/**', 'ci/**', '.github/workflows/build.yml']
   workflow_dispatch:
+
+# One run per PR: a new push cancels the PR's previous run. Runs on main are
+# never cancelled, since they publish `continuous`; they queue instead. Chain
+# runs (repository_dispatch) get their own group, so a merge queued behind one
+# can't replace it and drop its kernel-updated dispatch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'repository_dispatch' && 'chain' || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   FREEBSD_BRANCH: releng/15.1
@@ -647,10 +658,14 @@ jobs:
             out/rpi5-kernel8-arm64.img
             out/rpi500-kernel8-arm64.img
 
-      # Cascade to modules only on a real source/toolchain change
-      # (repository_dispatch), and only AFTER continuous is refreshed above —
-      # so the module build ingests this run's obj tree, not the prior one.
-      # No run_id needed anymore: modules pulls kernel's continuous release.
+      # Cascade to modules only when this run is part of the chain
+      # (repository_dispatch: an upstream freebsd-src change, or a manual
+      # full-chain run started from freebsd-src's sync-fork.yml with `force`),
+      # and only AFTER continuous is refreshed above, so the module build
+      # ingests this run's obj tree, not the prior one. A merge to main does
+      # NOT rebuild the kexts (nextbsd-kernel#324): they stay stale until the
+      # chain runs, and the KERNEL-BUILD-ID check (#326) makes packaging and
+      # images refuse the mismatched pair.
       - name: Trigger module build
         if: github.event_name == 'repository_dispatch'
         run: |

@@ -32,12 +32,19 @@ script, not in a workflow step.
 
 ## Triggers
 
-- `repository_dispatch: toolchain-updated` — full rebuild on a new toolchain
-  image (new upstream source); uses the SHA-pinned image and **cascades to a
-  module rebuild**.
-- `push` to `patches/**` or `config/**` — kernel-only rebuild on the
-  `amd64-latest` image; does **not** rebuild modules.
-- `workflow_dispatch` — manual.
+- `repository_dispatch: toolchain-updated`: a chain run. It uses the
+  SHA-pinned toolchain image and, after publishing, **dispatches
+  `kernel-updated` to nextbsd-kernel-extensions**. The chain starts at
+  freebsd-src's daily sync when `releng/15.1` moves, or by hand with
+  freebsd-src's `Sync Fork` workflow and `force` checked.
+- `push` to `main` touching `patches/`, `config/`, `src-overlay/`, `ci/` or the
+  workflow: rebuilds and publishes the kernel on the `<arch>-latest` image. It
+  does **not** rebuild the kexts; run the chain by hand when a merge should
+  reach them.
+- `pull_request`: build and boot test only, never publishes or dispatches.
+- `workflow_dispatch`: manual; publishes but does not dispatch.
+
+A new push to a PR cancels that PR's previous run. Runs on `main` queue.
 
 ## KERNEL-BUILD-ID
 
