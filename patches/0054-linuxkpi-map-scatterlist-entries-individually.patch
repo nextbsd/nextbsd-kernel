@@ -39,7 +39,7 @@ if that ever matters, the alternative is a larger nsegments on the tag, but
 linux_dma_map_phys_common()'s KASSERT(++nseg == 1) leans on the current
 nsegments semantics, so this is the safer shape.
 
-Refs nextbsd-kernel#206, nextbsd-kernel-extensions#72.
+Refs nextbsd-kernel#206, nextbsd-kernel-extensions-graphics#72.
 ---
  sys/compat/linuxkpi/common/src/linux_pci.c | 129 ++++++++++++++-------
  1 file changed, 87 insertions(+), 42 deletions(-)

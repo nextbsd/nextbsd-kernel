@@ -63,7 +63,7 @@ struct iocat_lookup {
 };
 
 /*
- * A device-tree personality (nextbsd-kernel-extensions#185).
+ * A device-tree personality (nextbsd-kernel-extensions-graphics#185).
  *
  * PCI personalities match a 32-bit 0x<device><vendor> word; a device-tree node
  * has no such id, it has a "compatible" string list. So this is a SEPARATE
