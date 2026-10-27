@@ -1,7 +1,7 @@
 # NextBSD in-kernel IOKit catalogue (K2, nextbsd#215) — appended to
 # sys/conf/files by the kernel build. Source under sys/dev/iokit, laid in from
 # the nextbsd-kernel src-overlay. `standard`: always compiled into the kernel
-# (the store is inert until the K3 matcher, nextbsd#216, calls it). Wired in
-# build.yml, NOT in patches/series, so the modules build (which shares the
-# series but does not lay in the overlay) never sees an absent source.
+# (the store is inert until the K3 matcher, nextbsd#216, calls it). Wired by
+# ci/prepare-src.sh, NOT in patches/series: a patch can't depend on an overlay
+# file, and every build that lays in this fragment lays in the overlay too.
 dev/iokit/iokit_catalogue.c	standard

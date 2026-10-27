@@ -6,10 +6,9 @@
 # COMPAT_LINUXKPI option already set by NEXTBSD/GENERIC. Source list and the
 # linux_hdmi.c -Wno-cast-qual flag mirror sys/modules/linuxkpi_video/Makefile;
 # the ${LINUXKPI_C} compile rule matches the other compat_linuxkpi entries in
-# sys/conf/files. Appended to sys/conf/files by build.yml on the KERNEL build
-# only -- the modules build shares patches/series but keeps building
-# linuxkpi_video as its own .ko, so it must never see these listed (same rule as
-# files.iocatalogue / files.ioregistry).
+# sys/conf/files. Appended to sys/conf/files by ci/prepare-src.sh (same rule as
+# files.iocatalogue / files.ioregistry). sys/conf/files feeds only config(8),
+# so the modules build still builds sys/modules/linuxkpi_video as its own .ko.
 compat/linuxkpi/common/src/linux_hdmi.c		optional compat_linuxkpi \
 	compile-with "${LINUXKPI_C} -Wno-cast-qual"
 compat/linuxkpi/common/src/linux_aperture.c	optional compat_linuxkpi \

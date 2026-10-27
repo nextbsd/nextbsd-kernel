@@ -13,8 +13,22 @@ patches/
   *.patch     # git format-patch diffs
 config/
   NEXTBSD     # kernel config (include GENERIC; ident NEXTBSD)
+src-overlay/  # NextBSD's own kernel sources + their sys/conf fragments
+ci/
+  prepare-src.sh  # all source preparation (see below)
 .github/workflows/build.yml
 ```
+
+## Source preparation
+
+`ci/prepare-src.sh <target> <target_arch> <nextbsd-userland checkout> [srcdir]`
+turns the toolchain image's unpatched `/usr/src` into the NextBSD kernel tree:
+`patches/series`, the NextBSD identity, the regenerated syscall tables, the
+config, `src-overlay/` and its `sys/conf` wiring, and the generated MIG servers.
+The kernel build runs it, and the kext builds run it at the nextbsd-kernel
+commit whose `kernel-obj` they build against, so both build from the same tree
+(#325). Anything new that changes the source before a build goes in this
+script, not in a workflow step.
 
 ## Triggers
 

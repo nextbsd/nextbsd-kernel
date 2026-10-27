@@ -6,7 +6,7 @@ Kernel source patches applied on top of the baked `/usr/src`
 ## `series` format
 
 One patch filename per line, relative to this directory. **No comments or
-blank lines** — the build applies the file verbatim with:
+blank lines** — `ci/prepare-src.sh` applies the file verbatim with:
 
 ```sh
 for p in $(cat patches/series); do git apply patches/$p; done

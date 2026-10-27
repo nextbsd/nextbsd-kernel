@@ -1,6 +1,6 @@
 ---
 name: mach-kernel-changes
-description: Rules for changing the Mach layer of the NextBSD kernel. Use before adding or changing anything under src-overlay/sys/compat/mach, src-overlay/sys/sys/mach/*.defs or *.msgids, ci/gen-mig-servers.sh or ci/verify-mig-abi.sh, or before adding or wiring a Mach syscall trap. Covers where a change belongs (patches/ vs src-overlay/ vs build.yml), the MIG-first decision gate in front of any new trap, the .defs → generated server workflow and its silent msgh_id renumbering trap, and what the CI checkmark does and does not prove.
+description: Rules for changing the Mach layer of the NextBSD kernel. Use before adding or changing anything under src-overlay/sys/compat/mach, src-overlay/sys/sys/mach/*.defs or *.msgids, ci/gen-mig-servers.sh or ci/verify-mig-abi.sh, or before adding or wiring a Mach syscall trap. Covers where a change belongs (patches/ vs src-overlay/ vs ci/prepare-src.sh), the MIG-first decision gate in front of any new trap, the .defs → generated server workflow and its silent msgh_id renumbering trap, and what the CI checkmark does and does not prove.
 ---
 
 # Changing the Mach layer in the kernel
@@ -22,28 +22,28 @@ FreeBSD-shaped drivers (`0015`, `0018`, `0025`) add new files as patches.
 | Edit an existing freebsd-src file | `patches/` + a line in `patches/series` (`patches/README.md`) |
 | Anything under `compat/mach`, `sys/mach`, `sys/apple`, `dev/iokit` | `src-overlay/sys/…` + a line in the matching `src-overlay/conf/files.*` |
 | Option stock FreeBSD declares | `config/NEXTBSD` |
-| Option only the overlay declares (`COMPAT_MACH`, `COMPAT_LINUX`, …) | a wiring step in `build.yml`, **never** `config/NEXTBSD` |
+| Option only the overlay declares (`COMPAT_MACH`, `COMPAT_LINUX`, …) | the wiring in `ci/prepare-src.sh`, **never** `config/NEXTBSD` |
 
-Mechanically: the series is `git apply`'d in `series` order (no comments, no
-blank lines, not numerically sorted). Then the "Build mach into the kernel"
-step `cp -R`s `src-overlay/sys/.` over `/usr/src/sys/` (`build.yml:111`) and
-wires `COMPAT_MACH` into `sys/conf/options`, `sys/conf/files`,
-`kern.pre.mk` and the copied config (`build.yml:117-128`). A patch can never
-depend on an overlay file. The overlay may assume patched sources, and does.
+Mechanically, `ci/prepare-src.sh` does all of it, and both the kernel build
+and the kext builds run it (#325). The series is `git apply`'d in `series`
+order (no comments, no blank lines, not numerically sorted). Then the script
+`cp -R`s `src-overlay/sys/.` over `/usr/src/sys/`, wires `COMPAT_MACH` into
+`sys/conf/options`, `sys/conf/files`, `kern.pre.mk` and the copied config, and
+generates the MIG servers. A patch can never depend on an overlay file. The
+overlay may assume patched sources, and does.
 
-**The last row is the one that bites.** nextbsd-kernel-extensions reuses
-`patches/series` and `config/NEXTBSD` to build a KBI-matched kernel and lays
-in none of `src-overlay/`. An overlay-only option named in `config/NEXTBSD`
-makes its `config(8)` die with `unknown option`. That broke both legs of the
-modules build from 2026-08-03 while this repo stayed green
-(`config/NEXTBSD:132-140`, `build.yml:100-107`).
+**The last row is the one that bites.** Any build that copies
+`config/NEXTBSD` without running the script dies in `config(8)` with
+`unknown option` on an overlay-only option named there. That broke both legs
+of the kext repo's modules build from 2026-08-03 while this repo stayed green
+(`config/NEXTBSD`, the COMPAT_LINUX comment).
 
-**Some kernel code is injected by `build.yml` itself.** The global
-`mach_knote_enqueue()` wrapper is `printf`'d onto the end of `kern_event.c`
-(`build.yml:112-116`). Grep `build.yml` before deciding a symbol is missing.
+**Some kernel code is injected by `ci/prepare-src.sh` itself.** The global
+`mach_knote_enqueue()` wrapper is `printf`'d onto the end of `kern_event.c`.
+Grep the script before deciding a symbol is missing.
 
-Patches target freebsd-src **`releng/15.1`** (`FREEBSD_BRANCH`,
-`build.yml:15`). `patches/README.md` still says an empty series builds
+Patches target freebsd-src **`releng/15.1`** (`FREEBSD_BRANCH` in
+`build.yml`). `patches/README.md` still says an empty series builds
 "stock `releng/15.0`"; it is stale.
 
 ## The decision gate: before you add a trap
@@ -91,8 +91,8 @@ servers from .defs" step. It:
 
 1. Builds a **host** `migcom` from
    `nextbsd-userland/src/bootstrap_cmds/migcom.tproj`. The kernel workflow
-   checks out userland **`main`** for this ("Checkout nextbsd-userland",
-   `build.yml:151-156`). The target-arch migcom in the userland tarball is
+   checks out userland **`main`** for this ("Checkout nextbsd-userland" in
+   `build.yml`) and passes it to `ci/prepare-src.sh`. The target-arch migcom in the userland tarball is
    useless when the x86 runner cross-builds arm64.
 2. Takes the wire-type vocabulary (`std_types.defs`, `mach_types.defs`) from
    userland's `src/libmach/include`. Every subsystem `.defs` comes from
@@ -124,8 +124,8 @@ So the generated C is not committed. A `.msgids` file is
 (`src-overlay/sys/sys/mach/<sub>.msgids`, format `<msgid> <routine|skip>
 <argc>` under a `subsystem <name> <base> <end>` line). `ci/verify-mig-abi.sh
 <server.c> <contract.msgids>` checks base, end and every slot, tombstones
-included, on every build ("Verify MIG ABI against the frozen contract",
-`build.yml:176-193`). Changing a `.msgids` is an ABI break. If it is
+included, on every build ("Verify MIG ABI against the frozen contract" in
+`build.yml`). Changing a `.msgids` is an ABI break. If it is
 intentional, change it in the same commit and say why.
 
 ### Passing the ABI gate does not mean it compiles
@@ -144,7 +144,7 @@ from. Wait for the `kernel` job on both arches.
    from the frozen server **before** you replace it.
 3. Add `gen_one <sub>` to `ci/gen-mig-servers.sh`, and a header case there if
    the server's own entry points need one.
-4. Add `<sub>` to the verify loop in `build.yml` (`for sub in …`, `:189`).
+4. Add `<sub>` to the verify loop in `build.yml` (`for sub in …`).
 5. New subsystem only: list `compat/mach/<sub>_server.c` in
    `src-overlay/conf/files.compat_mach` and add `&<sub>_subsystem` to
    `mig_e[]` in `ipc_kobject.c`.
@@ -180,7 +180,7 @@ lands in this order:
 
 ## Never edit a `*_server.c`
 
-The rule in `build.yml`: **"No generated source is ever committed to this
+The rule in `ci/prepare-src.sh`: **"No generated source is ever committed to this
 repo."** The six 2015 servers are still checked in, at
 `src-overlay/sys/compat/mach/{clock,host_priv,mach_host,mach_vm,task,vm_map}_server.c`
 (21,735 lines). They are dead: `gen_one` overwrites each one at build time.
@@ -245,10 +245,10 @@ current one to `/boot/kernel.old/` first: images ship without a fallback.
 **The gate is the existing CI, as-is**: `build.yml` plus the pinned
 nextbsd-ci boot smoke test, on both arches. Do not add tests, markers,
 hardware gates or harness changes to get a change in. The harness is
-nextbsd/nextbsd-ci pinned at `v0.3.5` (`build.yml:526`, `671`, `765`); never
+nextbsd/nextbsd-ci pinned at `v0.3.5` (the `nextbsd-ci` checkouts in `build.yml`); never
 modify it from here.
 
-`publish continuous` (`build.yml:807`) needs only the `kernel` job, so both
+`publish continuous` in `build.yml` needs only the `kernel` job, so both
 arches are load-bearing even for an amd64-only change. Nothing downstream
 picks it up automatically: nextbsd-pkg publishes only by `workflow_dispatch`.
 
@@ -256,11 +256,11 @@ picks it up automatically: nextbsd-pkg publishes only by `workflow_dispatch`.
 
 Read the right step, and know what it covered.
 
-- The boot steps carry `continue-on-error: true` (`build.yml:683`, `:770`).
+- The boot steps carry `continue-on-error: true`.
   That masks the **step** conclusion as well as the job's, so a boot that
   exited non-zero still shows a checkmark. Each is followed by **"Gate —
   kernel booted clean"** keyed on `steps.boottest.outputs.rc`
-  (`build.yml:700-706`, `785-791`), which prints `BOOT-GATE-FAIL` and the
+  (one per arch), which prints `BOOT-GATE-FAIL` and the
   harness rc. Read the Gate step and grep the uploaded `boot-log` /
   `boot-log-arm64` transcript for markers; do not read the checkmark.
 - The kernel smoke tests are **login-only** (`NB_LOGIN_ONLY=1`), under qemu,
