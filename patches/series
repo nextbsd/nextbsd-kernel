@@ -61,3 +61,4 @@
 0068-NextBSD-add-evdev_registered-evdev_unregistering-eve.patch
 0069-NextBSD-evdev-end-driver-frames-with-SYN_REPORT-0-as.patch
 0070-NextBSD-compile-DTrace-into-the-kernel.patch
+0071-NextBSD-create-no-pflog0-at-boot-as-xnu-does.patch

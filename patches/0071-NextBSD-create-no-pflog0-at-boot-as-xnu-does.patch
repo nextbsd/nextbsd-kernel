@@ -1,0 +1,38 @@
+From 2e3980f1ebb9a20677738083c9f311facaf606b4 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 28 Oct 2026 13:57:22 -0500
+Subject: [PATCH] NextBSD: create no pflog0 at boot, as xnu does
+
+FreeBSD's pflogattach() creates pflog0 when pf loads. xnu registers its
+pflog cloner with a minimum of 0 interfaces, so a Mac has no pflog0 until
+something creates one (checked on 10.9.5 and current macOS). Leave the
+cloner registered and create nothing; `ifconfig pflog0 create` makes it
+when pf logging is wanted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/netpfil/pf/if_pflog.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/sys/netpfil/pf/if_pflog.c b/sys/netpfil/pf/if_pflog.c
+index cb96d2fcc..99bf6e264 100644
+--- a/sys/netpfil/pf/if_pflog.c
++++ b/sys/netpfil/pf/if_pflog.c
+@@ -114,8 +114,12 @@ pflogattach(int npflog __unused)
+ 		.flags = IFC_F_AUTOUNIT,
+ 	};
+ 	V_pflog_cloner = ifc_attach_cloner(pflogname, &req);
+-	struct ifc_data ifd = { .unit = 0 };
+-	ifc_create_ifp(pflogname, &ifd, NULL);
++	/*
++	 * NextBSD: no pflog0 at boot, as in xnu (whose pflog cloner has a
++	 * minimum of 0 interfaces). Whoever enables pf logging creates it with
++	 * `ifconfig pflog0 create`; until then pf's log rules have nowhere to
++	 * log, which it already handles.
++	 */
+ }
+ 
+ static int
+-- 
+2.54.0 (Apple Git-157)
+
