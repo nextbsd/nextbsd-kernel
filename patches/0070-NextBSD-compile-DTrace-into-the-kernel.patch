@@ -1,4 +1,4 @@
-From e8ba0c1233eb5249a74be6cff42884b5d7805a0c Mon Sep 17 00:00:00 2001
+From 5bf74507ff275804d407aabd425014115ba0b4cd Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
 Date: Wed, 28 Oct 2026 10:48:49 -0500
 Subject: [PATCH] NextBSD: compile DTrace into the kernel: add the missing
@@ -10,8 +10,7 @@ compiles DTrace in, as xnu does:
 
 - files.amd64 and files.arm64 list dtrace_asm.S and dtrace_subr.c but not
   dtrace_isa.c (stack walking, dtrace_copyin/fuword*), and arm64 lacks
-  instr_size.c; files lacks opensolaris_taskq.c, which dtrace.c uses. Add
-  them, matching sys/modules/dtrace/dtrace.
+  instr_size.c. Add them, matching sys/modules/dtrace/dtrace.
 - FBT_CFLAGS adds -I cddl/dev/fbt/amd64, which doesn't exist (amd64's fbt
   is under x86/), and -Wmissing-include-dirs fails the build.
 - fasttrap (pid and USDT probes) is module-only; add it to files.amd64 as
@@ -21,25 +20,17 @@ compiles DTrace in, as xnu does:
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- sys/conf/files       |  3 ++-
+ sys/conf/files       |  2 +-
  sys/conf/files.amd64 |  8 ++++++++
  sys/conf/files.arm64 |  2 ++
  sys/conf/kern.pre.mk | 11 ++++++++++-
- 4 files changed, 22 insertions(+), 2 deletions(-)
+ 4 files changed, 21 insertions(+), 2 deletions(-)
 
 diff --git a/sys/conf/files b/sys/conf/files
-index 7f925bfc3..9ac393b19 100644
+index 7f925bfc3..ca216ab07 100644
 --- a/sys/conf/files
 +++ b/sys/conf/files
-@@ -135,6 +135,7 @@ cam/scsi/smp_all.c		optional scbus
- # shared between zfs and dtrace
- cddl/compat/opensolaris/kern/opensolaris.c		optional dtrace compile-with "${CDDL_C}"
- cddl/compat/opensolaris/kern/opensolaris_proc.c		optional zfs | dtrace compile-with "${CDDL_C}"
-+cddl/compat/opensolaris/kern/opensolaris_taskq.c	optional dtrace compile-with "${CDDL_C}"
- contrib/openzfs/module/os/freebsd/spl/spl_misc.c		optional zfs | dtrace compile-with "${ZFS_C}"
- contrib/openzfs/module/os/freebsd/spl/spl_cmn_err.c		optional zfs | dtrace compile-with "${ZFS_C}"
- contrib/openzfs/module/os/freebsd/spl/spl_taskq.c		optional zfs | dtrace compile-with "${ZFS_C}"
-@@ -224,7 +225,7 @@ contrib/openzfs/module/os/freebsd/zfs/zio_crypt.c		optional zfs compile-with "${
+@@ -224,7 +224,7 @@ contrib/openzfs/module/os/freebsd/zfs/zio_crypt.c		optional zfs compile-with "${
  contrib/openzfs/module/os/freebsd/zfs/zvol_os.c		optional zfs compile-with "${ZFS_C}"
  
  #zfs unicode support
