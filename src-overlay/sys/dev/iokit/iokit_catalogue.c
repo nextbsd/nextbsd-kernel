@@ -65,9 +65,20 @@ static void iocat_rematch_pending(void);
  * present, driver-less devices the catalogue now claims. Robust autoload trigger
  * that does not depend on the device_nomatch event having been captured (real
  * hardware misses boot nomatches the eventhandler never saw). Runs on the
- * taskqueue (sleeps/allocates), debounced by taskqueue coalescing. */
+ * taskqueue (sleeps/allocates).
+ *
+ * Both rematches run once per push batch, not once per personality: kextd adds
+ * personalities one IOCATIOCADD at a time (one per USB vendor/product pair, so
+ * thousands with the full FreeBSD kext set), and a rescan plus load request per
+ * add flooded kextd and the console. Like Darwin's IOCatalogue, which matches
+ * after the whole set is added, each add (re)arms one timeout task that fires
+ * IOCAT_SETTLE_MS after the last add of the batch. */
 static void iocat_rematch_present(void);
-static struct task iocat_present_task;
+static struct timeout_task iocat_present_task;
+#define	IOCAT_SETTLE_MS	250
+#define	iocat_schedule_rematch()					\
+	taskqueue_enqueue_timeout(taskqueue_thread, &iocat_present_task,	\
+	    MAX(1, IOCAT_SETTLE_MS * hz / 1000))
 
 static MALLOC_DEFINE(M_IOCAT, "iocatalogue", "in-kernel IOKit catalogue");
 
@@ -142,15 +153,13 @@ iocat_add(struct iocat_add *ua)
 	sx_xunlock(&iocat_lock);
 
 	/* push-triggers-match: this personality may claim a device that went
-	 * unmatched earlier (e.g. the 8260 at boot, before kextd pushed). Re-run
-	 * the matcher over the pending list now. Done after the lock is dropped
-	 * (the rematch path re-takes iocat_lock via iocat_lookup_pci). */
-	iocat_rematch_pending();
-	/* Also actively rescan the live PCI tree — the boot device_nomatch capture
-	 * is unreliable on real hardware, so iocat_pending may not contain a device
-	 * that is in fact present and unmatched. Deferred to the taskqueue (the scan
-	 * sleeps/allocates) and coalesced across a push batch. */
-	taskqueue_enqueue(taskqueue_thread, &iocat_present_task);
+	 * unmatched earlier (e.g. the 8260 at boot, before kextd pushed): re-run
+	 * the matcher over the pending list, and also actively rescan the live
+	 * PCI tree — the boot device_nomatch capture is unreliable on real
+	 * hardware, so iocat_pending may not contain a device that is in fact
+	 * present and unmatched. Both on the taskqueue, once the push batch
+	 * settles (the rematch path re-takes iocat_lock via iocat_lookup_pci). */
+	iocat_schedule_rematch();
 	return (0);
 }
 
@@ -303,8 +312,7 @@ iocat_add_compat(struct iocat_add_compat *ua)
 
 	/* Same push-triggers-match as the PCI path: a device may already have
 	 * gone unmatched before this personality existed. */
-	iocat_rematch_pending();
-	taskqueue_enqueue(taskqueue_thread, &iocat_present_task);
+	iocat_schedule_rematch();
 	return (0);
 }
 
@@ -904,6 +912,7 @@ iocat_rematch_present(void)
 static void
 iocat_present_taskfn(void *ctx __unused, int pending __unused)
 {
+	iocat_rematch_pending();
 	iocat_rematch_present();
 }
 
@@ -1150,7 +1159,8 @@ iocat_modevent(module_t mod __unused, int type, void *data __unused)
 	case MOD_LOAD:
 		mtx_init(&iocat_work_mtx, "iocat_work", NULL, MTX_DEF);
 		TASK_INIT(&iocat_match_task, 0, iocat_match_taskfn, NULL);
-		TASK_INIT(&iocat_present_task, 0, iocat_present_taskfn, NULL);
+		TIMEOUT_TASK_INIT(taskqueue_thread, &iocat_present_task, 0,
+		    iocat_present_taskfn, NULL);
 		iocat_dev = make_dev(&iocat_cdevsw, 0, UID_ROOT, GID_WHEEL,
 		    0600, "iocatalogue");
 		if (iocat_dev == NULL) {
@@ -1165,7 +1175,7 @@ iocat_modevent(module_t mod __unused, int type, void *data __unused)
 		if (iocat_nomatch_tag != NULL)
 			EVENTHANDLER_DEREGISTER(device_nomatch, iocat_nomatch_tag);
 		taskqueue_drain(taskqueue_thread, &iocat_match_task);
-		taskqueue_drain(taskqueue_thread, &iocat_present_task);
+		taskqueue_drain_timeout(taskqueue_thread, &iocat_present_task);
 		if (iocat_dev != NULL)
 			destroy_dev(iocat_dev);
 		while ((w = STAILQ_FIRST(&iocat_work)) != NULL) {

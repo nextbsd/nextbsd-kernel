@@ -15,29 +15,89 @@ ident	NEXTBSD
 options 	ROOTDEVNAME=\"ufs:/dev/ufs/ROOTFS\"
 options 	INIT_PATH=/sbin/launchd
 
-# em(4) (the Intel PRO/1000 em and igb families) is compiled in, as in GENERIC
-# (#328, E21 D5). It was removed for a while (#219) so it would load as
-# IntelEthernet.kext, the first driver-to-kext conversion; the graphics kexts
-# and IntelWiFi now prove hardware-matched kext loading, and the network driver
-# of every amd64 VM and most Intel boards should not depend on kextd.
+# Network drivers are kexts, not part of the kernel (E21 D11-D13). The kernel
+# keeps only what must work before kextd runs, and drops hardware older than
+# about 2012:
+#
+#   * Modern PCI NICs load as kexts from nextbsd-kernel-extensions: kextd's
+#     personalities, generated from each driver's own PCI table, let the IOKit
+#     matcher load them as the device appears (E21 D12: a driver leaves the
+#     kernel only when its kext autoloads). em/igb (IntelEM.kext), igc, ix, ixv,
+#     ixl, iavf, ice, bge, alc, vmx and enetc; re is Realtek's own driver
+#     (RealtekRE.kext, E21 D14), which replaces base re(4).
+#   * net80211 (wlan and every plug-in) is the Wlan family kext, and LinuxKPI
+#     802.11 comes with it as LinuxKpiWlan.kext. Wi-Fi drivers depend on them.
+#   * Pre-2012 Ethernet and Wi-Fi are not shipped at all (E21 D13).
+#   * vtnet stays compiled in, so VMs (and CI) have a network before kextd and
+#     in single-user mode. So do the arm64 board NICs on USB or device tree
+#     (genet, cgem, awg, mvneta, muge, smsc, ure, axa) until USB and
+#     device-tree autoload are proven on hardware.
+#
+# config(8) ignores a nodevice for a device the arch never declared, so one
+# list serves both arches.
+nodevice	em
+nodevice	igc
+nodevice	ix
+nodevice	ixv
+nodevice	ixl
+nodevice	iavf
+nodevice	ice
+nodevice	re
+nodevice	bge
+nodevice	alc
+nodevice	vmx
+nodevice	enetc
+# pre-2012 Ethernet (E21 D13)
+nodevice	ae
+nodevice	age
+nodevice	ale
+nodevice	axp
+nodevice	bce
+nodevice	bfe
+nodevice	bxe
+nodevice	cas
+nodevice	dc
+nodevice	et
+nodevice	fxp
+nodevice	gem
+nodevice	jme
+nodevice	lge
+nodevice	msk
+nodevice	nfe
+nodevice	nge
+nodevice	rl
+nodevice	sge
+nodevice	sis
+nodevice	sk
+nodevice	ste
+nodevice	stge
+nodevice	ti
+nodevice	vge
+nodevice	vr
+nodevice	xl
+# pre-2012 Wi-Fi (E21 D13)
+nodevice	ath
+nodevice	ath_hal
+nodevice	ath_rate_sample
+nodevice	ipw
+nodevice	iwi
+nodevice	iwn
+nodevice	malo
+nodevice	mwl
+nodevice	ral
+nodevice	wpi
+# net80211: the Wlan family kext
+nodevice	wlan
+nodevice	wlan_wep
+nodevice	wlan_tkip
+nodevice	wlan_ccmp
+nodevice	wlan_gcmp
+nodevice	wlan_amrr
 
-# 802.11: the net80211 core and every plug-in, on both arches (#53, E21 D5).
-# amd64 GENERIC already has most of these; arm64 GENERIC has none, so arm64
-# had no 802.11 layer at all. The plug-ins never autoload (there is no .ko
-# tree), so they are all compiled in. config(8) ignores a device or option
-# GENERIC already declares, so one list serves both arches. COMPAT_LINUXKPI
-# (which LinuxKPI 802.11 and the drm kexts need) is set explicitly: on arm64 it
-# otherwise arrives only through GENERIC's include of std.azure.
+# COMPAT_LINUXKPI is set explicitly: the drm and LinuxKPI 802.11 kexts link
+# against it, and on arm64 it otherwise arrives only through GENERIC's include
+# of std.azure.
 options 	COMPAT_LINUXKPI
-device		wlan			# 802.11 support
-device		wlan_wep		# 802.11 WEP
-device		wlan_tkip		# 802.11 TKIP
-device		wlan_ccmp		# 802.11 CCMP
-device		wlan_gcmp		# 802.11 GCMP
-device		wlan_amrr		# AMRR transmit rate control
-device		wlan_rssadapt		# RSS-adaptive transmit rate control
-device		wlan_xauth		# external authenticator (hostapd)
-device		wlan_acl		# MAC-based ACLs (hostapd)
 
 # base virtio_gpu(4) is deliberately KEPT (nextbsd-kernel#170).
 #
