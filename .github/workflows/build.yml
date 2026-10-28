@@ -257,7 +257,7 @@ jobs:
 
       - name: Package obj tree (preserves exec bits)
         run: |
-          # Full /usr/obj — consumed by nextbsd-kernel-extensions-graphics and -nvidia.
+          # Full /usr/obj — consumed by nextbsd-kernel-extensions, -graphics and -nvidia.
           tar -czf "/tmp/kernel-obj-${{ matrix.target }}.tar.gz" -C /usr/obj .
           # sys/NEXTBSD subtree (kernel binary + opt_*.h) — consumed by nextbsd.
           SUB=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD' | head -1)
@@ -335,17 +335,16 @@ jobs:
           # `ls` ordered after graphics-kexts-<arch>.tar.gz, so assembly laid
           # the old set over the current one (and on arm64, x86-64 objects over
           # arm64's: "DMABuf - unsupported file type"). Graphics is per-arch;
-          # IntelWiFi, IntelEthernet and NVIDIA are amd64-only. NVIDIA comes from
-          # its own repo (nextbsd/nextbsd#548). Every kext asset must be there:
+          # the FreeBSD kexts (IntelWiFi, IntelEthernet) and NVIDIA are amd64-only
+          # and come from their own repos (nextbsd/nextbsd#554, #548). Every kext
+          # asset must be there:
           # a missing one fails the lane instead of booting an image without
           # it (nextbsd/nextbsd#552).
           gh release download continuous -R nextbsd/nextbsd-kernel-extensions-graphics \
             --pattern 'graphics-kexts-${{ matrix.target }}.tar.gz' --dir art --clobber
           if [ "${{ matrix.target }}" = amd64 ]; then
-            for _k in intelwifi-kext intelethernet-kext; do
-              gh release download continuous -R nextbsd/nextbsd-kernel-extensions-graphics \
-                --pattern "$_k.tar.gz" --dir art --clobber
-            done
+            gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
+              --pattern 'freebsd-kexts-amd64.tar.gz' --dir art --clobber
             gh release download continuous -R nextbsd/nextbsd-kernel-extensions-nvidia \
               --pattern 'nvidia-kexts-amd64.tar.gz' --dir art --clobber
           fi
@@ -358,7 +357,7 @@ jobs:
           # kernel, which no kext was built for yet, so check the kexts against
           # the published kernel instead: it still refuses kexts that are stale
           # relative to main. (Kexts are rebuilt after a kernel merge by a merge
-          # to nextbsd-kernel-extensions-graphics, a manual run of its workflow, or
+          # to each kext repo, a manual run of its workflow, or
           # freebsd-src's Sync Fork with force.)
           EXPECT_KERNEL_BUILD_ID="$(gh release download continuous -R nextbsd/nextbsd-kernel \
             --pattern KERNEL-BUILD-ID --output - )"
@@ -632,7 +631,7 @@ jobs:
           name: Continuous kernel build
           body: |
             Rolling kernel build, refreshed on every successful `main` build.
-            Consumed by nextbsd-kernel-extensions-graphics and -nvidia (`kernel-obj-<arch>.tar.gz`) and
+            Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-obj-<arch>.tar.gz`) and
             nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
             `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
             `rpi500-kernel8-arm64.img` is a transition alias for the same
@@ -661,12 +660,18 @@ jobs:
       # NOT rebuild the kexts (nextbsd-kernel#324): they stay stale until the
       # chain runs, and the KERNEL-BUILD-ID check (#326) makes packaging and
       # images refuse the mismatched pair.
-      - name: Trigger module build
+      # Both kext repos build against this kernel: the FreeBSD kexts and the
+      # graphics kexts (nextbsd/nextbsd#554). NVIDIA is run by hand after
+      # graphics publishes. Each dispatch must succeed.
+      - name: Trigger kext builds
         if: github.event_name == 'repository_dispatch'
         run: |
-          gh api repos/nextbsd/nextbsd-kernel-extensions-graphics/dispatches \
-            -f event_type=kernel-updated \
-            -f "client_payload[fbsd_sha]=${{ github.event.client_payload.fbsd_sha }}" \
-            -f "client_payload[sha]=${{ github.sha }}"
+          for repo in nextbsd-kernel-extensions nextbsd-kernel-extensions-graphics; do
+            gh api "repos/nextbsd/$repo/dispatches" \
+              -f event_type=kernel-updated \
+              -f "client_payload[fbsd_sha]=${{ github.event.client_payload.fbsd_sha }}" \
+              -f "client_payload[sha]=${{ github.sha }}"
+            echo "dispatched kernel-updated to $repo"
+          done
         env:
           GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
