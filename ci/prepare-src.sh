@@ -115,6 +115,12 @@ if [ "$TARGET" = arm64 ]; then
 	cp "$REPO/config/NEXTBSD-RPI5" "$SRC/sys/arm64/conf/"
 	cp "$REPO/config/rpi5.env" "$SRC/sys/arm64/conf/"
 fi
+# DTrace's userland provider (pid, USDT). `device fasttrap` only exists on
+# amd64 (patch 0070; FreeBSD has no arm64 fasttrap), and config(8) fails on a
+# device the arch never declared, so it can't go in the shared config/NEXTBSD.
+if [ "$TARGET" = amd64 ]; then
+	printf 'device\tfasttrap\n' >> "$CONF"
+fi
 
 # --------------------------------------------------------------- overlay ----
 # NextBSD-original sources (not freebsd-src), laid into the throwaway tree; the

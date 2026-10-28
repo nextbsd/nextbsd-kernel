@@ -1,0 +1,139 @@
+From cf7fbd0729e73446eb3f9925d9d20657b94e22d9 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 28 Oct 2026 10:39:20 -0500
+Subject: [PATCH] NextBSD: let amd64 compile vmm and fasttrap into the kernel
+
+Stock FreeBSD builds bhyve's vmm and DTrace's fasttrap provider for amd64
+only as modules (sys/modules/vmm, sys/modules/dtrace/fasttrap). NextBSD
+compiles both in, as xnu does its hypervisor and userland DTrace support,
+so add them to files.amd64 as `device vmm` and `device fasttrap`, with
+the include paths, defines and genassym headers (vmx_assym.h,
+svm_assym.h) their module Makefiles use. arm64 already has `device vmm`;
+FreeBSD has no arm64 fasttrap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/conf/files       |  2 +-
+ sys/conf/files.amd64 | 73 ++++++++++++++++++++++++++++++++++++++++++++
+ sys/conf/kern.pre.mk |  8 +++++
+ 3 files changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/sys/conf/files b/sys/conf/files
+index 7f925bfc3..ca216ab07 100644
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -224,7 +224,7 @@ contrib/openzfs/module/os/freebsd/zfs/zio_crypt.c		optional zfs compile-with "${
+ contrib/openzfs/module/os/freebsd/zfs/zvol_os.c		optional zfs compile-with "${ZFS_C}"
+ 
+ #zfs unicode support
+-contrib/openzfs/module/unicode/u8_textprep.c		optional zfs compile-with "${ZFS_C}"
++contrib/openzfs/module/unicode/u8_textprep.c		optional zfs | fasttrap compile-with "${ZFS_C}"
+ 
+ #zfs checksums / zcommon
+ contrib/openzfs/module/zcommon/cityhash.c		optional zfs compile-with "${ZFS_C}"
+diff --git a/sys/conf/files.amd64 b/sys/conf/files.amd64
+index 9837086af..eab19dbf3 100644
+--- a/sys/conf/files.amd64
++++ b/sys/conf/files.amd64
+@@ -37,6 +37,79 @@ ia32_assym.h			standard				\
+ 	no-obj no-implicit-rule before-depend				\
+ 	clean		"ia32_assym.h"
+ #
++#
++# NextBSD: bhyve's vmm compiled into the kernel (`device vmm`). Stock FreeBSD
++# builds it for amd64 only as sys/modules/vmm; these mirror that Makefile.
++#
++vmx_genassym.o			optional vmm				\
++	dependency 	"$S/amd64/vmm/intel/vmx_genassym.c offset.inc"	\
++	compile-with	"${CC} ${CFLAGS:N-flto*:N-fno-common:N-fsanitize*:N-fno-sanitize*} ${VMM_INCS} -fcommon -c ${.IMPSRC}" \
++	no-obj no-implicit-rule						\
++	clean		"vmx_genassym.o"
++vmx_assym.h			optional vmm				\
++	dependency 	"$S/kern/genassym.sh vmx_genassym.o"		\
++	compile-with	"env NM='${NM}' NMFLAGS='${NMFLAGS}' sh $S/kern/genassym.sh vmx_genassym.o > ${.TARGET}" \
++	no-obj no-implicit-rule before-depend				\
++	clean		"vmx_assym.h"
++svm_genassym.o			optional vmm				\
++	dependency 	"$S/amd64/vmm/amd/svm_genassym.c offset.inc"	\
++	compile-with	"${CC} ${CFLAGS:N-flto*:N-fno-common:N-fsanitize*:N-fno-sanitize*} ${VMM_INCS} -fcommon -c ${.IMPSRC}" \
++	no-obj no-implicit-rule						\
++	clean		"svm_genassym.o"
++svm_assym.h			optional vmm				\
++	dependency 	"$S/kern/genassym.sh svm_genassym.o"		\
++	compile-with	"env NM='${NM}' NMFLAGS='${NMFLAGS}' sh $S/kern/genassym.sh svm_genassym.o > ${.TARGET}" \
++	no-obj no-implicit-rule before-depend				\
++	clean		"svm_assym.h"
++dev/vmm/vmm_dev.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++dev/vmm/vmm_mem.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++dev/vmm/vmm_stat.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++dev/vmm/vmm_vm.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/vmm.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/vmm_dev_machdep.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/vmm_instruction_emul.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/vmm_host.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/vmm_ioport.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/vmm_lapic.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/vmm_mem_machdep.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/vmm_util.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/x86.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/io/iommu.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/io/ppt.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/io/vatpic.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/io/vatpit.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/io/vhpet.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/io/vioapic.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/io/vlapic.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/io/vpmtmr.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/io/vrtc.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/intel/ept.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/intel/vmcs.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/intel/vmx_msr.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/intel/vmx.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/intel/vtd.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/amd/vmcb.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/amd/amdviiommu.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/amd/svm.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/amd/npt.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/amd/ivrs_drv.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/amd/amdvi_hw.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/amd/svm_msr.c	optional vmm compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/vmm_snapshot.c	optional vmm bhyve_snapshot compile-with "${NORMAL_C} ${VMM_INCS}"
++amd64/vmm/amd/ivhd_if.m	optional vmm
++amd64/vmm/intel/vmx_support.S	optional vmm				\
++	dependency	"vmx_assym.h"					\
++	compile-with	"${NORMAL_S} ${VMM_INCS}"
++amd64/vmm/amd/svm_support.S	optional vmm				\
++	dependency	"svm_assym.h"					\
++	compile-with	"${NORMAL_S} ${VMM_INCS}"
++#
++# NextBSD: DTrace's userland provider (pid, USDT) compiled into the kernel
++# (`device fasttrap`). Stock FreeBSD builds it only as
++# sys/modules/dtrace/fasttrap.
++#
++cddl/contrib/opensolaris/uts/common/dtrace/fasttrap.c	optional fasttrap dtrace compile-with "${FASTTRAP_C}"
++cddl/contrib/opensolaris/uts/intel/dtrace/fasttrap_isa.c	optional fasttrap dtrace compile-with "${FASTTRAP_C}"
+ amd64/acpica/acpi_machdep.c	optional	acpi
+ amd64/acpica/acpi_wakeup.c	optional	acpi
+ acpi_wakecode.o			optional	acpi			\
+diff --git a/sys/conf/kern.pre.mk b/sys/conf/kern.pre.mk
+index 025148624..bcd63802e 100644
+--- a/sys/conf/kern.pre.mk
++++ b/sys/conf/kern.pre.mk
+@@ -250,6 +250,14 @@ DTRACE_ASM_CFLAGS=	-x assembler-with-cpp -DLOCORE ${DTRACE_CFLAGS}
+ DTRACE_C=	${CC} -c ${DTRACE_CFLAGS}	${WERROR} ${.IMPSRC}
+ DTRACE_S=	${CC} -c ${DTRACE_ASM_CFLAGS}	${WERROR} ${.IMPSRC}
+ 
++# NextBSD: fasttrap compiled into the kernel (files.amd64), with the flags
++# sys/modules/dtrace/fasttrap builds it with.
++FASTTRAP_C=	${CC} -c ${DTRACE_CFLAGS} -include $S/cddl/compat/opensolaris/sys/debug_compat.h ${WERROR} ${.IMPSRC}
++
++# NextBSD: vmm compiled into the kernel (files.amd64), with the include paths
++# and defines sys/modules/vmm builds it with.
++VMM_INCS=	-DVMM_KEEP_STATS -I$S/amd64/vmm -I$S/amd64/vmm/io -I$S/amd64/vmm/intel -I$S/amd64/vmm/amd
++
+ # zlib code supports systems that are quite old, but will fix this issue once C2x gets radified.
+ # see https://github.com/madler/zlib/issues/633 for details
+ ZLIB_CFLAGS=	-Wno-cast-qual ${NO_WDEPRECATED_NON_PROTOTYPE} ${NO_WSTRICT_PROTOTYPES}
+-- 
+2.54.0 (Apple Git-157)
+
