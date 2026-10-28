@@ -31,6 +31,10 @@
 #include <sys/taskqueue.h>
 #include <sys/iocatalogue.h>
 
+#include <dev/hid/hid.h>		/* struct hid_device_info (#360) */
+#include <dev/hid/hidbus.h>		/* hidbus_get_usage() */
+#include <dev/virtio/virtio.h>		/* virtio_get_device_type() */
+
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pcireg.h>	/* PCIC_DISPLAY — vgapci look-through (#64) */
 
@@ -74,6 +78,11 @@ static void iocat_rematch_pending(void);
  * after the whole set is added, each add (re)arms one timeout task that fires
  * IOCAT_SETTLE_MS after the last add of the batch. */
 static void iocat_rematch_present(void);
+/* HID bus, virtio and VMBus children (#360): defined with the nomatch
+ * handler, also used by the present-scan. */
+struct iocat_match_work;
+static int iocat_capture_bus_child(device_t, device_t,
+    struct iocat_match_work *);
 static struct timeout_task iocat_present_task;
 #define	IOCAT_SETTLE_MS	250
 #define	iocat_schedule_rematch()					\
@@ -367,6 +376,9 @@ enum iocat_kind {
 	IOCAT_KIND_FDT,		/* compat */
 	IOCAT_KIND_USB,		/* match_word (product<<16|vendor) + class_word (iface triple) */
 	IOCAT_KIND_ACPI,	/* acpi_handle, resolved to _HID/_CID in thread context */
+	IOCAT_KIND_HID,		/* match_word (product<<16|vendor) + class_word (page<<16|usage) */
+	IOCAT_KIND_VIRTIO,	/* match_word (virtio device type) */
+	IOCAT_KIND_VMBUS,	/* compat ("vmbus:<class GUID>") */
 };
 
 struct iocat_match_work {
@@ -481,7 +493,19 @@ iocat_lookup_work(const struct iocat_match_work *w, char *buf, size_t buflen,
 
 	switch (w->kind) {
 	case IOCAT_KIND_FDT:
+	case IOCAT_KIND_VMBUS:
 		return (iocat_lookup_compat(w->compat, buf, buflen, score_out));
+	case IOCAT_KIND_HID:
+		/* Darwin precedence: a vendor/product personality, then usage. */
+		if (w->match_word != 0 &&
+		    iocat_lookup_word(IOCAT_PROVIDER_IOHIDDEVICE, w->match_word,
+		    buf, buflen, score_out) == 0)
+			return (0);
+		return (iocat_lookup_word(IOCAT_PROVIDER_IOHIDUSAGE,
+		    w->class_word, buf, buflen, score_out));
+	case IOCAT_KIND_VIRTIO:
+		return (iocat_lookup_word(IOCAT_PROVIDER_IOVIRTIODEVICE,
+		    w->match_word, buf, buflen, score_out));
 	case IOCAT_KIND_USB:
 		/* Darwin precedence: a vendor/product personality, then class. */
 		if (iocat_lookup_word(IOCAT_PROVIDER_IOUSBHOSTDEVICE,
@@ -898,6 +922,54 @@ iocat_rematch_present(void)
 		}
 	}
 #endif
+	/*
+	 * HID, virtio and VMBus children no driver claimed (#360), the same
+	 * authoritative re-check for a device the boot capture missed.
+	 */
+	{
+		static const char *const buses[] = {
+		    "hidbus", "virtio_pci", "virtio_mmio", "vmbus" };
+		struct iocat_match_work tw;
+		device_t *bs, *kids;
+		int nb, nk, b, k, x;
+
+		for (x = 0; x < (int)nitems(buses); x++) {
+			devclass_t dc = devclass_find(buses[x]);
+
+			if (dc == NULL ||
+			    devclass_get_devices(dc, &bs, &nb) != 0)
+				continue;
+			for (b = 0; b < nb; b++) {
+				if (device_get_children(bs[b], &kids, &nk) != 0)
+					continue;
+				for (k = 0; k < nk; k++) {
+					if (device_get_driver(kids[k]) != NULL)
+						continue;
+					checked++;
+					unmatched++;
+					memset(&tw, 0, sizeof(tw));
+					if (iocat_capture_bus_child(bs[b],
+					    kids[k], &tw) != 0 ||
+					    iocat_lookup_work(&tw, bundle,
+					    sizeof(bundle), &score) != 0)
+						continue;
+					if (bootverbose)
+						printf("iokit: present-scan: %s "
+						    "(%s) present + unmatched -> "
+						    "request load %s\n",
+						    device_get_nameunit(kids[k]),
+						    buses[x], bundle);
+					iocat_request_load(tw.match_word,
+					    device_get_nameunit(kids[k]),
+					    bundle, score);
+					requested++;
+				}
+				free(kids, M_TEMP);
+			}
+			free(bs, M_TEMP);
+		}
+	}
+
 	/* One summary line, under bootverbose, so a verbose boot can confirm the
 	 * scan ran even when every present device is already attached (qemu) and
 	 * no per-device line is printed. Quiet on a normal boot so the autoload
@@ -943,6 +1015,67 @@ iocat_match_taskfn(void *ctx __unused, int pending __unused)
 			iocat_remember_pending(w);
 		}
 	}
+}
+
+/*
+ * nextbsd-kernel#360: fill `w` for a child of the HID bus, virtio or VMBus.
+ * Returns 0 when `parent` is one of those buses and `w` is filled, else -1.
+ * Only ivar reads and the bus's own pnpinfo formatting (into a fixed
+ * buffer), so it is safe in the device_nomatch handler like the PCI and USB
+ * captures, and in the present-scan.
+ */
+static int
+iocat_capture_bus_child(device_t parent, device_t dev,
+    struct iocat_match_work *w)
+{
+	const char *pn = device_get_name(parent);
+
+	if (pn == NULL)
+		return (-1);
+	if (strcmp(pn, "hidbus") == 0) {
+		/* A HID top-level collection: its usage, and the device's ids
+		 * (hidbus's own ivars are the device's hid_device_info). */
+		const struct hid_device_info *hw = device_get_ivars(parent);
+
+		w->kind = IOCAT_KIND_HID;
+		w->class_word = (uint32_t)hidbus_get_usage(dev);
+		if (hw != NULL)
+			w->match_word = ((uint32_t)hw->idProduct << 16) |
+			    hw->idVendor;
+		return (0);
+	}
+	if (strcmp(pn, "virtio_pci") == 0 || strcmp(pn, "virtio_mmio") == 0) {
+		w->kind = IOCAT_KIND_VIRTIO;
+		w->match_word = (uint32_t)virtio_get_device_type(dev);
+		return (0);
+	}
+	if (strcmp(pn, "vmbus") == 0) {
+		/* The channel's class GUID, from vmbus's own pnpinfo string
+		 * ("classid=<guid> deviceid=<guid>"), as kldxref reads it. */
+		char info[160];
+		struct sbuf sb;
+		const char *p;
+		size_t n;
+
+		sbuf_new(&sb, info, sizeof(info), SBUF_FIXEDLEN);
+		if (BUS_CHILD_PNPINFO(parent, dev, &sb) != 0 ||
+		    sbuf_finish(&sb) != 0) {
+			sbuf_delete(&sb);
+			return (-1);
+		}
+		sbuf_delete(&sb);
+		if ((p = strstr(info, "classid=")) == NULL)
+			return (-1);
+		p += strlen("classid=");
+		n = strcspn(p, " ");
+		if (n == 0 || n + sizeof(IOCAT_VMBUS_PREFIX) > IOCAT_COMPAT_MAX)
+			return (-1);
+		w->kind = IOCAT_KIND_VMBUS;
+		snprintf(w->compat, sizeof(w->compat), "%s%.*s",
+		    IOCAT_VMBUS_PREFIX, (int)n, p);
+		return (0);
+	}
+	return (-1);
 }
 
 static void
@@ -993,6 +1126,17 @@ iocat_device_nomatch(void *arg __unused, device_t dev)
 		    device_get_nameunit(parent), uaa->port,
 		    uaa->info.bIfaceIndex);
 		goto queue;
+	} else if (strcmp(device_get_name(parent), "hidbus") == 0 ||
+	    strncmp(device_get_name(parent), "virtio_", 7) == 0 ||
+	    strcmp(device_get_name(parent), "vmbus") == 0) {
+		/* HID, virtio and VMBus children (#360). */
+		w = malloc(sizeof(*w), M_IOCAT, M_NOWAIT | M_ZERO);
+		if (w == NULL)
+			return;
+		if (iocat_capture_bus_child(parent, dev, w) != 0) {
+			free(w, M_IOCAT);
+			return;
+		}
 #ifdef DEV_ACPI
 	} else if (strcmp(device_get_name(parent), "acpi") == 0) {
 		ACPI_HANDLE h;

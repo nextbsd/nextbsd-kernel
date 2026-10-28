@@ -53,6 +53,26 @@
 #define	IOCAT_PROVIDER_IOPCICLASS	5
 #define	IOCAT_ACPI_PREFIX		"acpi:"
 
+/*
+ * nextbsd-kernel#360: devices on the HID bus, virtio and VMBus.
+ *
+ * IOHIDDevice (Darwin's provider for a HID top-level collection), in two
+ *   kinds as Darwin's personalities have:
+ *   - VendorID + ProductID: match[] holds 0x<ProductID><VendorID> words;
+ *   - PrimaryUsagePage + PrimaryUsage: its own provider class here,
+ *     IOCAT_PROVIDER_IOHIDUSAGE, with match[] holding 0x<page><usage> words.
+ *   A vendor/product personality wins over a usage one, as on Darwin.
+ * IOVirtIODevice (NextBSD; Darwin has no virtio matching): match[] holds
+ *   virtio device-type words (VirtIODeviceType: 4 entropy, 3 console, 5
+ *   balloon, ...).
+ * VMBus (IOVMBusDevice + IONameMatch, NextBSD): the channel class GUIDs go
+ *   through the device-tree string path like ACPI ids, prefixed "vmbus:".
+ */
+#define	IOCAT_PROVIDER_IOHIDDEVICE	6
+#define	IOCAT_PROVIDER_IOHIDUSAGE	7
+#define	IOCAT_PROVIDER_IOVIRTIODEVICE	8
+#define	IOCAT_VMBUS_PREFIX		"vmbus:"
+
 /* Longest FDT compatible string we will store, including NUL. */
 #define	IOCAT_COMPAT_MAX		128
 
