@@ -379,9 +379,11 @@ device		pty
 # and drops their kexts:
 #
 #   * bridge with STP (xnu's if_bridge), lagg (xnu's bond), epair (VNET jails),
-#     IPsec with enc. `ifconfig ... create` then works with nothing to load.
-#   * pf and pflog, inert until enabled: org.nextbsd.pfctl turns pf on, as
-#     10.9's com.apple.pfctl did.
+#     IPsec. `ifconfig ... create` then works with nothing to load. Not enc:
+#     xnu has no enc0, and IPsec doesn't need it.
+#   * pf and pflog, off until something enables pf (Internet Sharing, with a
+#     reference token), as in xnu; org.nextbsd.pfctl only loads /etc/pf.conf,
+#     as 10.9's com.apple.pfctl does. Patch 0071: no pflog0 at boot.
 #   * DTrace and its providers, so dtrace(1) works with nothing to load. amd64
 #     also gets fasttrap (pid and USDT probes), appended by ci/prepare-src.sh
 #     because the device only exists there. Patch 0070 fills the gaps in
@@ -399,7 +401,6 @@ device		if_bridge
 device		lagg
 device		epair
 options 	IPSEC
-device		enc
 device		pf
 device		pflog
 device		dtrace
