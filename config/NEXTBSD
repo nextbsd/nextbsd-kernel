@@ -385,8 +385,11 @@ device		pty
 #   * DTrace and its providers, so dtrace(1) works with nothing to load. amd64
 #     also gets fasttrap (pid and USDT probes), appended by ci/prepare-src.sh
 #     because the device only exists there (patch 0070).
-#   * Not bhyve: vmm and nmdm are left for a separate, optional bhyve repo
-#     later, the way third-party hypervisors shipped their own kexts on macOS.
+#   * nmdm, the null-modem tty pairs (/dev/nmdmNA, NB). It creates them on
+#     open, which only works when it's present, so it's compiled in rather
+#     than a kext nothing would load. Not vmm: bhyve is left for a separate,
+#     optional repo later, the way third-party hypervisors shipped their own
+#     kexts on macOS.
 #   * UDF, the in-kernel iconv and the msdosfs/cd9660/UDF iconv tables, so
 #     DiskArbitration mounts UDF media and FAT/ISO names with non-ASCII
 #     characters (#228). APM and EBR partition schemes, which GEOM tastes on
@@ -400,6 +403,7 @@ device		pf
 device		pflog
 device		dtrace
 device		dtraceall
+device		nmdm
 options 	UDF
 options 	LIBICONV
 options 	MSDOSFS_ICONV
