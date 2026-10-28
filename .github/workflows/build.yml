@@ -266,6 +266,12 @@ jobs:
           tar -czf "/tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz" -C /usr/obj "$SUB"
           ls -lh /tmp/kernel-obj-${{ matrix.target }}.tar.gz /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
 
+      # The kernel SDK (#327): headers, generated options and exported symbols,
+      # what a kext needs to build against this kernel without its source or
+      # obj tree. See ci/package-sdk.sh.
+      - name: Package kernel SDK
+        run: ci/package-sdk.sh ${{ matrix.target }} ${{ matrix.target_arch }} /tmp/kernel-sdk-${{ matrix.target }}.tar.gz
+
       # Artifacts are now single .tar.gz files (already gzip'd → store-only).
       # Their CONTENTS carry the perms, so the round-trip through artifacts +
       # the continuous release no longer strips the exec bit.
@@ -282,6 +288,14 @@ jobs:
           name: kernel-obj-${{ matrix.target }}
           path: /tmp/kernel-obj-${{ matrix.target }}.tar.gz
           compression-level: 0
+
+      - name: Upload kernel SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-sdk-${{ matrix.target }}
+          path: /tmp/kernel-sdk-${{ matrix.target }}.tar.gz
+          compression-level: 0
+          if-no-files-found: error
 
       # --- Native image assembly (nextbsd#369) ---
       # Assemble a bootable disk.img HERE, in the toolchain container (which has
@@ -591,6 +605,7 @@ jobs:
           mkdir -p out
           find artifacts -name 'kernel-obj-*.tar.gz' -exec cp {} out/ \;
           find artifacts -name 'nextbsd-kernel-*.tar.gz' -exec cp {} out/ \;
+          find artifacts -name 'kernel-sdk-*.tar.gz' -exec cp {} out/ \;
           # The Pi 5 family board kernel, published under a name that says what
           # it is: kernel.bin wrapped in an arm64 Linux Image header, which the
           # BCM2712 bootloader loads directly as kernel8.img. It is NOT a
@@ -620,6 +635,12 @@ jobs:
             [ "$got" = "$ID" ] || { echo "FAIL: $t has KERNEL-BUILD-ID $got, expected $ID" >&2; exit 1; }
             echo "  $(basename "$t"): $got"
           done
+          for t in out/kernel-sdk-*.tar.gz; do
+            got=$(tar -xzOf "$t" kernel-sdk/KERNEL-BUILD-ID) \
+              || { echo "FAIL: $t carries no KERNEL-BUILD-ID" >&2; exit 1; }
+            [ "$got" = "$ID" ] || { echo "FAIL: $t has KERNEL-BUILD-ID $got, expected $ID" >&2; exit 1; }
+            echo "  $(basename "$t"): $got"
+          done
           ls -lh out/
 
       # Stable asset names (no datestamp) → each publish overwrites in place, so
@@ -631,7 +652,9 @@ jobs:
           name: Continuous kernel build
           body: |
             Rolling kernel build, refreshed on every successful `main` build.
-            Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-obj-<arch>.tar.gz`) and
+            Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-obj-<arch>.tar.gz`,
+            moving to `kernel-sdk-<arch>.tar.gz`, the kernel SDK: headers, generated options and
+            exported symbols, nextbsd-kernel#327) and
             nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
             `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
             `rpi500-kernel8-arm64.img` is a transition alias for the same
