@@ -78,6 +78,11 @@ static void iocat_rematch_pending(void);
  * after the whole set is added, each add (re)arms one timeout task that fires
  * IOCAT_SETTLE_MS after the last add of the batch. */
 static void iocat_rematch_present(void);
+/* HID bus, virtio and VMBus children (#360): defined with the nomatch
+ * handler, also used by the present-scan. */
+struct iocat_match_work;
+static int iocat_capture_bus_child(device_t, device_t,
+    struct iocat_match_work *);
 static struct timeout_task iocat_present_task;
 #define	IOCAT_SETTLE_MS	250
 #define	iocat_schedule_rematch()					\
