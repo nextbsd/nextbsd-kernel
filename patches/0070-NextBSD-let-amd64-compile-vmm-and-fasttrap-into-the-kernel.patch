@@ -1,4 +1,4 @@
-From cf7fbd0729e73446eb3f9925d9d20657b94e22d9 Mon Sep 17 00:00:00 2001
+From 25608d5e27afca27795622dfbdd785d59fe711fb Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
 Date: Wed, 28 Oct 2026 10:39:20 -0500
 Subject: [PATCH] NextBSD: let amd64 compile vmm and fasttrap into the kernel
@@ -8,15 +8,21 @@ only as modules (sys/modules/vmm, sys/modules/dtrace/fasttrap). NextBSD
 compiles both in, as xnu does its hypervisor and userland DTrace support,
 so add them to files.amd64 as `device vmm` and `device fasttrap`, with
 the include paths, defines and genassym headers (vmx_assym.h,
-svm_assym.h) their module Makefiles use. arm64 already has `device vmm`;
-FreeBSD has no arm64 fasttrap.
+svm_assym.h) their module Makefiles use. FreeBSD has no arm64 fasttrap.
+
+Two upstream gaps in compiling these in are fixed on the way:
+- files.arm64 never lists dev/vmm/vmm_vm.c (vm_suspend, hw.vmm and the
+  rest of the generic VM code), so a built-in arm64 vmm fails to link.
+- FBT_CFLAGS adds -I cddl/dev/fbt/amd64, which doesn't exist (amd64's
+  fbt is under x86/), and -Wmissing-include-dirs fails a built-in fbt.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  sys/conf/files       |  2 +-
  sys/conf/files.amd64 | 73 ++++++++++++++++++++++++++++++++++++++++++++
- sys/conf/kern.pre.mk |  8 +++++
- 3 files changed, 82 insertions(+), 1 deletion(-)
+ sys/conf/files.arm64 |  1 +
+ sys/conf/kern.pre.mk | 15 ++++++++-
+ 4 files changed, 89 insertions(+), 2 deletions(-)
 
 diff --git a/sys/conf/files b/sys/conf/files
 index 7f925bfc3..ca216ab07 100644
@@ -115,11 +121,23 @@ index 9837086af..eab19dbf3 100644
  amd64/acpica/acpi_machdep.c	optional	acpi
  amd64/acpica/acpi_wakeup.c	optional	acpi
  acpi_wakecode.o			optional	acpi			\
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index 1f3a072fe..35685f4de 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -160,6 +160,7 @@ arm64/vmm/io/vtimer.c				optional vmm
+ dev/vmm/vmm_dev.c				optional vmm
+ dev/vmm/vmm_mem.c				optional vmm
+ dev/vmm/vmm_stat.c				optional vmm
++dev/vmm/vmm_vm.c				optional vmm
+ 
+ crypto/armv8/armv8_crypto.c			optional armv8crypto
+ armv8_crypto_wrap.o				optional armv8crypto	\
 diff --git a/sys/conf/kern.pre.mk b/sys/conf/kern.pre.mk
-index 025148624..bcd63802e 100644
+index 025148624..59f85437f 100644
 --- a/sys/conf/kern.pre.mk
 +++ b/sys/conf/kern.pre.mk
-@@ -250,6 +250,14 @@ DTRACE_ASM_CFLAGS=	-x assembler-with-cpp -DLOCORE ${DTRACE_CFLAGS}
+@@ -250,15 +250,28 @@ DTRACE_ASM_CFLAGS=	-x assembler-with-cpp -DLOCORE ${DTRACE_CFLAGS}
  DTRACE_C=	${CC} -c ${DTRACE_CFLAGS}	${WERROR} ${.IMPSRC}
  DTRACE_S=	${CC} -c ${DTRACE_ASM_CFLAGS}	${WERROR} ${.IMPSRC}
  
@@ -134,6 +152,21 @@ index 025148624..bcd63802e 100644
  # zlib code supports systems that are quite old, but will fix this issue once C2x gets radified.
  # see https://github.com/madler/zlib/issues/633 for details
  ZLIB_CFLAGS=	-Wno-cast-qual ${NO_WDEPRECATED_NON_PROTOTYPE} ${NO_WSTRICT_PROTOTYPES}
+ ZLIB_C=		${CC} -c ${CFLAGS} ${WERROR} ${ZLIB_CFLAGS} ${.IMPSRC}
+ 
+ # Special flags for managing the compat compiles for DTrace/FBT
+-FBT_CFLAGS=	-DBUILDING_DTRACE -nostdinc -I$S/cddl/dev/fbt/${MACHINE_CPUARCH} -I$S/cddl/dev/fbt ${CDDL_CFLAGS} -I$S/cddl/compat/opensolaris -I$S/cddl/contrib/opensolaris/uts/common  
++FBT_CFLAGS=	-DBUILDING_DTRACE -nostdinc -I$S/cddl/dev/fbt ${CDDL_CFLAGS} -I$S/cddl/compat/opensolaris -I$S/cddl/contrib/opensolaris/uts/common  
+ .if ${MACHINE_CPUARCH} == "amd64" || ${MACHINE_CPUARCH} == "i386"
+ FBT_CFLAGS+=	-I$S/cddl/dev/fbt/x86
++.else
++# NextBSD: amd64 and i386 keep their fbt code under x86/, so only the other
++# arches have a per-arch directory; -Wmissing-include-dirs fails the build
++# on a missing one when fbt is compiled in.
++FBT_CFLAGS+=	-I$S/cddl/dev/fbt/${MACHINE_CPUARCH}
+ .endif
+ FBT_C=		${CC} -c ${FBT_CFLAGS}		${WERROR} ${.IMPSRC}
+ 
 -- 
 2.54.0 (Apple Git-157)
 
