@@ -21,6 +21,9 @@
 #                       assym.inc, ...; no objects
 #     kernel.symbols    every global symbol the kernel defines: what a kext
 #                       can link against
+#     kernel.modules    every module version (MODULE_VERSION) compiled into
+#                       the kernel: what a kext's MODULE_DEPEND can name
+#                       without another kext providing it
 #
 # usage: package-sdk.sh <target> <target_arch> <out.tar.gz> [srcdir] [objroot]
 #   srcdir   the prepared tree the kernel was built from (default /usr/src)
@@ -77,6 +80,12 @@ NM="${CROSS_BINDIR:-}/llvm-nm"
 [ -x "$NM" ] || NM="$(command -v llvm-nm || command -v nm)"
 "$NM" -g --defined-only "$OBJ/kernel" | awk '{print $NF}' | sort -u > "$SDK/kernel.symbols"
 [ -s "$SDK/kernel.symbols" ] || { echo "package-sdk: no symbols from $OBJ/kernel" >&2; exit 1; }
+# MODULE_VERSION(name, ...) leaves a static _mod_metadata_<name>_version in the
+# kernel's symbol table; the kernel linker resolves MODULE_DEPEND against
+# these versions (plus "kernel" itself).
+{ echo kernel; "$NM" --defined-only "$OBJ/kernel" | awk '{print $NF}' |
+    sed -n 's/^_mod_metadata_\(.*\)_version$/\1/p'; } | sort -u > "$SDK/kernel.modules"
+[ "$(wc -l < "$SDK/kernel.modules")" -gt 1 ] || { echo "package-sdk: no module versions in $OBJ/kernel" >&2; exit 1; }
 
 cp "$OBJ/KERNEL-BUILD-ID" "$SDK/KERNEL-BUILD-ID"
 {
@@ -88,6 +97,7 @@ cp "$OBJ/KERNEL-BUILD-ID" "$SDK/KERNEL-BUILD-ID"
 	echo "obj_files=$(wc -l < "$STAGE/obj.list" | tr -d ' ')"
 	echo "opt_headers=$n_opt"
 	echo "kernel_symbols=$(wc -l < "$SDK/kernel.symbols" | tr -d ' ')"
+	echo "kernel_modules=$(wc -l < "$SDK/kernel.modules" | tr -d ' ')"
 } > "$SDK/SDK-INFO"
 
 tar -C "$STAGE" -czf "$OUT" kernel-sdk
