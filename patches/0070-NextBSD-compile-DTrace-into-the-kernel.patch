@@ -1,0 +1,113 @@
+From 5bf74507ff275804d407aabd425014115ba0b4cd Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 28 Oct 2026 10:48:49 -0500
+Subject: [PATCH] NextBSD: compile DTrace into the kernel: add the missing
+ sources and fasttrap
+
+Stock FreeBSD builds DTrace as modules, and its kernel-config support for
+`device dtrace` has gaps that only show when it's compiled in. NextBSD
+compiles DTrace in, as xnu does:
+
+- files.amd64 and files.arm64 list dtrace_asm.S and dtrace_subr.c but not
+  dtrace_isa.c (stack walking, dtrace_copyin/fuword*), and arm64 lacks
+  instr_size.c. Add them, matching sys/modules/dtrace/dtrace.
+- FBT_CFLAGS adds -I cddl/dev/fbt/amd64, which doesn't exist (amd64's fbt
+  is under x86/), and -Wmissing-include-dirs fails the build.
+- fasttrap (pid and USDT probes) is module-only; add it to files.amd64 as
+  `device fasttrap` with its module's flags, and let u8_textprep.c, which
+  it calls, build for it as well as for zfs. FreeBSD has no arm64
+  fasttrap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/conf/files       |  2 +-
+ sys/conf/files.amd64 |  8 ++++++++
+ sys/conf/files.arm64 |  2 ++
+ sys/conf/kern.pre.mk | 11 ++++++++++-
+ 4 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/sys/conf/files b/sys/conf/files
+index 7f925bfc3..ca216ab07 100644
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -224,7 +224,7 @@ contrib/openzfs/module/os/freebsd/zfs/zio_crypt.c		optional zfs compile-with "${
+ contrib/openzfs/module/os/freebsd/zfs/zvol_os.c		optional zfs compile-with "${ZFS_C}"
+ 
+ #zfs unicode support
+-contrib/openzfs/module/unicode/u8_textprep.c		optional zfs compile-with "${ZFS_C}"
++contrib/openzfs/module/unicode/u8_textprep.c		optional zfs | fasttrap compile-with "${ZFS_C}"
+ 
+ #zfs checksums / zcommon
+ contrib/openzfs/module/zcommon/cityhash.c		optional zfs compile-with "${ZFS_C}"
+diff --git a/sys/conf/files.amd64 b/sys/conf/files.amd64
+index 9837086af..c0c0fb3c7 100644
+--- a/sys/conf/files.amd64
++++ b/sys/conf/files.amd64
+@@ -37,6 +37,13 @@ ia32_assym.h			standard				\
+ 	no-obj no-implicit-rule before-depend				\
+ 	clean		"ia32_assym.h"
+ #
++#
++# NextBSD: DTrace's userland provider (pid, USDT) compiled into the kernel
++# (`device fasttrap`). Stock FreeBSD builds it only as
++# sys/modules/dtrace/fasttrap.
++#
++cddl/contrib/opensolaris/uts/common/dtrace/fasttrap.c	optional fasttrap dtrace compile-with "${FASTTRAP_C}"
++cddl/contrib/opensolaris/uts/intel/dtrace/fasttrap_isa.c	optional fasttrap dtrace compile-with "${FASTTRAP_C}"
+ amd64/acpica/acpi_machdep.c	optional	acpi
+ amd64/acpica/acpi_wakeup.c	optional	acpi
+ acpi_wakecode.o			optional	acpi			\
+@@ -95,6 +102,7 @@ amd64/amd64/uio_machdep.c	standard
+ amd64/amd64/vm_machdep.c	standard
+ amd64/pci/pci_cfgreg.c		optional	pci
+ cddl/dev/dtrace/amd64/dtrace_asm.S			optional dtrace compile-with "${DTRACE_S}"
++cddl/dev/dtrace/amd64/dtrace_isa.c			optional dtrace compile-with "${DTRACE_C}"
+ cddl/dev/dtrace/amd64/dtrace_subr.c			optional dtrace compile-with "${DTRACE_C}"
+ crypto/aesni/aeskeys_amd64.S	optional aesni
+ crypto/des/des_enc.c		optional	netsmb
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index 1f3a072fe..3762228df 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -205,6 +205,8 @@ dev/acpi_support/acpi_wmi_if.m			optional acpi acpi_wmi
+ dev/ahci/ahci_generic.c				optional ahci
+ 
+ cddl/dev/dtrace/aarch64/dtrace_asm.S		optional dtrace compile-with "${DTRACE_S}"
++cddl/dev/dtrace/aarch64/dtrace_isa.c		optional dtrace compile-with "${DTRACE_C}"
++cddl/dev/dtrace/aarch64/instr_size.c		optional dtrace compile-with "${DTRACE_C}"
+ cddl/dev/dtrace/aarch64/dtrace_subr.c		optional dtrace compile-with "${DTRACE_C}"
+ cddl/dev/fbt/aarch64/fbt_isa.c			optional dtrace_fbt | dtraceall compile-with "${FBT_C}"
+ 
+diff --git a/sys/conf/kern.pre.mk b/sys/conf/kern.pre.mk
+index 025148624..6ebe2f09a 100644
+--- a/sys/conf/kern.pre.mk
++++ b/sys/conf/kern.pre.mk
+@@ -250,15 +250,24 @@ DTRACE_ASM_CFLAGS=	-x assembler-with-cpp -DLOCORE ${DTRACE_CFLAGS}
+ DTRACE_C=	${CC} -c ${DTRACE_CFLAGS}	${WERROR} ${.IMPSRC}
+ DTRACE_S=	${CC} -c ${DTRACE_ASM_CFLAGS}	${WERROR} ${.IMPSRC}
+ 
++# NextBSD: fasttrap compiled into the kernel (files.amd64), with the flags
++# sys/modules/dtrace/fasttrap builds it with.
++FASTTRAP_C=	${CC} -c ${DTRACE_CFLAGS} -include $S/cddl/compat/opensolaris/sys/debug_compat.h ${WERROR} ${.IMPSRC}
++
+ # zlib code supports systems that are quite old, but will fix this issue once C2x gets radified.
+ # see https://github.com/madler/zlib/issues/633 for details
+ ZLIB_CFLAGS=	-Wno-cast-qual ${NO_WDEPRECATED_NON_PROTOTYPE} ${NO_WSTRICT_PROTOTYPES}
+ ZLIB_C=		${CC} -c ${CFLAGS} ${WERROR} ${ZLIB_CFLAGS} ${.IMPSRC}
+ 
+ # Special flags for managing the compat compiles for DTrace/FBT
+-FBT_CFLAGS=	-DBUILDING_DTRACE -nostdinc -I$S/cddl/dev/fbt/${MACHINE_CPUARCH} -I$S/cddl/dev/fbt ${CDDL_CFLAGS} -I$S/cddl/compat/opensolaris -I$S/cddl/contrib/opensolaris/uts/common  
++FBT_CFLAGS=	-DBUILDING_DTRACE -nostdinc -I$S/cddl/dev/fbt ${CDDL_CFLAGS} -I$S/cddl/compat/opensolaris -I$S/cddl/contrib/opensolaris/uts/common  
+ .if ${MACHINE_CPUARCH} == "amd64" || ${MACHINE_CPUARCH} == "i386"
+ FBT_CFLAGS+=	-I$S/cddl/dev/fbt/x86
++.else
++# NextBSD: amd64 and i386 keep their fbt code under x86/, so only the other
++# arches have a per-arch directory; -Wmissing-include-dirs fails the build
++# on a missing one when fbt is compiled in.
++FBT_CFLAGS+=	-I$S/cddl/dev/fbt/${MACHINE_CPUARCH}
+ .endif
+ FBT_C=		${CC} -c ${FBT_CFLAGS}		${WERROR} ${.IMPSRC}
+ 
+-- 
+2.54.0 (Apple Git-157)
+

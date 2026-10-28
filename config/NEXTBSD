@@ -371,3 +371,44 @@ device		cuse
 #   /dev/ptmx and /dev/ptyXX nodes. Design: the nextbsd-kernel wiki,
 #   "Linuxulator ptys (ptmx / devpts)".
 device		pty
+
+# What xnu compiles in, compiled in here too (E21 kext loaders review,
+# maintainer 2026-10-28). Since the kernel stopped loading modules by name
+# (E21 D9, revised), a module nothing loads never appears. Darwin builds these
+# into the kernel rather than shipping them as kexts, so NextBSD does the same
+# and drops their kexts:
+#
+#   * bridge with STP (xnu's if_bridge), lagg (xnu's bond), epair (VNET jails),
+#     IPsec with enc. `ifconfig ... create` then works with nothing to load.
+#   * pf and pflog, inert until enabled: org.nextbsd.pfctl turns pf on, as
+#     10.9's com.apple.pfctl did.
+#   * DTrace and its providers, so dtrace(1) works with nothing to load. amd64
+#     also gets fasttrap (pid and USDT probes), appended by ci/prepare-src.sh
+#     because the device only exists there. Patch 0070 fills the gaps in
+#     FreeBSD's support for compiling DTrace in.
+#   * nmdm, the null-modem tty pairs (/dev/nmdmNA, NB). It creates them on
+#     open, which only works when it's present, so it's compiled in rather
+#     than a kext nothing would load. Not vmm: bhyve is left for a separate,
+#     optional repo later, the way third-party hypervisors shipped their own
+#     kexts on macOS.
+#   * UDF, the in-kernel iconv and the msdosfs/cd9660/UDF iconv tables, so
+#     DiskArbitration mounts UDF media and FAT/ISO names with non-ASCII
+#     characters (#228). APM and EBR partition schemes, which GEOM tastes on
+#     the whole disk, so no partition-type match could load them.
+device		if_bridge
+device		lagg
+device		epair
+options 	IPSEC
+device		enc
+device		pf
+device		pflog
+device		dtrace
+device		dtraceall
+device		nmdm
+options 	UDF
+options 	LIBICONV
+options 	MSDOSFS_ICONV
+options 	CD9660_ICONV
+options 	UDF_ICONV
+options 	GEOM_PART_APM
+options 	GEOM_PART_EBR
