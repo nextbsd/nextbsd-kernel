@@ -12,6 +12,7 @@
 
 #include "opt_compat_mach.h"
 #include "opt_platform.h"	/* FDT — device-tree personalities (#185) */
+#include "opt_acpi.h"		/* DEV_ACPI — ACPI _HID personalities (#329) */
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -36,6 +37,16 @@
 #ifdef FDT
 #include <dev/ofw/ofw_bus.h>	/* ofw_bus_get_compat() — #185 */
 #include <dev/ofw/ofw_bus_subr.h>
+#endif
+
+/* USB personalities (#329): the probe-time usb_attach_arg of an interface. */
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+
+#ifdef DEV_ACPI
+/* ACPI _HID personalities (#329). */
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
 #endif
 
 #ifdef COMPAT_MACH
@@ -100,6 +111,11 @@ iocat_add(struct iocat_add *ua)
 
 	if (ua->nmatch == 0 || ua->nmatch > IOCAT_MAX_MATCH)
 		return (EINVAL);
+	/* The class providers carry (value, mask) pairs (#329). */
+	if ((ua->provider_class == IOCAT_PROVIDER_IOUSBHOSTINTERFACE ||
+	    ua->provider_class == IOCAT_PROVIDER_IOPCICLASS) &&
+	    (ua->nmatch % 2) != 0)
+		return (EINVAL);
 	/* Force a NUL terminator, then reject an empty bundle id. */
 	ua->bundle_id[IOCAT_BUNDLE_ID_MAX - 1] = '\0';
 	if (ua->bundle_id[0] == '\0')
@@ -136,6 +152,76 @@ iocat_add(struct iocat_add *ua)
 	 * sleeps/allocates) and coalesced across a push batch. */
 	taskqueue_enqueue(taskqueue_thread, &iocat_present_task);
 	return (0);
+}
+
+/*
+ * Exact match of one word against every record of `provider` (#329 widened
+ * this from PCI-only; IOUSBHostDevice words have the same shape).
+ */
+int
+iocat_lookup_word(uint32_t provider, uint32_t word, char *buf, size_t buflen,
+    int32_t *score_out)
+{
+	struct iocat_record *r, *best;
+	uint32_t i;
+
+	best = NULL;
+	sx_slock(&iocat_lock);
+	TAILQ_FOREACH(r, &iocat_list, link) {
+		if (r->provider_class != provider)
+			continue;
+		for (i = 0; i < r->nmatch; i++) {
+			if (r->match[i] != word)
+				continue;
+			if (best == NULL || r->probe_score > best->probe_score)
+				best = r;
+			break;
+		}
+	}
+	if (best != NULL) {
+		strlcpy(buf, best->bundle_id, buflen);
+		if (score_out != NULL)
+			*score_out = best->probe_score;
+	}
+	sx_sunlock(&iocat_lock);
+	return (best != NULL ? 0 : ENOENT);
+}
+
+/*
+ * (value, mask) pair match for the class providers (#329): IOPCIClassMatch
+ * and IOUSBHostInterface. A record matches when any of its pairs satisfies
+ * (word & mask) == (value & mask). An all-zero mask would match everything,
+ * so it is skipped rather than treated as a wildcard.
+ */
+int
+iocat_lookup_masked(uint32_t provider, uint32_t word, char *buf, size_t buflen,
+    int32_t *score_out)
+{
+	struct iocat_record *r, *best;
+	uint32_t i, v, m;
+
+	best = NULL;
+	sx_slock(&iocat_lock);
+	TAILQ_FOREACH(r, &iocat_list, link) {
+		if (r->provider_class != provider)
+			continue;
+		for (i = 0; i + 1 < r->nmatch; i += 2) {
+			v = r->match[i];
+			m = r->match[i + 1];
+			if (m == 0 || (word & m) != (v & m))
+				continue;
+			if (best == NULL || r->probe_score > best->probe_score)
+				best = r;
+			break;
+		}
+	}
+	if (best != NULL) {
+		strlcpy(buf, best->bundle_id, buflen);
+		if (score_out != NULL)
+			*score_out = best->probe_score;
+	}
+	sx_sunlock(&iocat_lock);
+	return (best != NULL ? 0 : ENOENT);
 }
 
 int
@@ -267,15 +353,42 @@ iocat_lookup_compat(const char *want, char *buf, size_t buflen,
  * K3 userland half) loads the named bundle; kldload then re-probes the waiting
  * device automatically. The kernel decides; userland fetches.
  */
+/* What kind of device a work item describes (#185, #329). */
+enum iocat_kind {
+	IOCAT_KIND_PCI = 0,	/* match_word + class_word */
+	IOCAT_KIND_FDT,		/* compat */
+	IOCAT_KIND_USB,		/* match_word (product<<16|vendor) + class_word (iface triple) */
+	IOCAT_KIND_ACPI,	/* acpi_handle, resolved to _HID/_CID in thread context */
+};
+
 struct iocat_match_work {
 	STAILQ_ENTRY(iocat_match_work) link;
-	uint32_t	match_word;		/* 0x<device><vendor>; 0 if FDT */
+	enum iocat_kind	kind;
+	/*
+	 * PCI: 0x<device><vendor> (IOPCIPrimaryMatch). USB: 0x<idProduct><idVendor>.
+	 * Passed to kextd with the load request for its log.
+	 */
+	uint32_t	match_word;
+	/*
+	 * PCI: Darwin's IOPCIClassMatch word 0x<class><subclass><progif><rev>.
+	 * USB: the interface triple 0x00<class><subclass><protocol>.
+	 * Tried only when no exact personality claims match_word.
+	 */
+	uint32_t	class_word;
 	char		devname[64];
 	/*
 	 * Device-tree devices have no match word, they have a compatible
-	 * string (#185). Empty means "this is a PCI item, use match_word".
+	 * string (#185).
 	 */
 	char		compat[IOCAT_COMPAT_MAX];
+	/*
+	 * ACPI: the namespace node. Its _HID and first _CID are read once, in
+	 * thread context, into compat/compat2 ("acpi:"-prefixed); every later
+	 * re-match compares strings and does not touch the namespace again.
+	 */
+	void	       *acpi_handle;
+	char		compat2[IOCAT_COMPAT_MAX];
+	bool		acpi_resolved;
 };
 static STAILQ_HEAD(, iocat_match_work) iocat_work =
     STAILQ_HEAD_INITIALIZER(iocat_work);
@@ -314,14 +427,101 @@ iocat_request_load(uint32_t match_word, const char *devname,
  * carries a compatible string, a PCI item a match word. One place to make that
  * decision, so the two consumers below cannot drift apart.
  */
+#ifdef DEV_ACPI
+/*
+ * Read an ACPI node's _HID and first _CID as "acpi:"-prefixed strings (#329).
+ * Thread context only: AcpiGetObjectInfo() allocates. Either string may come
+ * back empty.
+ */
+static void
+iocat_acpi_ids(ACPI_HANDLE h, char *hid, char *cid, size_t len)
+{
+	ACPI_DEVICE_INFO *info;
+
+	hid[0] = cid[0] = '\0';
+	if (h == NULL || ACPI_FAILURE(AcpiGetObjectInfo(h, &info)))
+		return;
+	if ((info->Valid & ACPI_VALID_HID) != 0 && info->HardwareId.Length > 1)
+		snprintf(hid, len, "%s%s", IOCAT_ACPI_PREFIX,
+		    info->HardwareId.String);
+	if ((info->Valid & ACPI_VALID_CID) != 0 &&
+	    info->CompatibleIdList.Count > 0)
+		snprintf(cid, len, "%s%s", IOCAT_ACPI_PREFIX,
+		    info->CompatibleIdList.Ids[0].String);
+	AcpiOsFree(info);
+}
+
+/* Match _HID first, then _CID, against IONameMatch "acpi:" strings. */
+static int
+iocat_lookup_acpi_ids(const char *hid, const char *cid, char *buf,
+    size_t buflen, int32_t *score_out)
+{
+
+	if (hid[0] != '\0' &&
+	    iocat_lookup_compat(hid, buf, buflen, score_out) == 0)
+		return (0);
+	if (cid[0] != '\0')
+		return (iocat_lookup_compat(cid, buf, buflen, score_out));
+	return (ENOENT);
+}
+#endif
+
 static int
 iocat_lookup_work(const struct iocat_match_work *w, char *buf, size_t buflen,
     int32_t *score_out)
 {
 
-	if (w->compat[0] != '\0')
+	switch (w->kind) {
+	case IOCAT_KIND_FDT:
 		return (iocat_lookup_compat(w->compat, buf, buflen, score_out));
-	return (iocat_lookup_pci(w->match_word, buf, buflen, score_out));
+	case IOCAT_KIND_USB:
+		/* Darwin precedence: a vendor/product personality, then class. */
+		if (iocat_lookup_word(IOCAT_PROVIDER_IOUSBHOSTDEVICE,
+		    w->match_word, buf, buflen, score_out) == 0)
+			return (0);
+		return (iocat_lookup_masked(IOCAT_PROVIDER_IOUSBHOSTINTERFACE,
+		    w->class_word, buf, buflen, score_out));
+	case IOCAT_KIND_ACPI:
+#ifdef DEV_ACPI
+		/* Resolved by iocat_acpi_resolve() before any lookup. */
+		return (iocat_lookup_acpi_ids(w->compat, w->compat2, buf,
+		    buflen, score_out));
+#else
+		return (ENOENT);
+#endif
+	case IOCAT_KIND_PCI:
+	default:
+		if (iocat_lookup_pci(w->match_word, buf, buflen,
+		    score_out) == 0)
+			return (0);
+		return (iocat_lookup_masked(IOCAT_PROVIDER_IOPCICLASS,
+		    w->class_word, buf, buflen, score_out));
+	}
+}
+
+/* Fill in an ACPI item's ids, once, in thread context (#329). */
+static void
+iocat_acpi_resolve(struct iocat_match_work *w)
+{
+
+#ifdef DEV_ACPI
+	if (w->kind == IOCAT_KIND_ACPI && !w->acpi_resolved) {
+		iocat_acpi_ids(w->acpi_handle, w->compat, w->compat2,
+		    sizeof(w->compat));
+		w->acpi_resolved = true;
+	}
+#endif
+}
+
+/* Darwin's IOPCIClassMatch word for a PCI device (#329). */
+static uint32_t
+iocat_pci_class_word(device_t dev)
+{
+
+	return (((uint32_t)pci_get_class(dev) << 24) |
+	    ((uint32_t)pci_get_subclass(dev) << 16) |
+	    ((uint32_t)pci_get_progif(dev) << 8) |
+	    (uint32_t)pci_get_revid(dev));
 }
 
 /* Remember an unmatched device for push-triggers-match. Takes ownership of w
@@ -361,6 +561,7 @@ iocat_rematch_pending(void)
 
 	while ((w = STAILQ_FIRST(&todo)) != NULL) {
 		STAILQ_REMOVE_HEAD(&todo, link);
+		iocat_acpi_resolve(w);
 		if (iocat_lookup_work(w, bundle, sizeof(bundle),
 		    &score) == 0) {
 			iocat_request_load(w->match_word, w->devname, bundle, score);
@@ -581,8 +782,17 @@ iocat_rematch_present(void)
 			mw = ((uint32_t)pci_get_device(child) << 16) |
 			    pci_get_vendor(child);
 			if (iocat_lookup_pci(mw, bundle, sizeof(bundle),
-			    &score) != 0)
+			    &score) != 0 &&
+			    (device_get_driver(child) != NULL ||
+			    iocat_lookup_masked(IOCAT_PROVIDER_IOPCICLASS,
+			    iocat_pci_class_word(child), bundle, sizeof(bundle),
+			    &score) != 0))
 				continue;	/* no personality claims it */
+			/*
+			 * The class fallback (#329) is only for a device with no
+			 * driver at all: a vgapci- or virtio-shadowed GPU is
+			 * handed to its DRM kext by id, never by class.
+			 */
 			if (bootverbose)
 				printf("iokit: present-scan: %s (0x%08x) present + "
 				    "unmatched -> request load %s\n",
@@ -626,6 +836,60 @@ iocat_rematch_present(void)
 		}
 	}
 #endif
+#ifdef DEV_ACPI
+	/*
+	 * ACPI devices (#329): acpi(4)'s children that no driver claimed, matched
+	 * by _HID/_CID. Like the device-tree walk, this is the authoritative
+	 * trigger for nodes the boot device_nomatch capture missed.
+	 */
+	{
+		device_t *acpis, *kids;
+		int nacpi, nkids, i, j;
+
+		if (devclass_get_devices(devclass_find("acpi"), &acpis,
+		    &nacpi) == 0) {
+			for (i = 0; i < nacpi; i++) {
+				if (device_get_children(acpis[i], &kids,
+				    &nkids) != 0)
+					continue;
+				for (j = 0; j < nkids; j++) {
+					ACPI_HANDLE h;
+
+					if (device_get_driver(kids[j]) != NULL)
+						continue;
+					h = acpi_get_handle(kids[j]);
+					if (h == NULL)
+						continue;
+					checked++;
+					unmatched++;
+					{
+						char hid[IOCAT_COMPAT_MAX];
+						char cid[IOCAT_COMPAT_MAX];
+
+						iocat_acpi_ids(h, hid, cid,
+						    sizeof(hid));
+						if (iocat_lookup_acpi_ids(hid, cid,
+						    bundle, sizeof(bundle),
+						    &score) != 0)
+							continue;
+					}
+					if (bootverbose)
+						printf("iokit: present-scan: %s "
+						    "(acpi) present + unmatched "
+						    "-> request load %s\n",
+						    device_get_nameunit(kids[j]),
+						    bundle);
+					iocat_request_load(0,
+					    device_get_nameunit(kids[j]),
+					    bundle, score);
+					requested++;
+				}
+				free(kids, M_TEMP);
+			}
+			free(acpis, M_TEMP);
+		}
+	}
+#endif
 	/* One summary line, under bootverbose, so a verbose boot can confirm the
 	 * scan ran even when every present device is already attached (qemu) and
 	 * no per-device line is printed. Quiet on a normal boot so the autoload
@@ -659,6 +923,7 @@ iocat_match_taskfn(void *ctx __unused, int pending __unused)
 		if (w == NULL)
 			break;
 
+		iocat_acpi_resolve(w);
 		if (iocat_lookup_work(w, bundle, sizeof(bundle),
 		    &score) == 0) {
 			/* Driver known now — ask kextd to load it. */
@@ -679,7 +944,7 @@ iocat_device_nomatch(void *arg __unused, device_t dev)
 	const char *nu;
 
 	parent = device_get_parent(dev);
-	if (parent == NULL)
+	if (parent == NULL || device_get_name(parent) == NULL)
 		return;
 
 	if (strcmp(device_get_name(parent), "pci") == 0) {
@@ -687,9 +952,59 @@ iocat_device_nomatch(void *arg __unused, device_t dev)
 		w = malloc(sizeof(*w), M_IOCAT, M_NOWAIT | M_ZERO);
 		if (w == NULL)
 			return;
+		w->kind = IOCAT_KIND_PCI;
 		/* IOPCIPrimaryMatch: device in the high 16 bits, vendor low. */
 		w->match_word = ((uint32_t)pci_get_device(dev) << 16) |
 		    pci_get_vendor(dev);
+		w->class_word = iocat_pci_class_word(dev);
+	} else if (strcmp(device_get_name(parent), "uhub") == 0) {
+		struct usb_attach_arg *uaa;
+
+		/*
+		 * A USB interface no driver claimed (#329). During its probe
+		 * the child's ivars are the usb_attach_arg (usb_device.c's
+		 * usb_probe_and_attach_sub), and device_nomatch fires inside
+		 * that probe, so reading them here is as safe as the pci_get_*
+		 * reads above. USB reuses one unnamed temporary child per
+		 * device, so the item gets a stable name of its own.
+		 */
+		uaa = device_get_ivars(dev);
+		if (uaa == NULL || uaa->usb_mode != USB_MODE_HOST)
+			return;
+		w = malloc(sizeof(*w), M_IOCAT, M_NOWAIT | M_ZERO);
+		if (w == NULL)
+			return;
+		w->kind = IOCAT_KIND_USB;
+		w->match_word = ((uint32_t)uaa->info.idProduct << 16) |
+		    uaa->info.idVendor;
+		w->class_word = ((uint32_t)uaa->info.bInterfaceClass << 16) |
+		    ((uint32_t)uaa->info.bInterfaceSubClass << 8) |
+		    uaa->info.bInterfaceProtocol;
+		snprintf(w->devname, sizeof(w->devname), "%s.p%u.i%u",
+		    device_get_nameunit(parent), uaa->port,
+		    uaa->info.bIfaceIndex);
+		goto queue;
+#ifdef DEV_ACPI
+	} else if (strcmp(device_get_name(parent), "acpi") == 0) {
+		ACPI_HANDLE h;
+
+		/*
+		 * An ACPI node no driver claimed (#329). Reading _HID/_CID
+		 * allocates, so only the handle is captured here; the strings
+		 * are read in the taskqueue.
+		 */
+		h = acpi_get_handle(dev);
+		if (h == NULL)
+			return;
+		w = malloc(sizeof(*w), M_IOCAT, M_NOWAIT | M_ZERO);
+		if (w == NULL)
+			return;
+		w->kind = IOCAT_KIND_ACPI;
+		w->acpi_handle = h;
+		/* Unattached ACPI children are often unnamed; key on the node. */
+		snprintf(w->devname, sizeof(w->devname), "acpi:%p", h);
+		goto queue;
+#endif
 	} else {
 #ifdef FDT
 		const char *compat;
@@ -712,6 +1027,7 @@ iocat_device_nomatch(void *arg __unused, device_t dev)
 		w = malloc(sizeof(*w), M_IOCAT, M_NOWAIT | M_ZERO);
 		if (w == NULL)
 			return;
+		w->kind = IOCAT_KIND_FDT;
 		strlcpy(w->compat, compat, sizeof(w->compat));
 #else
 		return;
@@ -720,6 +1036,7 @@ iocat_device_nomatch(void *arg __unused, device_t dev)
 	nu = device_get_nameunit(dev);
 	strlcpy(w->devname, nu != NULL ? nu : "?", sizeof(w->devname));
 
+queue:
 	mtx_lock(&iocat_work_mtx);
 	STAILQ_INSERT_TAIL(&iocat_work, w, link);
 	mtx_unlock(&iocat_work_mtx);

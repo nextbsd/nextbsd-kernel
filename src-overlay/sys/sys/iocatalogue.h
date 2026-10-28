@@ -29,6 +29,29 @@
  * the same as a Darwin one rather than inventing a NextBSD-only spelling.
  */
 #define	IOCAT_PROVIDER_IOPLATFORMDEVICE	2
+/*
+ * nextbsd-kernel#329: USB and PCI-class personalities. All three ride the
+ * existing struct iocat_add (IOCATIOCADD) -- only provider_class and the
+ * meaning of match[] differ -- so the kextd ABI does not change size.
+ *
+ * IOUSBHostDevice: match[] holds 0x<idProduct><idVendor> words (product in the
+ *   high 16 bits, vendor low), the USB twin of IOPCIPrimaryMatch.
+ * IOUSBHostInterface: match[] holds (value, mask) PAIRS over the interface
+ *   triple 0x00<bInterfaceClass><bInterfaceSubClass><bInterfaceProtocol>; a
+ *   device matches when (triple & mask) == (value & mask). nmatch is even.
+ * IOPCIClassMatch (provider IOPCIDevice in a Darwin plist; its own class here):
+ *   match[] holds (value, mask) PAIRS over Darwin's IOPCIClassMatch word
+ *   0x<class><subclass><progif><revision>, e.g. 0x01080200&0xffffff00 for NVMe.
+ *
+ * ACPI _HID personalities (IOACPIPlatformDevice + IONameMatch) use the
+ * device-tree string path (IOCATIOCADDCOMPAT) with each name prefixed "acpi:"
+ * (e.g. "acpi:PNP0C14"), so an ACPI id can never collide with an FDT
+ * compatible string.
+ */
+#define	IOCAT_PROVIDER_IOUSBHOSTDEVICE	3
+#define	IOCAT_PROVIDER_IOUSBHOSTINTERFACE 4
+#define	IOCAT_PROVIDER_IOPCICLASS	5
+#define	IOCAT_ACPI_PREFIX		"acpi:"
 
 /* Longest FDT compatible string we will store, including NUL. */
 #define	IOCAT_COMPAT_MAX		128
@@ -159,6 +182,16 @@ int	iocat_lookup_pci(uint32_t match_word, char *buf, size_t buflen,
  */
 int	iocat_lookup_compat(const char *compat, char *buf, size_t buflen,
 	    int32_t *score_out);
+
+/*
+ * nextbsd-kernel#329: exact word lookup for any word-matched provider
+ * (IOPCIDevice, IOUSBHostDevice), and masked (value, mask) pair lookup for the
+ * class providers (IOUSBHostInterface, IOPCIClass). Same contract as above.
+ */
+int	iocat_lookup_word(uint32_t provider, uint32_t word, char *buf,
+	    size_t buflen, int32_t *score_out);
+int	iocat_lookup_masked(uint32_t provider, uint32_t word, char *buf,
+	    size_t buflen, int32_t *score_out);
 #endif /* _KERNEL */
 
 #endif /* _SYS_IOCATALOGUE_H_ */
