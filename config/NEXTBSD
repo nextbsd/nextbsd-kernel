@@ -15,16 +15,29 @@ ident	NEXTBSD
 options 	ROOTDEVNAME=\"ufs:/dev/ufs/ROOTFS\"
 options 	INIT_PATH=/sbin/launchd
 
-# D1 (#219): drop the built-in Intel GbE driver so it auto-loads as a kext.
-# GENERIC's `device em` compiles the e1000 driver (if_em.c registers BOTH the
-# `em` and `igb` drivers — the whole Intel PRO/1000 GbE family) into the kernel.
-# Removing it makes the e1000 hit device_nomatch at attach, so the in-kernel
-# IOKit matcher (#211) -> kextd auto-loads IntelEthernet.kext (if_em, shipped by
-# nextbsd-kernel-extensions) to bind it. iflib + miibus (if_em's load-time deps)
-# stay built in. NIC only -- not boot-critical (root is ahci/virtio). First
-# driver->kext conversion; ix/ixl/ice/igc stay built in (no qemu device to prove
-# their auto-load -- see nextbsd #245).
-nodevice 	em
+# em(4) (the Intel PRO/1000 em and igb families) is compiled in, as in GENERIC
+# (#328, E21 D5). It was removed for a while (#219) so it would load as
+# IntelEthernet.kext, the first driver-to-kext conversion; the graphics kexts
+# and IntelWiFi now prove hardware-matched kext loading, and the network driver
+# of every amd64 VM and most Intel boards should not depend on kextd.
+
+# 802.11: the net80211 core and every plug-in, on both arches (#53, E21 D5).
+# amd64 GENERIC already has most of these; arm64 GENERIC has none, so arm64
+# had no 802.11 layer at all. The plug-ins never autoload (there is no .ko
+# tree), so they are all compiled in. config(8) ignores a device or option
+# GENERIC already declares, so one list serves both arches. COMPAT_LINUXKPI
+# (which LinuxKPI 802.11 and the drm kexts need) is set explicitly: on arm64 it
+# otherwise arrives only through GENERIC's include of std.azure.
+options 	COMPAT_LINUXKPI
+device		wlan			# 802.11 support
+device		wlan_wep		# 802.11 WEP
+device		wlan_tkip		# 802.11 TKIP
+device		wlan_ccmp		# 802.11 CCMP
+device		wlan_gcmp		# 802.11 GCMP
+device		wlan_amrr		# AMRR transmit rate control
+device		wlan_rssadapt		# RSS-adaptive transmit rate control
+device		wlan_xauth		# external authenticator (hostapd)
+device		wlan_acl		# MAC-based ACLs (hostapd)
 
 # base virtio_gpu(4) is deliberately KEPT (nextbsd-kernel#170).
 #
