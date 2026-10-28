@@ -243,9 +243,9 @@ jobs:
       # struct layouts go -- __FreeBSD_version can't tell them apart
       # (nextbsd-kernel#326, nextbsd-kernel-extensions-graphics#46). Both arches and
       # NEXTBSD-RPI5 share one ID, since they come from one run and one tree.
-      # It lives in the obj dir, so it rides in BOTH tarballs below at
-      # .../sys/NEXTBSD/KERNEL-BUILD-ID: the kext builds read it from
-      # kernel-obj and stamp it into every kext tarball; packaging and the
+      # It lives in the obj dir, so it rides in the kernel tarball at
+      # .../sys/NEXTBSD/KERNEL-BUILD-ID and in the kernel SDK: the kext builds
+      # read it from the SDK and stamp it into every kext; packaging and the
       # image lanes compare the two and refuse a mismatch.
       - name: Stamp KERNEL-BUILD-ID
         run: |
@@ -255,16 +255,16 @@ jobs:
           echo "${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}" > "$OBJ/KERNEL-BUILD-ID"
           echo "KERNEL-BUILD-ID: $(cat "$OBJ/KERNEL-BUILD-ID")"
 
-      - name: Package obj tree (preserves exec bits)
+      # The full /usr/obj is no longer published: the kext repos build against
+      # the kernel SDK below (#327, nextbsd-kernel-extensions#2).
+      - name: Package kernel tree (preserves exec bits)
         run: |
-          # Full /usr/obj — consumed by nextbsd-kernel-extensions, -graphics and -nvidia.
-          tar -czf "/tmp/kernel-obj-${{ matrix.target }}.tar.gz" -C /usr/obj .
           # sys/NEXTBSD subtree (kernel binary + opt_*.h) — consumed by nextbsd.
           SUB=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD' | head -1)
           echo "sys/NEXTBSD subtree: ${SUB:-<not found>}"
           test -n "$SUB"
           tar -czf "/tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz" -C /usr/obj "$SUB"
-          ls -lh /tmp/kernel-obj-${{ matrix.target }}.tar.gz /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
+          ls -lh /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
 
       # The kernel SDK (#327): headers, generated options and exported symbols,
       # what a kext needs to build against this kernel without its source or
@@ -280,13 +280,6 @@ jobs:
         with:
           name: nextbsd-kernel-${{ matrix.target }}
           path: /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
-          compression-level: 0
-
-      - name: Upload obj tree for modules
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-obj-${{ matrix.target }}
-          path: /tmp/kernel-obj-${{ matrix.target }}.tar.gz
           compression-level: 0
 
       - name: Upload kernel SDK
@@ -602,7 +595,6 @@ jobs:
       - name: Collect per-arch assets
         run: |
           mkdir -p out
-          find artifacts -name 'kernel-obj-*.tar.gz' -exec cp {} out/ \;
           find artifacts -name 'nextbsd-kernel-*.tar.gz' -exec cp {} out/ \;
           find artifacts -name 'kernel-sdk-*.tar.gz' -exec cp {} out/ \;
           # The Pi 5 family board kernel, published under a name that says what
@@ -623,8 +615,7 @@ jobs:
           cp out/rpi5-kernel8-arm64.img out/rpi500-kernel8-arm64.img
           # One KERNEL-BUILD-ID for the whole run, also as its own asset so a
           # consumer can check it without downloading a tarball. Each kernel
-          # tarball must carry that same ID (kernel-obj is packed from the same
-          # obj dir in the same step, and is too big to re-read here).
+          # tarball and SDK must carry that same ID.
           ID="${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}"
           echo "$ID" > out/KERNEL-BUILD-ID
           for t in out/nextbsd-kernel-*.tar.gz; do
@@ -651,9 +642,8 @@ jobs:
           name: Continuous kernel build
           body: |
             Rolling kernel build, refreshed on every successful `main` build.
-            Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-obj-<arch>.tar.gz`,
-            moving to `kernel-sdk-<arch>.tar.gz`, the kernel SDK: headers, generated options and
-            exported symbols, nextbsd-kernel#327) and
+            Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-sdk-<arch>.tar.gz`,
+            the kernel SDK: headers, generated options and exported symbols, #327) and
             nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
             `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
             `rpi500-kernel8-arm64.img` is a transition alias for the same
