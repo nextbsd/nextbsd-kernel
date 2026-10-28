@@ -136,6 +136,24 @@ struct iocat_lookup_compat {
 #define	IOCATIOCADDCOMPAT	_IOW('K', 5, struct iocat_add_compat)
 #define	IOCATIOCLOOKUPCOMPAT	_IOWR('K', 6, struct iocat_lookup_compat)
 
+/*
+ * Kernel-requested loads by module name (nextbsd-kernel#52). kern_kldload()
+ * passes a module name it finds nowhere to the catalogue, which sends kextd an
+ * IOKIT_KEXTD_KLD_MSGID request and sleeps until kextd reports the outcome.
+ *
+ * IOCATIOCKLDSERVE: the calling process serves these requests until it closes
+ *   the descriptor it was issued on (kextd -w). Without one, a miss fails at
+ *   once with ENOENT, as on stock FreeBSD.
+ * IOCATIOCKLDDONE: the request `seq` has finished; `error` is 0 when the
+ *   module is now loaded, else an errno (ENOENT: no kext provides it).
+ */
+struct iocat_kld_done {
+	uint32_t	seq;
+	int32_t		error;
+};
+#define	IOCATIOCKLDSERVE	_IO('K', 7)
+#define	IOCATIOCKLDDONE		_IOW('K', 8, struct iocat_kld_done)
+
 #ifdef _KERNEL
 #include <sys/queue.h>
 #include <sys/sysctl.h>

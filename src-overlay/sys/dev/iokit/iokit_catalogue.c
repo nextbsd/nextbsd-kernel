@@ -29,6 +29,8 @@
 #include <sys/bus.h>
 #include <sys/eventhandler.h>
 #include <sys/taskqueue.h>
+#include <sys/linker.h>		/* linker_kld_request_hook (#52) */
+#include <sys/proc.h>
 #include <sys/iocatalogue.h>
 
 #include <dev/pci/pcivar.h>
@@ -55,6 +57,7 @@
  * pulls in no Mach headers. */
 extern int iokit_kextd_send(const char *bundle, const char *device,
     uint32_t match_word);
+extern int iokit_kextd_send_module(const char *name, uint32_t seq);
 #endif
 
 /* push-triggers-match (K3b): re-check devices that went unmatched against a
@@ -1052,6 +1055,138 @@ queue:
 	taskqueue_enqueue(taskqueue_thread, &iocat_match_task);
 }
 
+/*
+ * ---- kernel-requested loads by module name (nextbsd-kernel#52) ----
+ *
+ * kern_kldload() hands a module name it finds nowhere to iocat_kld_request()
+ * through linker_kld_request_hook. Modules ship in kext bundles that only
+ * kextd can resolve (its module-name index, nextbsd-userland#439), so the
+ * request goes to kextd as an IOKIT_KEXTD_KLD_MSGID Mach message and the
+ * caller sleeps, holding no lock, until kextd reports the outcome with
+ * IOCATIOCKLDDONE.
+ *
+ * Only a process that has issued IOCATIOCKLDSERVE is asked, and never that
+ * process itself: with no kextd serving, a miss fails at once with ENOENT,
+ * as on stock FreeBSD. When kextd's descriptor closes, its outstanding
+ * requests fail too.
+ *
+ * Unprivileged actions (a user mount, a netgraph socket) reach the hook only
+ * through kern_kldload(), which has already required PRIV_KLD_LOAD; the
+ * per-bundle opt-in for unprivileged loads (E21 D10) is for when that changes.
+ */
+#ifdef COMPAT_MACH
+#define	IOCAT_KLD_TIMEOUT	(60 * hz)	/* a kext may load firmware */
+
+struct iocat_kld_req {
+	TAILQ_ENTRY(iocat_kld_req) link;
+	uint32_t	seq;
+	int		error;
+	bool		done;
+};
+static TAILQ_HEAD(, iocat_kld_req) iocat_kld_reqs =
+    TAILQ_HEAD_INITIALIZER(iocat_kld_reqs);
+static struct mtx iocat_kld_mtx;
+MTX_SYSINIT(iocat_kld_mtx, &iocat_kld_mtx, "iocat_kld", MTX_DEF);
+static uint32_t iocat_kld_seq;
+static pid_t iocat_kld_pid;	/* the serving kextd, or 0 */
+
+static int
+iocat_kld_request(const char *modname)
+{
+	struct iocat_kld_req r;
+	int error;
+
+	memset(&r, 0, sizeof(r));
+	mtx_lock(&iocat_kld_mtx);
+	if (iocat_kld_pid == 0 || curproc->p_pid == iocat_kld_pid) {
+		mtx_unlock(&iocat_kld_mtx);
+		return (ENOENT);
+	}
+	if (++iocat_kld_seq == 0)
+		++iocat_kld_seq;
+	r.seq = iocat_kld_seq;
+	TAILQ_INSERT_TAIL(&iocat_kld_reqs, &r, link);
+	mtx_unlock(&iocat_kld_mtx);
+
+	error = iokit_kextd_send_module(modname, r.seq);
+
+	mtx_lock(&iocat_kld_mtx);
+	if (error != 0)
+		error = ENOENT;		/* kextd gone since the check */
+	while (error == 0 && !r.done)
+		error = msleep(&r, &iocat_kld_mtx, PCATCH, "kextd",
+		    IOCAT_KLD_TIMEOUT);
+	TAILQ_REMOVE(&iocat_kld_reqs, &r, link);
+	mtx_unlock(&iocat_kld_mtx);
+	if (r.done)
+		return (r.error);
+	if (error == EWOULDBLOCK) {
+		printf("iokit: kextd did not answer for module %s\n", modname);
+		error = ENOENT;
+	}
+	return (error);
+}
+
+static int
+iocat_kld_done(struct thread *td, const struct iocat_kld_done *d)
+{
+	struct iocat_kld_req *r;
+
+	mtx_lock(&iocat_kld_mtx);
+	if (td->td_proc->p_pid != iocat_kld_pid) {
+		mtx_unlock(&iocat_kld_mtx);
+		return (EPERM);
+	}
+	TAILQ_FOREACH(r, &iocat_kld_reqs, link)
+		if (r->seq == d->seq && !r->done)
+			break;
+	if (r != NULL) {
+		r->error = (d->error >= 0 && d->error <= ELAST) ? d->error : EIO;
+		r->done = true;
+		wakeup(r);
+	}
+	mtx_unlock(&iocat_kld_mtx);
+	return (r != NULL ? 0 : ENOENT);
+}
+
+/* The serving descriptor closed: stop asking, fail what is outstanding. */
+static void
+iocat_kld_serve_dtor(void *data)
+{
+	struct iocat_kld_req *r;
+	pid_t pid = (pid_t)(uintptr_t)data;
+
+	mtx_lock(&iocat_kld_mtx);
+	if (iocat_kld_pid == pid) {
+		iocat_kld_pid = 0;
+		TAILQ_FOREACH(r, &iocat_kld_reqs, link) {
+			if (!r->done) {
+				r->error = ENOENT;
+				r->done = true;
+				wakeup(r);
+			}
+		}
+	}
+	mtx_unlock(&iocat_kld_mtx);
+}
+
+static int
+iocat_kld_serve(struct thread *td)
+{
+	pid_t pid = td->td_proc->p_pid;
+	int error;
+
+	error = devfs_set_cdevpriv((void *)(uintptr_t)pid,
+	    iocat_kld_serve_dtor);
+	if (error != 0)
+		return (error);
+	mtx_lock(&iocat_kld_mtx);
+	iocat_kld_pid = pid;
+	mtx_unlock(&iocat_kld_mtx);
+	return (0);
+}
+#endif /* COMPAT_MACH */
+
 /* ---- /dev/iocatalogue: ioctl ingestion from userland (kextd) ---- */
 
 static d_ioctl_t iocat_ioctl;
@@ -1064,7 +1199,7 @@ static struct cdevsw iocat_cdevsw = {
 
 static int
 iocat_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
-    int fflag __unused, struct thread *td __unused)
+    int fflag __unused, struct thread *td)
 {
 	switch (cmd) {
 	case IOCATIOCADD:
@@ -1105,6 +1240,18 @@ iocat_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		return (ENOSYS);
 #endif
 	}
+	case IOCATIOCKLDSERVE:		/* #52: kextd serves module requests */
+#ifdef COMPAT_MACH
+		return (iocat_kld_serve(td));
+#else
+		return (ENOSYS);
+#endif
+	case IOCATIOCKLDDONE:
+#ifdef COMPAT_MACH
+		return (iocat_kld_done(td, (struct iocat_kld_done *)data));
+#else
+		return (ENOSYS);
+#endif
 	default:
 		return (ENOTTY);
 	}
@@ -1170,8 +1317,14 @@ iocat_modevent(module_t mod __unused, int type, void *data __unused)
 		/* Registered before SI_SUB_CONFIGURE, so it sees boot nomatches. */
 		iocat_nomatch_tag = EVENTHANDLER_REGISTER(device_nomatch,
 		    iocat_device_nomatch, NULL, EVENTHANDLER_PRI_ANY);
+#ifdef COMPAT_MACH
+		linker_kld_request_hook = iocat_kld_request;
+#endif
 		return (0);
 	case MOD_UNLOAD:
+#ifdef COMPAT_MACH
+		linker_kld_request_hook = NULL;
+#endif
 		if (iocat_nomatch_tag != NULL)
 			EVENTHANDLER_DEREGISTER(device_nomatch, iocat_nomatch_tag);
 		taskqueue_drain(taskqueue_thread, &iocat_match_task);

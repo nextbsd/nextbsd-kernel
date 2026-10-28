@@ -1,0 +1,97 @@
+From cb0a592665f4a97a859f1999609146587d4ab8cb Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 28 Oct 2026 08:44:52 -0500
+Subject: [PATCH] NextBSD: ask kextd for a module kldload finds nowhere
+
+Modules ship in kext bundles under /System/Library/Extensions, not a .ko
+tree linker_search_module() can search, so every load by module name
+(mount -t, netgraph mkpeer, LinuxKPI request_module, kldload <name>)
+failed with ENOENT. kern_kldload() now passes such a miss to
+linker_kld_request_hook, which the IOKit catalogue sets to ask kextd to
+load the kext providing the name (nextbsd-kernel#52).
+
+The hook runs with no linker lock held, never from inside another load
+(the busy count is recursed: kextd's own kldload would wait on this
+thread) and never with Giant held (an attach path).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/kern/kern_linker.c | 27 +++++++++++++++++++++++++++
+ sys/sys/linker.h       |  8 ++++++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/sys/kern/kern_linker.c b/sys/kern/kern_linker.c
+index 9559b5233..1bdfb28c0 100644
+--- a/sys/kern/kern_linker.c
++++ b/sys/kern/kern_linker.c
+@@ -108,6 +108,8 @@ static struct sx kld_sx;	/* kernel linker lock */
+ static u_int kld_busy;
+ static struct thread *kld_busy_owner;
+ 
++int (*linker_kld_request_hook)(const char *modname);
++
+ /*
+  * Load counter used by clients to determine if a linker file has been
+  * re-loaded. This counter is incremented for each file load.
+@@ -1202,6 +1204,8 @@ kern_kldload(struct thread *td, const char *file, int *fileid)
+ {
+ 	const char *kldname, *modname;
+ 	linker_file_t lf;
++	modlist_t mod;
++	bool nested;
+ 	int error;
+ 
+ 	if ((error = securelevel_gt(td->td_ucred, 0)) != 0)
+@@ -1243,7 +1247,30 @@ kern_kldload(struct thread *td, const char *file, int *fileid)
+ 		if (fileid != NULL)
+ 			*fileid = lf->id;
+ 	}
++	/* A load from inside another load's module handler (busy recursed). */
++	nested = kld_busy > 1;
+ 	linker_kldload_unbusy(LINKER_UB_LOCKED);
++
++	/*
++	 * NextBSD (nextbsd-kernel#52): a module found nowhere may be in a kext;
++	 * ask kextd for it. Never from inside another load (kextd's kldload would
++	 * wait for this thread's busy) or with Giant held (an attach path, whose
++	 * newbus lock the load needs). The kext's load holds the user reference
++	 * a kldload here would have taken, so the caller may unload it by id.
++	 */
++	if (error == ENOENT && modname != NULL && !nested &&
++	    !mtx_owned(&Giant) && linker_kld_request_hook != NULL) {
++		error = linker_kld_request_hook(modname);
++		if (error == 0) {
++			sx_xlock(&kld_sx);
++			mod = modlist_lookup2(modname, NULL);
++			if (mod == NULL)
++				error = ENOENT;
++			else if (fileid != NULL)
++				*fileid = mod->container->id;
++			sx_xunlock(&kld_sx);
++		}
++	}
+ 	return (error);
+ }
+ 
+diff --git a/sys/sys/linker.h b/sys/sys/linker.h
+index f8a5dda06..343ea5b3e 100644
+--- a/sys/sys/linker.h
++++ b/sys/sys/linker.h
+@@ -218,6 +218,14 @@ void *linker_hwpmc_list_objects(void);
+ int linker_kldload_busy(int flags);
+ void linker_kldload_unbusy(int flags);
+ 
++/*
++ * NextBSD: modules live in kext bundles, not a .ko tree the linker can
++ * search, so a load by module name that finds nothing is passed to this hook
++ * (kextd's module-name index, nextbsd-kernel#52). It returns 0 once the
++ * module is loaded, or an error. Called with no linker lock held.
++ */
++extern int (*linker_kld_request_hook)(const char *modname);
++
+ #endif	/* _KERNEL */
+ 
+ /*
+-- 
+2.54.0 (Apple Git-157)
+

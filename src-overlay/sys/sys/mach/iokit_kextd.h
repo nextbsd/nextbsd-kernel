@@ -20,6 +20,14 @@
 #define	IOKIT_KEXTD_BUNDLE_MAX	128
 
 /*
+ * msgid for a load request by FreeBSD module name ("IOKM", nextbsd-kernel#52):
+ * kern_kldload() found no module by that name. Same wire format: bundle_id
+ * carries the module name and match_word the request's sequence number, which
+ * kextd hands back with IOCATIOCKLDDONE once the load has finished.
+ */
+#define	IOKIT_KEXTD_KLD_MSGID	0x494f4b4d
+
+/*
  * Wire format. Fixed-size, inline (no out-of-line/complex descriptors), so the
  * kernel build is trivial and kextd reads it with a plain mach_msg. bundle_id
  * is the CFBundleIdentifier the kernel decided; device/match are informational.
@@ -41,6 +49,9 @@ typedef struct {
  */
 int	iokit_kextd_send(const char *bundle, const char *device,
 	    uint32_t match_word);
+
+/* Ask kextd to load the kext providing module `name`; same returns. */
+int	iokit_kextd_send_module(const char *name, uint32_t seq);
 #endif
 
 #endif /* _SYS_MACH_IOKIT_KEXTD_H_ */

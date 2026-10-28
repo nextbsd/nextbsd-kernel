@@ -45,8 +45,9 @@ kextd_strcopy(char *dst, const char *src, size_t n)
 	dst[i] = '\0';
 }
 
-int
-iokit_kextd_send(const char *bundle, const char *device, uint32_t match_word)
+static int
+iokit_kextd_send_msg(mach_msg_id_t id, const char *bundle, const char *device,
+    uint32_t match_word)
 {
 	ipc_port_t port;
 	ipc_kmsg_t kmsg;
@@ -76,7 +77,7 @@ iokit_kextd_send(const char *bundle, const char *device, uint32_t match_word)
 	m->hdr.msgh_local_port = MACH_PORT_NULL;
 	m->hdr.msgh_remote_port = (mach_port_t) port;	/* ref consumed by send */
 	m->hdr.msgh_voucher_port = 0;
-	m->hdr.msgh_id = IOKIT_KEXTD_LOAD_MSGID;
+	m->hdr.msgh_id = id;
 	m->hdr.msgh_size = (mach_msg_size_t)
 	    (sizeof(*m) - sizeof(mach_msg_format_0_trailer_t));
 	m->NDR = NDR_record;
@@ -98,4 +99,18 @@ iokit_kextd_send(const char *bundle, const char *device, uint32_t match_word)
 
 	ipc_mqueue_send_always(kmsg);
 	return (0);
+}
+
+int
+iokit_kextd_send(const char *bundle, const char *device, uint32_t match_word)
+{
+	return (iokit_kextd_send_msg(IOKIT_KEXTD_LOAD_MSGID, bundle, device,
+	    match_word));
+}
+
+int
+iokit_kextd_send_module(const char *name, uint32_t seq)
+{
+	return (iokit_kextd_send_msg(IOKIT_KEXTD_KLD_MSGID, name, "kldload",
+	    seq));
 }
