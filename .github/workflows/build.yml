@@ -349,16 +349,15 @@ jobs:
           # `ls` ordered after graphics-kexts-<arch>.tar.gz, so assembly laid
           # the old set over the current one (and on arm64, x86-64 objects over
           # arm64's: "DMABuf - unsupported file type"). Graphics is per-arch;
-          # the FreeBSD kexts (IntelWiFi, IntelEthernet) and NVIDIA are amd64-only
-          # and come from their own repos (nextbsd/nextbsd#554, #548). Every kext
-          # asset must be there:
+          # so are the FreeBSD kexts (nextbsd/nextbsd#554); NVIDIA is amd64-only.
+          # Each comes from its own repo. Every kext asset must be there:
           # a missing one fails the lane instead of booting an image without
           # it (nextbsd/nextbsd#552).
           gh release download continuous -R nextbsd/nextbsd-kernel-extensions-graphics \
             --pattern 'graphics-kexts-${{ matrix.target }}.tar.gz' --dir art --clobber
+          gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
+            --pattern 'freebsd-kexts-${{ matrix.target }}.tar.gz' --dir art --clobber
           if [ "${{ matrix.target }}" = amd64 ]; then
-            gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
-              --pattern 'freebsd-kexts-amd64.tar.gz' --dir art --clobber
             gh release download continuous -R nextbsd/nextbsd-kernel-extensions-nvidia \
               --pattern 'nvidia-kexts-amd64.tar.gz' --dir art --clobber
           fi
