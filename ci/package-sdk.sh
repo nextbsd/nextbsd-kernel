@@ -49,12 +49,20 @@ mkdir -p "$SDK/sys" "$SDK/obj"
 # sys/: interfaces, not implementation. Every header (linuxkpi's and the
 # overlay's included), the *.m / *.src files kmod.mk turns into *_if.h and
 # vnode_if*.h, and all of sys/conf and sys/tools, which the module build
-# includes and runs. No .c, .S or assembler includes: module source is not
-# taken from here.
+# includes and runs. Plus the other inputs kmod.mk itself names under
+# ${SYSDIR}: firmw.S (firmware modules, FIRMWS), the genassym/genoffset
+# generators, the *devs tables (usbdevs, sdiodevs, ...), acpi_quirks and the
+# bhnd nvram map. No other .c or .S: module source is not taken from here.
 ( cd "$SRC/sys" && find . \( -type f -o -type l \) \( \
 	-name '*.h' -o -name '*.hh' -o -name '*.m' -o -name '*.src' \
 	-o -path './conf/*' -o -path './tools/*' \
-	-o -path "./$TARGET/conf/*" \) -print ) | sort > "$STAGE/sys.list"
+	-o -path "./$TARGET/conf/*" \
+	-o -path './kern/firmw.S' -o -path './kern/genassym.sh' \
+	-o -path './kern/genoffset.c' -o -path './kern/genoffset.sh' \
+	-o -path "./$TARGET/$TARGET/genassym.c" \
+	-o -path './dev/*/*devs' -o -path './dev/acpica/acpi_quirks' \
+	-o -path './dev/bhnd/nvram/nvram_map' -o -path './dev/bhnd/tools/*' \) \
+	-print ) | sort > "$STAGE/sys.list"
 tar -C "$SRC/sys" -cf - -T "$STAGE/sys.list" | tar -C "$SDK/sys" -xf -
 
 # obj/: the generated, non-object part of the kernel build directory.
