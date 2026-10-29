@@ -76,7 +76,14 @@ static void iocat_rematch_pending(void);
  * thousands with the full FreeBSD kext set), and a rescan plus load request per
  * add flooded kextd and the console. Like Darwin's IOCatalogue, which matches
  * after the whole set is added, each add (re)arms one timeout task that fires
- * IOCAT_SETTLE_MS after the last add of the batch. */
+ * IOCAT_SETTLE_MS after the last add of the batch.
+ *
+ * This replaced a plain task, which taskqueue coalesced only while it was still
+ * queued: once the scan started, the next add queued it again, so one push ran
+ * the whole walk twice or more (#195 saw two on a Pi). A second scan now means
+ * personalities arrived after the first one fired (another push, or kextd
+ * restarted by launchd and re-pushing); that one is wanted, because a device
+ * the new set claims would otherwise never get its load request. */
 static void iocat_rematch_present(void);
 /* HID bus, virtio and VMBus children (#360): defined with the nomatch
  * handler, also used by the present-scan. */
@@ -88,6 +95,9 @@ static struct timeout_task iocat_present_task;
 #define	iocat_schedule_rematch()					\
 	taskqueue_enqueue_timeout(taskqueue_thread, &iocat_present_task,	\
 	    MAX(1, IOCAT_SETTLE_MS * hz / 1000))
+
+/* Logged / sent device name; the size of kextd's load-message device field. */
+#define	IOCAT_DEVNAME_MAX	64
 
 static MALLOC_DEFINE(M_IOCAT, "iocatalogue", "in-kernel IOKit catalogue");
 
@@ -395,7 +405,7 @@ struct iocat_match_work {
 	 * Tried only when no exact personality claims match_word.
 	 */
 	uint32_t	class_word;
-	char		devname[64];
+	char		devname[IOCAT_DEVNAME_MAX];
 	/*
 	 * Device-tree devices have no match word, they have a compatible
 	 * string (#185).
@@ -419,6 +429,51 @@ static STAILQ_HEAD(, iocat_match_work) iocat_pending =
 static struct mtx iocat_work_mtx;
 static struct task iocat_match_task;
 static eventhandler_tag iocat_nomatch_tag;
+
+/*
+ * A printable name for `dev`, written to `buf` when it has to be built (#195).
+ *
+ * device_get_nameunit() is NULL until a driver names the device, and every
+ * device the matcher reports is by definition one no driver has claimed, so
+ * passing it straight to "%s" logged "(null)" and sent kextd an empty device
+ * field. Fall back to whatever identifies an unattached device on its bus:
+ * the PCI selector (pci<domain>:<bus>:<slot>:<func>, as pciconf(8) and the
+ * "(no driver attached)" probe line spell it), the device-tree node name, the
+ * probe description, or failing all of those the parent bus. Never NULL.
+ *
+ * Reads ivars and softc-held strings only; it neither sleeps nor allocates,
+ * so the device_nomatch handler may call it too.
+ */
+static const char *
+iocat_devname(device_t dev, char *buf, size_t len)
+{
+	device_t parent;
+	const char *n, *pn;
+
+	n = device_get_nameunit(dev);
+	if (n != NULL && *n != '\0')
+		return (n);
+	parent = device_get_parent(dev);
+	pn = parent != NULL ? device_get_nameunit(parent) : NULL;
+	if (pn == NULL)
+		pn = "?";
+	if (parent != NULL && device_get_name(parent) != NULL &&
+	    strcmp(device_get_name(parent), "pci") == 0) {
+		snprintf(buf, len, "pci%d:%d:%d:%d", pci_get_domain(dev),
+		    pci_get_bus(dev), pci_get_slot(dev), pci_get_function(dev));
+		return (buf);
+	}
+#ifdef FDT
+	n = parent != NULL ? ofw_bus_get_name(dev) : NULL;
+	if (n != NULL && *n != '\0') {
+		snprintf(buf, len, "%s:%s", pn, n);
+		return (buf);
+	}
+#endif
+	n = device_get_desc(dev);
+	snprintf(buf, len, "%s:%s", pn, n != NULL && *n != '\0' ? n : "?");
+	return (buf);
+}
 
 /*
  * Ask userland (kextd) to load `bundle` for a matched device. The faithful
@@ -606,6 +661,17 @@ iocat_rematch_pending(void)
 	}
 }
 
+/*
+ * Present-scan counts, kept per walk (#195): the walks cover different kinds
+ * of device, and one shared total under a "pci devices" label told a reader
+ * of a Pi boot that it had 166 PCI devices when most were device-tree nodes.
+ */
+struct iocat_tally {
+	int	checked;
+	int	unmatched;
+	int	requested;
+};
+
 #ifdef FDT
 /*
  * Recursively walk an OF subtree looking for present-but-unmatched nodes whose
@@ -616,11 +682,12 @@ iocat_rematch_pending(void)
  * device tree itself (a handful of levels on a Pi), and each frame is small.
  */
 static void
-iocat_scan_of_subtree(device_t bus, int *checked, int *unmatched, int *requested)
+iocat_scan_of_subtree(device_t bus, struct iocat_tally *t)
 {
 	device_t *kids;
-	const char *compat;
+	const char *compat, *name;
 	char bundle[IOCAT_BUNDLE_ID_MAX];
+	char nbuf[IOCAT_DEVNAME_MAX];
 	int32_t score;
 	int nkids, i;
 
@@ -628,26 +695,26 @@ iocat_scan_of_subtree(device_t bus, int *checked, int *unmatched, int *requested
 		return;
 	for (i = 0; i < nkids; i++) {
 		/* Recurse first: a bus with a driver still has children. */
-		iocat_scan_of_subtree(kids[i], checked, unmatched, requested);
+		iocat_scan_of_subtree(kids[i], t);
 
 		compat = ofw_bus_get_compat(kids[i]);
 		if (compat == NULL || *compat == '\0')
 			continue;	/* not an OF node we can match */
-		(*checked)++;
+		t->checked++;
 		if (device_get_driver(kids[i]) != NULL)
 			continue;	/* already has a real owner */
-		(*unmatched)++;
+		t->unmatched++;
 		if (iocat_lookup_compat(compat, bundle, sizeof(bundle),
 		    &score) != 0)
 			continue;	/* no personality claims it */
+		name = iocat_devname(kids[i], nbuf, sizeof(nbuf));
 		if (bootverbose)
 			printf("iokit: present-scan: %s (%s) present + "
 			    "unmatched -> request load %s\n",
-			    device_get_nameunit(kids[i]), compat, bundle);
+			    name, compat, bundle);
 		/* match_word 0: this is an FDT match, not a PCI one. */
-		iocat_request_load(0, device_get_nameunit(kids[i]), bundle,
-		    score);
-		(*requested)++;
+		iocat_request_load(0, name, bundle, score);
+		t->requested++;
 	}
 	free(kids, M_TEMP);
 }
@@ -748,8 +815,13 @@ iocat_rematch_present(void)
 	device_t *buses = NULL;
 	int nbuses = 0, i;
 	char bundle[IOCAT_BUNDLE_ID_MAX];
+	char nbuf[IOCAT_DEVNAME_MAX];
+	const char *name;
 	int32_t score;
-	int checked = 0, unmatched = 0, requested = 0;
+	struct iocat_tally pci = { 0 }, bus = { 0 };
+	struct iocat_tally of __unused = { 0 };		/* FDT only */
+	struct iocat_tally acpi __unused = { 0 };	/* DEV_ACPI only */
+	u_int npers;
 
 	pci_dc = devclass_find("pci");
 	if (pci_dc == NULL)
@@ -766,7 +838,7 @@ iocat_rematch_present(void)
 			device_t child = kids[j];
 			uint32_t mw;
 
-			checked++;
+			pci.checked++;
 			/*
 			 * Skip devices already bound to a real driver — EXCEPT
 			 * two shapes of GPU where the bound driver is standing
@@ -809,7 +881,7 @@ iocat_rematch_present(void)
 				} else
 					continue;	/* real owner — skip */
 			}
-			unmatched++;
+			pci.unmatched++;
 			/* IOPCIPrimaryMatch form: device<<16 | vendor. */
 			mw = ((uint32_t)pci_get_device(child) << 16) |
 			    pci_get_vendor(child);
@@ -825,13 +897,13 @@ iocat_rematch_present(void)
 			 * driver at all: a vgapci- or virtio-shadowed GPU is
 			 * handed to its DRM kext by id, never by class.
 			 */
+			name = iocat_devname(child, nbuf, sizeof(nbuf));
 			if (bootverbose)
 				printf("iokit: present-scan: %s (0x%08x) present + "
 				    "unmatched -> request load %s\n",
-				    device_get_nameunit(child), mw, bundle);
-			iocat_request_load(mw, device_get_nameunit(child),
-			    bundle, score);
-			requested++;
+				    name, mw, bundle);
+			iocat_request_load(mw, name, bundle, score);
+			pci.requested++;
 		}
 		free(kids, M_TEMP);
 	}
@@ -862,8 +934,7 @@ iocat_rematch_present(void)
 		if (devclass_get_devices(devclass_find("ofwbus"), &devs,
 		    &ndevs) == 0) {
 			for (i = 0; i < ndevs; i++)
-				iocat_scan_of_subtree(devs[i], &checked,
-				    &unmatched, &requested);
+				iocat_scan_of_subtree(devs[i], &of);
 			free(devs, M_TEMP);
 		}
 	}
@@ -892,8 +963,8 @@ iocat_rematch_present(void)
 					h = acpi_get_handle(kids[j]);
 					if (h == NULL)
 						continue;
-					checked++;
-					unmatched++;
+					acpi.checked++;
+					acpi.unmatched++;
 					{
 						char hid[IOCAT_COMPAT_MAX];
 						char cid[IOCAT_COMPAT_MAX];
@@ -905,16 +976,16 @@ iocat_rematch_present(void)
 						    &score) != 0)
 							continue;
 					}
+					name = iocat_devname(kids[j], nbuf,
+					    sizeof(nbuf));
 					if (bootverbose)
 						printf("iokit: present-scan: %s "
 						    "(acpi) present + unmatched "
 						    "-> request load %s\n",
-						    device_get_nameunit(kids[j]),
-						    bundle);
-					iocat_request_load(0,
-					    device_get_nameunit(kids[j]),
-					    bundle, score);
-					requested++;
+						    name, bundle);
+					iocat_request_load(0, name, bundle,
+					    score);
+					acpi.requested++;
 				}
 				free(kids, M_TEMP);
 			}
@@ -945,24 +1016,24 @@ iocat_rematch_present(void)
 				for (k = 0; k < nk; k++) {
 					if (device_get_driver(kids[k]) != NULL)
 						continue;
-					checked++;
-					unmatched++;
+					bus.checked++;
+					bus.unmatched++;
 					memset(&tw, 0, sizeof(tw));
 					if (iocat_capture_bus_child(bs[b],
 					    kids[k], &tw) != 0 ||
 					    iocat_lookup_work(&tw, bundle,
 					    sizeof(bundle), &score) != 0)
 						continue;
+					name = iocat_devname(kids[k], nbuf,
+					    sizeof(nbuf));
 					if (bootverbose)
 						printf("iokit: present-scan: %s "
 						    "(%s) present + unmatched -> "
 						    "request load %s\n",
-						    device_get_nameunit(kids[k]),
-						    buses[x], bundle);
-					iocat_request_load(tw.match_word,
-					    device_get_nameunit(kids[k]),
+						    name, buses[x], bundle);
+					iocat_request_load(tw.match_word, name,
 					    bundle, score);
-					requested++;
+					bus.requested++;
 				}
 				free(kids, M_TEMP);
 			}
@@ -970,15 +1041,39 @@ iocat_rematch_present(void)
 		}
 	}
 
-	/* One summary line, under bootverbose, so a verbose boot can confirm the
+	/* A summary, under bootverbose, so a verbose boot can confirm the
 	 * scan ran even when every present device is already attached (qemu) and
 	 * no per-device line is printed. Quiet on a normal boot so the autoload
 	 * scan doesn't paper over the console / getty login prompt; the data is
 	 * still in dmesg on a verbose boot. (CI verifies autoload via the
 	 * EM-AUTOLOAD / IOCATALOGUE / kextstat markers, not this line.) */
-	if (bootverbose)
-		printf("iokit: present-scan: checked %d pci devices, %d unmatched, "
-		    "%d load(s) requested\n", checked, unmatched, requested);
+	if (bootverbose) {
+		sx_slock(&iocat_lock);
+		npers = iocat_count;
+		sx_sunlock(&iocat_lock);
+		/*
+		 * One line per walk (#195), each with its own counts, plus the
+		 * catalogue size: two scans on one boot then show whether the
+		 * second saw a different personality set (a later push) or the
+		 * same one (a redundant rescan).
+		 */
+		printf("iokit: present-scan: %u personalities; pci: checked %d, "
+		    "%d unmatched, %d load(s) requested\n", npers,
+		    pci.checked, pci.unmatched, pci.requested);
+#ifdef FDT
+		printf("iokit: present-scan: device-tree: checked %d nodes, "
+		    "%d unmatched, %d load(s) requested\n",
+		    of.checked, of.unmatched, of.requested);
+#endif
+#ifdef DEV_ACPI
+		printf("iokit: present-scan: acpi: checked %d, %d unmatched, "
+		    "%d load(s) requested\n",
+		    acpi.checked, acpi.unmatched, acpi.requested);
+#endif
+		printf("iokit: present-scan: hid/virtio/vmbus: checked %d, "
+		    "%d unmatched, %d load(s) requested\n",
+		    bus.checked, bus.unmatched, bus.requested);
+	}
 }
 
 static void
@@ -1083,7 +1178,7 @@ iocat_device_nomatch(void *arg __unused, device_t dev)
 {
 	struct iocat_match_work *w;
 	device_t parent;
-	const char *nu;
+	char nbuf[IOCAT_DEVNAME_MAX];
 
 	parent = device_get_parent(dev);
 	if (parent == NULL || device_get_name(parent) == NULL)
@@ -1186,8 +1281,8 @@ iocat_device_nomatch(void *arg __unused, device_t dev)
 		return;
 #endif
 	}
-	nu = device_get_nameunit(dev);
-	strlcpy(w->devname, nu != NULL ? nu : "?", sizeof(w->devname));
+	strlcpy(w->devname, iocat_devname(dev, nbuf, sizeof(nbuf)),
+	    sizeof(w->devname));
 
 queue:
 	mtx_lock(&iocat_work_mtx);
