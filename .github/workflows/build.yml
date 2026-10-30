@@ -302,7 +302,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
-          ref: ba32cf2326cd84a2400c18629e784aa425ff41b2  # nextbsd-ci#26 (-smp 2); becomes v0.3.8 once tagged
+          ref: v0.3.8
           path: nextbsd-ci
 
       - name: Assemble disk.img (this kernel + component continuous artifacts)
@@ -440,7 +440,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
-          ref: ba32cf2326cd84a2400c18629e784aa425ff41b2  # nextbsd-ci#26 (-smp 2); becomes v0.3.8 once tagged
+          ref: v0.3.8
           path: nextbsd-ci
 
       # A KERNEL smoke-test gates on "does THIS kernel boot" (reached login), NOT
@@ -534,7 +534,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: nextbsd/nextbsd-ci
-          ref: ba32cf2326cd84a2400c18629e784aa425ff41b2  # nextbsd-ci#26 (-smp 2); becomes v0.3.8 once tagged
+          ref: v0.3.8
           path: nextbsd-ci
 
       - name: Boot test (this kernel, self-assembled arm64 image)
