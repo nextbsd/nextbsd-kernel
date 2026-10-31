@@ -1,0 +1,66 @@
+From 954f9ac2cc6bbf42af1b4336de6dd30b6aec57ee Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 31 Oct 2026 12:39:23 -0500
+Subject: [PATCH] NextBSD: kldload("foo.ko") of a compiled-in module returns
+ EEXIST
+
+kern_kldload() treats a name containing a dot as a file name, and
+linker_load_module() then only searches for the file, returning ENOENT
+when none exists. The modlist_lookup2() check that answers EEXIST runs
+only for bare module names. NextBSD ships no .ko tree, so a module that
+is compiled into the kernel (or already loaded from a kext) still gets
+ENOENT for "foo.ko", and callers such as virtual_oss, which do
+kldload("cuse.ko") and accept EEXIST, exit.
+
+When no file is found, strip a trailing ".ko" from the basename and
+return EEXIST if that module is already present. Nothing changes when
+the file exists, and a module that is truly absent still gets ENOENT.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/kern/kern_linker.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/sys/kern/kern_linker.c b/sys/kern/kern_linker.c
+index 9559b52..3768b1b 100644
+--- a/sys/kern/kern_linker.c
++++ b/sys/kern/kern_linker.c
+@@ -2251,8 +2251,10 @@ linker_load_module(const char *kldname, const char *modname,
+ {
+ 	linker_file_t lfdep;
+ 	const char *filename;
+-	char *pathname;
++	char *name, *pathname;
++	size_t len;
+ 	int error;
++	bool found;
+ 
+ 	sx_assert(&kld_sx, SA_XLOCKED);
+ 	if (modname == NULL) {
+@@ -2264,6 +2266,23 @@ linker_load_module(const char *kldname, const char *modname,
+ 		if (!linker_root_mounted())
+ 			return (ENXIO);
+ 		pathname = linker_search_kld(kldname);
++		if (pathname == NULL) {
++			/*
++			 * NextBSD ships no .ko tree, so a module compiled
++			 * into the kernel has no file to find. If "foo.ko"
++			 * names a module that is already present, answer
++			 * EEXIST as kldload("foo") would, not ENOENT.
++			 */
++			filename = linker_basename(kldname);
++			len = strlen(filename);
++			if (len > 3 && strcmp(filename + len - 3, ".ko") == 0)
++				len -= 3;
++			name = strndup(filename, len, M_LINKER);
++			found = modlist_lookup2(name, NULL) != NULL;
++			free(name, M_LINKER);
++			if (found)
++				return (EEXIST);
++		}
+ 	} else {
+ 		if (modlist_lookup2(modname, verinfo) != NULL)
+ 			return (EEXIST);
+-- 
+2.54.0 (Apple Git-157)
+
