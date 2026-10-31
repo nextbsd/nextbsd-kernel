@@ -6,12 +6,12 @@ on:
     # main only: a PR branch is built by its pull_request run, and a push run
     # on the same branch was a second, identical build (nextbsd-kernel#324).
     branches: [main]
-    paths: ['patches/**', 'config/**', 'src-overlay/**', 'ci/**', '.github/workflows/build.yml']
+    paths: ['patches/**', 'config/**', 'src-overlay/**', 'abi/**', 'ci/**', '.github/workflows/build.yml']
   pull_request:
     # Validate the kernel build on PRs touching patches/config/workflow. PR
     # runs never cascade — the module-build trigger is gated on
     # github.event_name == 'repository_dispatch', which a pull_request is not.
-    paths: ['patches/**', 'config/**', 'src-overlay/**', 'ci/**', '.github/workflows/build.yml']
+    paths: ['patches/**', 'config/**', 'src-overlay/**', 'abi/**', 'ci/**', '.github/workflows/build.yml']
   workflow_dispatch:
 
 # One run per PR: a new push cancels the PR's previous run. Runs on main are
@@ -254,6 +254,14 @@ jobs:
           test -f "$OBJ/kernel" || { echo "no kernel at $OBJ" >&2; exit 1; }
           echo "${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}" > "$OBJ/KERNEL-BUILD-ID"
           echo "KERNEL-BUILD-ID: $(cat "$OBJ/KERNEL-BUILD-ID")"
+          # What uname -r / uname -v will say (kern.osrelease / kern.version),
+          # straight from the vers.c each kernel was linked with (#376).
+          for k in NEXTBSD NEXTBSD-RPI5; do
+            V="/usr/obj/usr/src/${{ matrix.target }}.${{ matrix.target_arch }}/sys/$k/vers.c"
+            [ -f "$V" ] || continue
+            echo "--- $k"
+            grep -E '^#define (RELSTR|VERSTR) ' "$V" | sed 's/^/  /'
+          done
 
       # The full /usr/obj is no longer published: the kext repos build against
       # the kernel SDK below (#327, nextbsd-kernel-extensions#2).
@@ -271,6 +279,71 @@ jobs:
       # obj tree. See ci/package-sdk.sh.
       - name: Package kernel SDK
         run: ci/package-sdk.sh ${{ matrix.target }} ${{ matrix.target_arch }} /tmp/kernel-sdk-${{ matrix.target }}.tar.gz
+
+      # The kext ABI guard (#376). The SDK's SDK-HASH (sha256 of SDK-MANIFEST,
+      # see ci/package-sdk.sh) must match abi/ABI's sdk-<arch> line; when it
+      # doesn't, the ABI kexts build against changed and abi/ABI needs a minor
+      # bump (27.<n+1>.0) and the new hashes. The manifest diff against the
+      # published SDK names the files that changed. A PR that changes the
+      # recorded hashes without changing major.minor is flagged too.
+      # WARN-ONLY for now: it emits ::warning:: and never fails the build,
+      # until two builds of the same commit are shown to give the same hash.
+      - name: Guard — kernel SDK hash vs abi/ABI (warn-only)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          T: ${{ matrix.target }}
+        run: |
+          set -u
+          G=/tmp/sdk-guard; rm -rf "$G"; mkdir -p "$G/cur" "$G/pub"
+          tar -C "$G/cur" -xzf "/tmp/kernel-sdk-$T.tar.gz" --wildcards 'kernel-sdk/KERNEL-*' 'kernel-sdk/SDK-*'
+          S="$G/cur/kernel-sdk"
+          echo "KERNEL-VERSION $(cat "$S/KERNEL-VERSION"), KERNEL-ABI-VERSION $(cat "$S/KERNEL-ABI-VERSION")"
+          pub_fetched=
+          check() { # <abi/ABI key> <SDK-HASH file> <SDK-MANIFEST file>
+            got=$(cat "$S/$2" 2>/dev/null)
+            want=$(awk -v k="$1" '$1 == k { print $2; exit }' abi/ABI)
+            echo "$1 $got   (abi/ABI: ${want:-<missing>})"
+            [ -n "$got" ] && [ "$got" = "$want" ] && return 0
+            echo "::warning title=Kernel SDK hash differs from abi/ABI ($1)::computed $got, abi/ABI has ${want:-nothing}. If the kext ABI changed, bump abi/ABI's version to <major>.<minor+1>.0 and record the new hashes. Warn-only for now (nextbsd-kernel#376)."
+            if [ -z "$pub_fetched" ]; then
+              pub_fetched=1
+              gh release download continuous -R "${{ github.repository }}" \
+                --pattern "kernel-sdk-$T.tar.gz" --dir "$G/pub" --clobber \
+                && tar -C "$G/pub" -xzf "$G/pub/kernel-sdk-$T.tar.gz" --wildcards 'kernel-sdk/SDK-MANIFEST*'
+            fi
+            P="$G/pub/kernel-sdk/$3"
+            if [ -f "$P" ]; then
+              echo "--- $3: published (continuous) -> this build"
+              diff -u "$P" "$S/$3" | sed -n '3,$p' | grep '^[-+]' | head -400
+            else
+              echo "(the published SDK has no $3 to diff against yet)"
+            fi
+          }
+          check "sdk-$T" SDK-HASH SDK-MANIFEST
+          if [ "$T" = arm64 ]; then
+            check sdk-arm64-rpi5 SDK-HASH-NEXTBSD-RPI5 SDK-MANIFEST-NEXTBSD-RPI5
+          fi
+          # A PR that changes the recorded hashes must change major.minor. A
+          # placeholder (unset) on the base being filled in is not a change.
+          if [ "${{ github.event_name }}" = pull_request ] && [ "$T" = amd64 ]; then
+            if gh api -H 'Accept: application/vnd.github.raw' \
+                "repos/${{ github.repository }}/contents/abi/ABI?ref=${{ github.event.pull_request.base.sha }}" \
+                > "$G/ABI.base" 2>/dev/null; then
+              mm() { awk '$1 == "version" { split($2, v, "."); print v[1] "." v[2]; exit }' "$1"; }
+              changed=$(awk 'NR == FNR { if ($1 ~ /^sdk-/) b[$1] = $2; next }
+                             $1 ~ /^sdk-/ && ($1 in b) && b[$1] != "unset" && b[$1] != $2 { print $1 }' \
+                        "$G/ABI.base" abi/ABI | tr '\n' ' ')
+              if [ -n "$changed" ] && [ "$(mm "$G/ABI.base")" = "$(mm abi/ABI)" ]; then
+                echo "::warning title=abi/ABI hashes changed without an ABI bump::$changed changed but the version stays $(mm abi/ABI).x. Bump to <major>.<minor+1>.0 (nextbsd-kernel#376)."
+              else
+                echo "abi/ABI vs base: ${changed:-no hash changes}; version $(mm "$G/ABI.base") -> $(mm abi/ABI)"
+              fi
+            else
+              echo "(the base has no abi/ABI yet)"
+            fi
+          fi
+          exit 0
 
       # Artifacts are now single .tar.gz files (already gzip'd → store-only).
       # Their CONTENTS carry the perms, so the round-trip through artifacts +
@@ -631,6 +704,44 @@ jobs:
             [ "$got" = "$ID" ] || { echo "FAIL: $t has KERNEL-BUILD-ID $got, expected $ID" >&2; exit 1; }
             echo "  $(basename "$t"): $got"
           done
+          # The kernel version, the kext ABI version and each SDK's hash
+          # (#376), as their own assets so a consumer can check them without
+          # downloading a tarball.
+          tar -xzOf out/kernel-sdk-amd64.tar.gz kernel-sdk/KERNEL-VERSION > out/KERNEL-VERSION
+          tar -xzOf out/kernel-sdk-amd64.tar.gz kernel-sdk/KERNEL-ABI-VERSION > out/KERNEL-ABI-VERSION
+          for a in amd64 arm64; do
+            tar -xzOf "out/kernel-sdk-$a.tar.gz" kernel-sdk/SDK-HASH > "out/SDK-HASH-$a"
+          done
+          tar -xzOf out/kernel-sdk-arm64.tar.gz kernel-sdk/SDK-HASH-NEXTBSD-RPI5 > out/SDK-HASH-arm64-rpi5
+          for f in KERNEL-VERSION KERNEL-ABI-VERSION SDK-HASH-amd64 SDK-HASH-arm64 SDK-HASH-arm64-rpi5; do
+            [ -s "out/$f" ] || { echo "FAIL: no $f" >&2; exit 1; }
+            echo "  $f: $(cat "out/$f")"
+          done
+          cat > notes.md <<'EOF'
+          Rolling kernel build, refreshed on every successful `main` build.
+          Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-sdk-<arch>.tar.gz`,
+          the kernel SDK: headers, generated options and exported symbols, #327) and
+          nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
+          `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
+          `rpi500-kernel8-arm64.img` is a transition alias for the same
+          file).
+
+          KERNEL-BUILD-ID: `${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}`
+          (also the `KERNEL-BUILD-ID` asset, and `.../sys/NEXTBSD/KERNEL-BUILD-ID`
+          in every tarball). Kexts built against this kernel carry the same ID.
+          EOF
+          {
+            echo
+            echo "Kernel version: \`$(cat out/KERNEL-VERSION)\` (kern.osrelease; the \`KERNEL-VERSION\` asset)."
+            echo "Kext ABI version: \`$(cat out/KERNEL-ABI-VERSION)\` (the \`KERNEL-ABI-VERSION\` asset)."
+            echo "Kernel SDK hashes (the \`SDK-HASH-<arch>\` assets, sha256 of each SDK's \`SDK-MANIFEST\`):"
+            for a in amd64 arm64 arm64-rpi5; do
+              echo "- \`sdk-$a $(cat "out/SDK-HASH-$a")\`"
+            done
+            echo
+            echo "Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "Commit: ${{ github.sha }}"
+          } >> notes.md
           ls -lh out/
 
       # Stable asset names (no datestamp) → each publish overwrites in place, so
@@ -640,26 +751,17 @@ jobs:
         with:
           tag_name: continuous
           name: Continuous kernel build
-          body: |
-            Rolling kernel build, refreshed on every successful `main` build.
-            Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-sdk-<arch>.tar.gz`,
-            the kernel SDK: headers, generated options and exported symbols, #327) and
-            nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
-            `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
-            `rpi500-kernel8-arm64.img` is a transition alias for the same
-            file).
-
-            KERNEL-BUILD-ID: `${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}`
-            (also the `KERNEL-BUILD-ID` asset, and `.../sys/NEXTBSD/KERNEL-BUILD-ID`
-            in every tarball). Kexts built against this kernel carry the same ID.
-
-            Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Commit: ${{ github.sha }}
+          body_path: notes.md
           prerelease: true
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
           files: |
             out/KERNEL-BUILD-ID
+            out/KERNEL-VERSION
+            out/KERNEL-ABI-VERSION
+            out/SDK-HASH-amd64
+            out/SDK-HASH-arm64
+            out/SDK-HASH-arm64-rpi5
             out/*.tar.gz
             out/rpi5-kernel8-arm64.img
             out/rpi500-kernel8-arm64.img

@@ -11,6 +11,14 @@
 #
 #   kernel-sdk/
 #     KERNEL-BUILD-ID   the kernel build these headers and options are from
+#     KERNEL-VERSION    the kernel version (abi/ABI), e.g. 27.0.0 = kern.osrelease
+#     KERNEL-ABI-VERSION  its major.minor, e.g. 27.0: the kext ABI version
+#     SDK-MANIFEST      "sha256  path" for every SDK file that defines the
+#                       kext ABI, plus the target triple and compiler version
+#     SDK-HASH          sha256 of SDK-MANIFEST, checked against abi/ABI
+#     SDK-MANIFEST-NEXTBSD-RPI5, SDK-HASH-NEXTBSD-RPI5
+#                       arm64 only: the same for the NEXTBSD-RPI5 kernel's
+#                       generated headers and modules
 #     SDK-INFO          target, kernel commit, what is inside
 #     sys/              the prepared sys/ tree, minus implementation: headers,
 #                       the interface (*.m) and vnode_if sources kmod.mk
@@ -40,6 +48,8 @@ OUT=${3:?$USAGE}
 SRC=${4:-/usr/src}
 OBJROOT=${5:-/usr/obj}
 OBJ="$OBJROOT$SRC/$TARGET.$TARGET_ARCH/sys/NEXTBSD"
+OBJ_RPI5="$OBJROOT$SRC/$TARGET.$TARGET_ARCH/sys/NEXTBSD-RPI5"
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 [ -f "$OBJ/kernel" ] || { echo "package-sdk: no kernel at $OBJ" >&2; exit 1; }
 [ -s "$OBJ/KERNEL-BUILD-ID" ] || { echo "package-sdk: no KERNEL-BUILD-ID in $OBJ (stamp it first)" >&2; exit 1; }
@@ -88,11 +98,81 @@ NM="${CROSS_BINDIR:-}/llvm-nm"
 [ "$(wc -l < "$SDK/kernel.modules")" -gt 1 ] || { echo "package-sdk: no module versions in $OBJ/kernel" >&2; exit 1; }
 
 cp "$OBJ/KERNEL-BUILD-ID" "$SDK/KERNEL-BUILD-ID"
+
+# The kernel version and the kext ABI version (nextbsd-kernel#376).
+KVER=$(awk '$1 == "version" { print $2; exit }' "$REPO/abi/ABI")
+[ -n "$KVER" ] || { echo "package-sdk: no version in $REPO/abi/ABI" >&2; exit 1; }
+echo "$KVER" > "$SDK/KERNEL-VERSION"
+echo "${KVER%.*}" > "$SDK/KERNEL-ABI-VERSION"
+
+# SDK-MANIFEST: what the kext ABI is made of, one "sha256  path" line per file,
+# sorted by path (LC_ALL=C), then the compiler target triple and version. Its
+# sha256 is SDK-HASH. Two builds of the same commit must give the same hash, so
+# nothing build-specific goes in: obj/version (the build counter), newvers.sh
+# (it carries the commit and run attempt) and the KERNEL-*/SDK-* files are
+# left out. The triple is the one the build derives from REVISION.
+case "$TARGET_ARCH" in
+amd64) TRIPLE_ARCH=x86_64 ;;
+*) TRIPLE_ARCH=$TARGET_ARCH ;;
+esac
+REVISION=$(sed -n 's/^REVISION="\(.*\)"$/\1/p' "$SRC/sys/conf/newvers.sh")
+[ -n "$REVISION" ] || { echo "package-sdk: no REVISION in $SRC/sys/conf/newvers.sh" >&2; exit 1; }
+TRIPLE="$TRIPLE_ARCH-unknown-freebsd$REVISION"
+CC_BIN="${CROSS_BINDIR:-}/cc"
+[ -x "$CC_BIN" ] || CC_BIN="${CROSS_BINDIR:-}/clang"
+CC_VERSION=$("$CC_BIN" -dumpversion)
+[ -n "$CC_VERSION" ] || { echo "package-sdk: no version from $CC_BIN" >&2; exit 1; }
+
+# usage: sdk_manifest <kernel obj dir> <kernel.modules file>
+# The sys/ part comes from the staged SDK; obj/ from the given obj dir, so the
+# NEXTBSD-RPI5 manifest can name its own generated headers under obj/.
+sdk_manifest() {
+	{
+		( cd "$SDK" && {
+			find sys -type f \( -name '*.h' -o -name '*.hh' -o -name '*.m' \
+			    -o -name '*.src' \) -print
+			for f in kmod.mk kern.mk kern.opts.mk kern.pre.mk; do
+				echo "sys/conf/$f"
+			done
+			find sys/conf -maxdepth 1 -type f -name 'ldscript.*' -print
+		  } | grep -vxE 'sys/conf/newvers\.sh' | tr '\n' '\0' | xargs -0r sha256sum )
+		# Symlinks by their target, so a dangling one cannot fail the hash.
+		( cd "$SDK" && find sys -type l \( -name '*.h' -o -name '*.hh' \
+		    -o -name '*.m' -o -name '*.src' \) -print ) | while read -r l; do
+			printf '%s  %s\n' "$(readlink "$SDK/$l" | sha256sum | cut -d' ' -f1)" "$l"
+		done
+		( cd "$1" && find . -maxdepth 1 -type f \( -name '*.h' -o -name '*.inc' \) \
+		    -print0 | xargs -0r sha256sum ) | sed 's~  \./~  obj/~'
+		printf '%s  kernel.modules\n' "$(sha256sum < "$2" | cut -d' ' -f1)"
+	} | grep -vE '  (obj/version|sys/conf/newvers\.sh|KERNEL-[^/]*|SDK-[^/]*)$' \
+	  | LC_ALL=C sort -k2,2
+	echo "target=$TRIPLE"
+	echo "cc=$CC_VERSION"
+}
+sdk_manifest "$OBJ" "$SDK/kernel.modules" > "$SDK/SDK-MANIFEST"
+sha256sum < "$SDK/SDK-MANIFEST" | cut -d' ' -f1 > "$SDK/SDK-HASH"
+
+# NEXTBSD-RPI5 (arm64, built before this runs) has its own opt_*.h and its own
+# set of compiled-in modules, so its kexts see a different ABI unless the two
+# hashes agree. Only the manifest and hash are shipped, not its headers.
+if [ -f "$OBJ_RPI5/kernel" ]; then
+	"$NM" --defined-only "$OBJ_RPI5/kernel" | awk '{print $NF}' |
+	    sed -n 's/^_mod_metadata_\(.*\)_version$/\1/p' > "$STAGE/rpi5.mods"
+	{ echo kernel; cat "$STAGE/rpi5.mods"; } | sort -u > "$STAGE/rpi5.modules"
+	sdk_manifest "$OBJ_RPI5" "$STAGE/rpi5.modules" > "$SDK/SDK-MANIFEST-NEXTBSD-RPI5"
+	sha256sum < "$SDK/SDK-MANIFEST-NEXTBSD-RPI5" | cut -d' ' -f1 > "$SDK/SDK-HASH-NEXTBSD-RPI5"
+fi
 {
 	echo "target=$TARGET"
 	echo "target_arch=$TARGET_ARCH"
 	echo "kernconf=NEXTBSD"
 	echo "kernel_build_id=$(cat "$OBJ/KERNEL-BUILD-ID")"
+	echo "kernel_version=$KVER"
+	echo "kernel_abi_version=${KVER%.*}"
+	echo "sdk_hash=$(cat "$SDK/SDK-HASH")"
+	[ ! -s "$SDK/SDK-HASH-NEXTBSD-RPI5" ] ||
+		echo "sdk_hash_nextbsd_rpi5=$(cat "$SDK/SDK-HASH-NEXTBSD-RPI5")"
+	echo "sdk_manifest_entries=$(wc -l < "$SDK/SDK-MANIFEST" | tr -d ' ')"
 	echo "sys_files=$(wc -l < "$STAGE/sys.list" | tr -d ' ')"
 	echo "obj_files=$(wc -l < "$STAGE/obj.list" | tr -d ' ')"
 	echo "opt_headers=$n_opt"
