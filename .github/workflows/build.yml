@@ -6,12 +6,12 @@ on:
     # main only: a PR branch is built by its pull_request run, and a push run
     # on the same branch was a second, identical build (nextbsd-kernel#324).
     branches: [main]
-    paths: ['patches/**', 'config/**', 'src-overlay/**', 'ci/**', '.github/workflows/build.yml']
+    paths: ['patches/**', 'config/**', 'src-overlay/**', 'abi/**', 'ci/**', '.github/workflows/build.yml']
   pull_request:
     # Validate the kernel build on PRs touching patches/config/workflow. PR
     # runs never cascade — the module-build trigger is gated on
     # github.event_name == 'repository_dispatch', which a pull_request is not.
-    paths: ['patches/**', 'config/**', 'src-overlay/**', 'ci/**', '.github/workflows/build.yml']
+    paths: ['patches/**', 'config/**', 'src-overlay/**', 'abi/**', 'ci/**', '.github/workflows/build.yml']
   workflow_dispatch:
 
 # One run per PR: a new push cancels the PR's previous run. Runs on main are
@@ -254,6 +254,14 @@ jobs:
           test -f "$OBJ/kernel" || { echo "no kernel at $OBJ" >&2; exit 1; }
           echo "${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}" > "$OBJ/KERNEL-BUILD-ID"
           echo "KERNEL-BUILD-ID: $(cat "$OBJ/KERNEL-BUILD-ID")"
+          # What uname -r / uname -v will say (kern.osrelease / kern.version),
+          # straight from the vers.c each kernel was linked with (#376).
+          for k in NEXTBSD NEXTBSD-RPI5; do
+            V="/usr/obj/usr/src/${{ matrix.target }}.${{ matrix.target_arch }}/sys/$k/vers.c"
+            [ -f "$V" ] || continue
+            echo "--- $k"
+            grep -E '^#define (RELSTR|VERSTR) ' "$V" | sed 's/^/  /'
+          done
 
       # The full /usr/obj is no longer published: the kext repos build against
       # the kernel SDK below (#327, nextbsd-kernel-extensions#2).
@@ -631,6 +639,36 @@ jobs:
             [ "$got" = "$ID" ] || { echo "FAIL: $t has KERNEL-BUILD-ID $got, expected $ID" >&2; exit 1; }
             echo "  $(basename "$t"): $got"
           done
+          # The kernel version and the kext ABI version (#376), as their own
+          # assets so a consumer can check them without
+          # downloading a tarball.
+          tar -xzOf out/kernel-sdk-amd64.tar.gz kernel-sdk/KERNEL-VERSION > out/KERNEL-VERSION
+          tar -xzOf out/kernel-sdk-amd64.tar.gz kernel-sdk/KERNEL-ABI-VERSION > out/KERNEL-ABI-VERSION
+          for f in KERNEL-VERSION KERNEL-ABI-VERSION; do
+            [ -s "out/$f" ] || { echo "FAIL: no $f" >&2; exit 1; }
+            echo "  $f: $(cat "out/$f")"
+          done
+          cat > notes.md <<'EOF'
+          Rolling kernel build, refreshed on every successful `main` build.
+          Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-sdk-<arch>.tar.gz`,
+          the kernel SDK: headers, generated options and exported symbols, #327) and
+          nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
+          `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
+          `rpi500-kernel8-arm64.img` is a transition alias for the same
+          file).
+
+          KERNEL-BUILD-ID: `${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}`
+          (also the `KERNEL-BUILD-ID` asset, and `.../sys/NEXTBSD/KERNEL-BUILD-ID`
+          in every tarball). Kexts built against this kernel carry the same ID.
+          EOF
+          {
+            echo
+            echo "Kernel version: \`$(cat out/KERNEL-VERSION)\` (kern.osrelease; the \`KERNEL-VERSION\` asset)."
+            echo "Kext ABI version: \`$(cat out/KERNEL-ABI-VERSION)\` (the \`KERNEL-ABI-VERSION\` asset)."
+            echo
+            echo "Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "Commit: ${{ github.sha }}"
+          } >> notes.md
           ls -lh out/
 
       # Stable asset names (no datestamp) → each publish overwrites in place, so
@@ -640,26 +678,14 @@ jobs:
         with:
           tag_name: continuous
           name: Continuous kernel build
-          body: |
-            Rolling kernel build, refreshed on every successful `main` build.
-            Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-sdk-<arch>.tar.gz`,
-            the kernel SDK: headers, generated options and exported symbols, #327) and
-            nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
-            `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
-            `rpi500-kernel8-arm64.img` is a transition alias for the same
-            file).
-
-            KERNEL-BUILD-ID: `${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}`
-            (also the `KERNEL-BUILD-ID` asset, and `.../sys/NEXTBSD/KERNEL-BUILD-ID`
-            in every tarball). Kexts built against this kernel carry the same ID.
-
-            Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Commit: ${{ github.sha }}
+          body_path: notes.md
           prerelease: true
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
           files: |
             out/KERNEL-BUILD-ID
+            out/KERNEL-VERSION
+            out/KERNEL-ABI-VERSION
             out/*.tar.gz
             out/rpi5-kernel8-arm64.img
             out/rpi500-kernel8-arm64.img

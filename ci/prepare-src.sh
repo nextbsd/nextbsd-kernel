@@ -65,30 +65,51 @@ done
 # IMPORTANT: REVISION is left STOCK. The build derives the compiler target
 # triple (x86_64-unknown-freebsd${OS_REVISION}) from REVISION, and that sets
 # __FreeBSD__. A timestamp in REVISION poisons __FreeBSD__ kernel-wide (e.g.
-# smartpqi assigns it to a u_char -> -Werror). So the timestamp goes in RELEASE
-# only (= osrelease / uname -r); REVISION stays stock so __FreeBSD__ stays 15.
-# Each sed line is self-contained because the version-extraction machinery
-# evaluates these lines in isolation. date -u +FMT and date -u are GNU+BSD
-# portable.
+# smartpqi assigns it to a u_char -> -Werror). So the NextBSD version goes in
+# RELEASE only (= osrelease / uname -r); REVISION stays stock so __FreeBSD__
+# stays 15. Each sed line is self-contained because the version-extraction
+# machinery evaluates these lines in isolation; RELEASE is a literal.
 #
-# Also reformat the version banner (VERINFO/VERSTR, both metadata branches) to
-# a clean NextBSD string and drop the FreeBSD bits that don't fit out-of-tree:
-# the #N build counter and the <hash>[-dirty] VCS tag (the tree is always
-# "dirty" -- it's releng/15.1 + the NextBSD patch stack). Result (uname -v):
-#   NextBSD Kernel Version <RELEASE>; <date>; <user>@<host>:<objdir>
-# RELEASE (the build timestamp) leads, so nextbsd-version -k can still find it.
+# The kernel version is a fixed Darwin-style release read from abi/ABI
+# (nextbsd-kernel#376), not a build timestamp: kern.osrelease (uname -r) is
+# e.g. 27.0.0. It changes when the base or the kext ABI changes, not per build;
+# the build itself is named in the banner below.
+#
+# The version banner (VERINFO/VERSTR, both metadata branches) is reformatted
+# to Darwin's shape, dropping the FreeBSD bits that don't fit out-of-tree (the
+# #N build counter and the <hash>[-dirty] VCS tag of the throwaway tree):
+#   NextBSD Kernel Version 27.0.0: <date>; root:nextbsd-kernel-<shortsha>~<attempt>/RELEASE_<ARCH>
+# <shortsha> is this repo's commit, <attempt> the CI run attempt
+# (GITHUB_RUN_ATTEMPT, 1 outside CI). <ARCH> is X86_64, ARM64, or
+# ARM64_BCM2712 for NEXTBSD-RPI5; newvers.sh knows the config only at build
+# time, as ${i} (KERN_IDENT), so nb_arch is set on that same line.
 # Replaced lines are tab-indented inside an if/else; both branches get the same
-# value, which is fine.
+# value, which is fine. REVISION, __FreeBSD_version and osreldate are untouched.
+ABI_VERSION=$(awk '$1 == "version" { print $2; exit }' "$REPO/abi/ABI")
+case "$ABI_VERSION" in
+[0-9]*.[0-9]*.[0-9]*) ;;
+*) echo "prepare-src: no 'version X.Y.Z' line in $REPO/abi/ABI" >&2; exit 1 ;;
+esac
+# safe.directory: the CI container runs as root over a checkout owned by the
+# runner user, which git otherwise refuses ("dubious ownership").
+NB_SHA=$(git -c safe.directory='*' -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
+NB_ATTEMPT=${GITHUB_RUN_ATTEMPT:-1}
+case "$TARGET" in
+amd64) NB_ARCH_EXPR='nb_arch=X86_64' ;;
+arm64) NB_ARCH_EXPR='case "${i}" in (NEXTBSD-RPI5) nb_arch=ARM64_BCM2712 ;; (*) nb_arch=ARM64 ;; esac' ;;
+esac
 nv=sys/conf/newvers.sh
 sed -i \
 	-e 's~^TYPE=.*~TYPE="NextBSD"~' \
-	-e 's~^RELEASE=.*~RELEASE=$(date -u +%Y%m%d-%H%M%S)~' \
+	-e "s~^RELEASE=.*~RELEASE=\"$ABI_VERSION\"~" \
 	-e 's~t=$(date)$~t=$(date -u)~' \
-	-e 's~^[[:space:]]*VERINFO=".*~VERINFO="${TYPE} Kernel Version ${RELEASE}; ${t}; ${u}@${h}:${d}"~' \
+	-e "s~^i=\$(\${MAKE:-make} -V KERN_IDENT)\$~&; $NB_ARCH_EXPR~" \
+	-e "s~^[[:space:]]*VERINFO=\".*~VERINFO=\"\${TYPE} Kernel Version \${RELEASE}: \${t}; root:nextbsd-kernel-$NB_SHA\\~$NB_ATTEMPT/RELEASE_\${nb_arch}\"~" \
 	-e 's~^[[:space:]]*VERSTR=".*~VERSTR="${VERINFO}\\\\n"~' \
 	"$nv"
 echo "=== newvers.sh identity after rebrand ==="
-grep -nE '^TYPE=|^RELEASE=|t=\$\(date|VERINFO=|VERSTR=' "$nv" || true
+grep -nE '^TYPE=|^RELEASE=|t=\$\(date|nb_arch=|VERINFO=|VERSTR=' "$nv" || true
+grep -q 'KERN_IDENT); .*nb_arch=' "$nv" || { echo "prepare-src: newvers.sh has no KERN_IDENT line to key the banner arch on" >&2; exit 1; }
 
 # ------------------------------------------------- syscall tables (sysent) ----
 # A syscalls.master patch changes the GENERATED syscall tables (init_sysent.c,

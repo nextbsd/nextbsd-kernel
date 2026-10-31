@@ -14,8 +14,11 @@ patches/
 config/
   NEXTBSD     # kernel config (include GENERIC; ident NEXTBSD)
 src-overlay/  # NextBSD's own kernel sources + their sys/conf fragments
+abi/
+  ABI         # the kernel version, set by hand (see below)
 ci/
   prepare-src.sh  # all source preparation (see below)
+  package-sdk.sh  # the kernel SDK
 .github/workflows/build.yml
 ```
 
@@ -36,7 +39,7 @@ script, not in a workflow step.
   `kernel-updated` to nextbsd-kernel-extensions and nextbsd-kernel-extensions-graphics**. The chain starts at
   freebsd-src's daily sync when `releng/15.1` moves, or by hand with
   freebsd-src's `Sync Fork` workflow and `force` checked.
-- `push` to `main` touching `patches/`, `config/`, `src-overlay/`, `ci/` or the
+- `push` to `main` touching `patches/`, `config/`, `src-overlay/`, `abi/`, `ci/` or the
   workflow: rebuilds and publishes the kernel on the `<arch>-latest` image. It
   does **not** rebuild the kexts; run the chain by hand when a merge should
   reach them.
@@ -44,6 +47,36 @@ script, not in a workflow step.
 - `workflow_dispatch`: manual; publishes but does not dispatch.
 
 A new push to a PR cancels that PR's previous run. Runs on `main` queue.
+
+## Kernel version and kext ABI
+
+The kernel version is a fixed, Darwin-style release kept in `abi/ABI`
+(`version 27.0.0`), not a build stamp (#376). `ci/prepare-src.sh` writes it
+into `newvers.sh`, so:
+
+```
+kern.osrelease (uname -r)  27.0.0
+kern.version   (uname -v)  NextBSD Kernel Version 27.0.0: <date>; root:nextbsd-kernel-<shortsha>~<attempt>/RELEASE_<ARCH>
+```
+
+`<shortsha>` is this repo's commit, `<attempt>` the CI run attempt, and
+`<ARCH>` is `X86_64`, `ARM64`, or `ARM64_BCM2712` for NEXTBSD-RPI5.
+`kern.ostype` stays `NextBSD`; `REVISION`, `__FreeBSD_version` and
+`kern.osreldate` are unchanged.
+
+The scheme:
+
+- `27` is the major release while NextBSD is based on releng/15.1; the next
+  base is 28.0.0.
+- `27.0` (major.minor) is the **kext ABI version**. It goes to 27.1.0, 27.2.0…
+  when the ABI that kexts build against changes.
+- A patch release (27.0.x) is a kernel change that keeps the ABI.
+
+The version is set by hand in `abi/ABI`. It is bumped when the maintainer
+decides the ABI kexts build against has changed; no build changes it. The
+kernel SDK carries it as `KERNEL-VERSION` (27.0.0) and `KERNEL-ABI-VERSION`
+(27.0), and `continuous` publishes both as assets and lists them in the
+release notes.
 
 ## KERNEL-BUILD-ID
 
@@ -61,7 +94,8 @@ kexts whose IDs differ (#326).
 The kernel is built with `NO_MODULES=yes`. Kexts are built against
 `kernel-sdk-<arch>.tar.gz` (#327, made by `ci/package-sdk.sh`): the kernel's
 headers and the module-build inputs `kmod.mk` names, the generated
-`opt_*.h`/`*_if.h`, the exported-symbol list and the `KERNEL-BUILD-ID`. A
+`opt_*.h`/`*_if.h`, the exported-symbol list, the `KERNEL-BUILD-ID` and the
+kernel and ABI versions (above). A
 kext repo points `SYSDIR` (and `KERNBUILDDIR` where it wants the kernel's
 options) into it, so it needs neither this repo's source nor the obj tree, and
 never relinks the kernel. The full obj tree is not published.

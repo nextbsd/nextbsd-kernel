@@ -1,0 +1,5 @@
+# The NextBSD kernel version (nextbsd-kernel#376): kern.osrelease (uname -r)
+# and the head of kern.version. major.minor (27.0) is the kext ABI version,
+# published as KERNEL-ABI-VERSION. It is set by hand: bump to 27.<n+1>.0 when
+# the ABI kexts build against changes; a patch release (27.0.x) keeps the ABI.
+version 27.0.0
