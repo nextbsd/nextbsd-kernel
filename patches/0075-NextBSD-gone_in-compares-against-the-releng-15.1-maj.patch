@@ -1,0 +1,64 @@
+From bac914142d2ad784c75c030e54ccd79a53a2f2f7 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 31 Oct 2026 18:17:58 -0500
+Subject: [PATCH] NextBSD: gone_in() compares against the releng/15.1 major
+
+__FreeBSD_version is 2700000 for the NextBSD 27.0.0 kernel
+(nextbsd-kernel#376), but gone_in()/gone_in_dev() majors name FreeBSD
+releases. With P_OSREL_MAJOR(__FreeBSD_version) = 27, the "To be
+removed in FreeBSD N" notices would disappear and debug.obsolete_panic=1
+would panic on every deprecated feature. Compare against 15, the base's
+major, so both behave as on releng/15.1.
+---
+ sys/kern/subr_bus.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/sys/kern/subr_bus.c b/sys/kern/subr_bus.c
+index 497b2194..2f5e4f6b 100644
+--- a/sys/kern/subr_bus.c
++++ b/sys/kern/subr_bus.c
+@@ -6320,6 +6320,15 @@ device_clear_prop_alldev(const char *name)
+ /*
+  * APIs to manage deprecation and obsolescence.
+  */
++
++/*
++ * NextBSD: __FreeBSD_version is 2700000 (kernel 27.0.0) on the releng/15.1
++ * base. gone_in() majors name FreeBSD releases, so compare them with the
++ * base's major, 15, as releng/15.1 does: the "To be removed in FreeBSD N"
++ * notices and debug.obsolete_panic behave as there.
++ */
++#define	GONE_IN_BASE_MAJOR	15
++
+ static int obsolete_panic = 0;
+ SYSCTL_INT(_debug, OID_AUTO, obsolete_panic, CTLFLAG_RWTUN, &obsolete_panic, 0,
+     "Panic when obsolete features are used (0 = never, 1 = if obsolete, "
+@@ -6350,10 +6359,10 @@ _gone_in(int major, const char *msg, ...)
+ 	va_list ap;
+ 
+ 	va_start(ap, msg);
+-	gone_panic(major, P_OSREL_MAJOR(__FreeBSD_version), msg, ap);
++	gone_panic(major, GONE_IN_BASE_MAJOR, msg, ap);
+ 	vprintf(msg, ap);
+ 	va_end(ap);
+-	if (P_OSREL_MAJOR(__FreeBSD_version) < major)
++	if (GONE_IN_BASE_MAJOR < major)
+ 		printf("To be removed in FreeBSD %d\n", major);
+ }
+ 
+@@ -6363,10 +6372,10 @@ _gone_in_dev(device_t dev, int major, const char *msg, ...)
+ 	va_list ap;
+ 
+ 	va_start(ap, msg);
+-	gone_panic(major, P_OSREL_MAJOR(__FreeBSD_version), msg, ap);
++	gone_panic(major, GONE_IN_BASE_MAJOR, msg, ap);
+ 	device_printf(dev, msg, ap);
+ 	va_end(ap);
+-	if (P_OSREL_MAJOR(__FreeBSD_version) < major)
++	if (GONE_IN_BASE_MAJOR < major)
+ 		device_printf(dev,
+ 		    "to be removed in FreeBSD %d\n", major);
+ }
+-- 
+2.54.0 (Apple Git-157)
+

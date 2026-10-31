@@ -10,7 +10,7 @@
 # (E22) relies on: the kext repos depend on this, not on the kernel's tree.
 #
 #   kernel-sdk/
-#     KERNEL-BUILD-ID   the kernel build these headers and options are from
+#     KERNEL-BUILD-ID   the kext ABI version (27.0), the legacy key kexts copy
 #     KERNEL-VERSION    the kernel version (abi/ABI), e.g. 27.0.0 = kern.osrelease
 #     KERNEL-ABI-VERSION  its major.minor, e.g. 27.0: the kext ABI version
 #     SDK-INFO          target, kernel commit (kernel_commit=), what is inside
@@ -99,8 +99,8 @@ echo "$KVER" > "$SDK/KERNEL-VERSION"
 echo "${KVER%.*}" > "$SDK/KERNEL-ABI-VERSION"
 
 # The nextbsd-kernel commit this SDK was built from, in full. Kext builds read
-# it from SDK-INFO (kernel_commit=); KERNEL-BUILD-ID will stop carrying it
-# (#376). safe.directory: the CI container runs as root over a checkout owned
+# it from SDK-INFO (kernel_commit=); KERNEL-BUILD-ID holds the ABI version, not
+# the commit (#376). safe.directory: the CI container runs as root over a checkout owned
 # by the runner user.
 KCOMMIT=$(git -c safe.directory='*' -C "$REPO" rev-parse HEAD 2>/dev/null || echo "${GITHUB_SHA:-}")
 [ -n "$KCOMMIT" ] || { echo "package-sdk: cannot tell the nextbsd-kernel commit of $REPO" >&2; exit 1; }
