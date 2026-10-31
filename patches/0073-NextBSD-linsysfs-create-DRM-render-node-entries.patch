@@ -1,0 +1,175 @@
+From 3a839685589652b0ac296272892ea2461bc42486 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 31 Oct 2026 14:55:21 -0500
+Subject: [PATCH] NextBSD: linsysfs: create DRM render-node entries
+
+Linux Mesa opens /dev/dri/renderD128 and libdrm then reads the GPU's
+PCI IDs through /sys/dev/char/226:128/device/{vendor,device} to pick a
+DRI driver. linsysfs_run_bus() only created the primary node entries
+(/sys/dev/char/226:<unit> and /sys/class/drm/card<unit>), so the lookup
+failed, Mesa logged "MESA-LOADER: failed to retrieve device
+information", fell back to the kernel driver name (i915) and loaded the
+wrong driver.
+
+For each DRM PCI device also create the render node, as Linux does:
+/sys/dev/char/226:(128+unit) and /sys/class/drm/renderD(128+unit), each
+with a "device" link to the PCI device directory and a uevent carrying
+MAJOR=226, MINOR=128+unit, DEVNAME=dri/renderD(128+unit) and
+DEVTYPE=dri_minor. /sys/class/drm/card<unit> now gets its uevent too,
+and the PCI device's drm/ directory lists card<unit> and
+renderD(128+unit), which libdrm scans to map a minor to its node name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linsysfs/linsysfs.c | 114 ++++++++++++++++++++++++++-------
+ 1 file changed, 90 insertions(+), 24 deletions(-)
+
+diff --git a/sys/compat/linsysfs/linsysfs.c b/sys/compat/linsysfs/linsysfs.c
+index 44ac4729b..36cbbe42b 100644
+--- a/sys/compat/linsysfs/linsysfs.c
++++ b/sys/compat/linsysfs/linsysfs.c
+@@ -200,6 +200,14 @@ linsysfs_fill_uevent_pci(PFS_FILL_ARGS)
+ 	return (0);
+ }
+ 
++/*
++ * DRM minor numbers, as Linux assigns them: primary nodes (cardN) start at
++ * 0 and render nodes (renderDN) at 128. libdrm derives the node type from
++ * the minor (minor >> 6), and Mesa opens the render node.
++ */
++#define	LINSYSFS_DRM_MAJOR		226
++#define	LINSYSFS_DRM_RENDER_MINOR_BASE	128
++
+ /*
+  * Filler function for drm uevent file
+  */
+@@ -212,8 +220,25 @@ linsysfs_fill_uevent_drm(PFS_FILL_ARGS)
+ 	dev = (device_t)pn->pn_data;
+ 	unit = device_get_unit(dev);
+ 	sbuf_printf(sb,
+-	    "MAJOR=226\nMINOR=%d\nDEVNAME=dri/card%d\nDEVTYPE=dri_minor\n",
+-	    unit, unit);
++	    "MAJOR=%d\nMINOR=%d\nDEVNAME=dri/card%d\nDEVTYPE=dri_minor\n",
++	    LINSYSFS_DRM_MAJOR, unit, unit);
++	return (0);
++}
++
++/*
++ * Filler function for drm render node uevent file
++ */
++static int
++linsysfs_fill_uevent_drm_render(PFS_FILL_ARGS)
++{
++	device_t dev;
++	int minor;
++
++	dev = (device_t)pn->pn_data;
++	minor = LINSYSFS_DRM_RENDER_MINOR_BASE + device_get_unit(dev);
++	sbuf_printf(sb,
++	    "MAJOR=%d\nMINOR=%d\nDEVNAME=dri/renderD%d\nDEVTYPE=dri_minor\n",
++	    LINSYSFS_DRM_MAJOR, minor, minor);
+ 	return (0);
+ }
+ 
+@@ -251,6 +276,43 @@ linsysfs_fill_vgapci(PFS_FILL_ARGS)
+ 	return (0);
+ }
+ 
++/*
++ * Create one DRM minor: /sys/dev/char/226:<minor> and /sys/class/drm/<name>,
++ * each with a "device" link to the PCI device directory and a "uevent", and
++ * an empty <name> entry in the PCI device's drm/ directory, which libdrm
++ * scans to map a minor to its /dev/dri node name.
++ */
++static void
++linsysfs_create_drm_minor(device_t dev, struct pfs_node *pcidir,
++    struct pfs_node *pcidrm, struct pfs_node *chardev, struct pfs_node *drm,
++    pfs_fill_t uevent, int minor, const char *name)
++{
++	struct pfs_node *sub_dir, *cur_file;
++	struct pfs_node *parents[2];
++	const char *names[2];
++	char devname[16];
++	int i;
++
++	snprintf(devname, sizeof(devname), "%d:%d", LINSYSFS_DRM_MAJOR, minor);
++	parents[0] = chardev;
++	names[0] = devname;
++	parents[1] = drm;
++	names[1] = name;
++	for (i = 0; i < nitems(parents); i++) {
++		if (pfs_create_dir(parents[i], &sub_dir, names[i], NULL, NULL,
++		    NULL, 0) != 0)
++			continue;
++		if (pfs_create_link(sub_dir, &cur_file, "device",
++		    &linsysfs_fill_vgapci, NULL, NULL, NULL, PFS_RD) == 0)
++			cur_file->pn_data = (void*)pcidir;
++		if (pfs_create_file(sub_dir, &cur_file, "uevent", uevent, NULL,
++		    NULL, NULL, PFS_RD) == 0)
++			cur_file->pn_data = (void*)dev;
++	}
++	if (pcidrm != NULL)
++		pfs_create_dir(pcidrm, NULL, name, NULL, NULL, NULL, 0);
++}
++
+ #undef PCI_DEV
+ #define PCI_DEV "pci"
+ #define DRMN_DEV "drmn"
+@@ -376,28 +438,32 @@ linsysfs_run_bus(device_t dev, struct pfs_node *dir, struct pfs_node *scsi,
+ 		    device_get_unit(dev) >= 0) {
+ 			dinfo = device_get_ivars(parent);
+ 			if (dinfo != NULL && dinfo->cfg.baseclass == PCIC_DISPLAY) {
+-				pfs_create_dir(dir, NULL, "drm", NULL, NULL,
+-				    NULL, 0);
+-				sprintf(devname, "226:%d",
+-				    device_get_unit(dev));
+-				pfs_create_dir(chardev, &sub_dir, devname, NULL,
+-				    NULL, NULL, 0);
+-				pfs_create_link(sub_dir, &cur_file, "device",
+-				    &linsysfs_fill_vgapci, NULL, NULL, NULL,
+-				    PFS_RD);
+-				cur_file->pn_data = (void*)dir;
+-				pfs_create_file(sub_dir, &cur_file, "uevent",
+-				    &linsysfs_fill_uevent_drm, NULL, NULL, NULL,
+-				    PFS_RD);
+-				cur_file->pn_data = (void*)dev;
+-				sprintf(devname, "card%d",
+-				    device_get_unit(dev));
+-				pfs_create_dir(drm, &sub_dir, devname, NULL,
+-				    NULL, NULL, 0);
+-				pfs_create_link(sub_dir, &cur_file, "device",
+-				    &linsysfs_fill_vgapci, NULL, NULL, NULL,
+-				    PFS_RD);
+-				cur_file->pn_data = (void*)dir;
++				struct pfs_node *pcidrm;
++				int unit, rminor;
++
++				unit = device_get_unit(dev);
++				if (pfs_create_dir(dir, &pcidrm, "drm", NULL,
++				    NULL, NULL, 0) != 0)
++					pcidrm = NULL;
++				/* Primary node: 226:<unit>, card<unit>. */
++				sprintf(devname, "card%d", unit);
++				linsysfs_create_drm_minor(dev, dir, pcidrm,
++				    chardev, drm, &linsysfs_fill_uevent_drm,
++				    unit, devname);
++				/*
++				 * NextBSD: render node: 226:(128+unit),
++				 * renderD(128+unit). Linux Mesa opens
++				 * /dev/dri/renderD128 and reads the PCI IDs
++				 * through /sys/dev/char/226:128/device; with
++				 * no entry it falls back to the kernel driver
++				 * name and loads the wrong DRI driver.
++				 */
++				rminor = LINSYSFS_DRM_RENDER_MINOR_BASE + unit;
++				sprintf(devname, "renderD%d", rminor);
++				linsysfs_create_drm_minor(dev, dir, pcidrm,
++				    chardev, drm,
++				    &linsysfs_fill_uevent_drm_render, rminor,
++				    devname);
+ 			}
+ 		}
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+
