@@ -1,13 +1,5 @@
-# The NextBSD kernel version and the kext ABI it provides (nextbsd-kernel#376).
-#
-# version   kern.osrelease (uname -r) and the head of kern.version. major.minor
-#           (27.0) is the kext ABI version; a patch release (27.0.x) keeps it.
-# sdk-*     sha256 of the kernel SDK's SDK-MANIFEST (ci/package-sdk.sh): the
-#           headers, generated options, module list and compiler that kexts
-#           build against, per arch and per config. When CI computes a
-#           different hash, the kext ABI changed: bump to 27.<n+1>.0 and
-#           record the new hashes here.
+# The NextBSD kernel version (nextbsd-kernel#376): kern.osrelease (uname -r)
+# and the head of kern.version. major.minor (27.0) is the kext ABI version,
+# published as KERNEL-ABI-VERSION. It is set by hand: bump to 27.<n+1>.0 when
+# the ABI kexts build against changes; a patch release (27.0.x) keeps the ABI.
 version 27.0.0
-sdk-amd64 unset
-sdk-arm64 unset
-sdk-arm64-rpi5 unset

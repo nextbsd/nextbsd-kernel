@@ -280,71 +280,6 @@ jobs:
       - name: Package kernel SDK
         run: ci/package-sdk.sh ${{ matrix.target }} ${{ matrix.target_arch }} /tmp/kernel-sdk-${{ matrix.target }}.tar.gz
 
-      # The kext ABI guard (#376). The SDK's SDK-HASH (sha256 of SDK-MANIFEST,
-      # see ci/package-sdk.sh) must match abi/ABI's sdk-<arch> line; when it
-      # doesn't, the ABI kexts build against changed and abi/ABI needs a minor
-      # bump (27.<n+1>.0) and the new hashes. The manifest diff against the
-      # published SDK names the files that changed. A PR that changes the
-      # recorded hashes without changing major.minor is flagged too.
-      # WARN-ONLY for now: it emits ::warning:: and never fails the build,
-      # until two builds of the same commit are shown to give the same hash.
-      - name: Guard — kernel SDK hash vs abi/ABI (warn-only)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          T: ${{ matrix.target }}
-        run: |
-          set -u
-          G=/tmp/sdk-guard; rm -rf "$G"; mkdir -p "$G/cur" "$G/pub"
-          tar -C "$G/cur" -xzf "/tmp/kernel-sdk-$T.tar.gz" --wildcards 'kernel-sdk/KERNEL-*' 'kernel-sdk/SDK-*'
-          S="$G/cur/kernel-sdk"
-          echo "KERNEL-VERSION $(cat "$S/KERNEL-VERSION"), KERNEL-ABI-VERSION $(cat "$S/KERNEL-ABI-VERSION")"
-          pub_fetched=
-          check() { # <abi/ABI key> <SDK-HASH file> <SDK-MANIFEST file>
-            got=$(cat "$S/$2" 2>/dev/null)
-            want=$(awk -v k="$1" '$1 == k { print $2; exit }' abi/ABI)
-            echo "$1 $got   (abi/ABI: ${want:-<missing>})"
-            [ -n "$got" ] && [ "$got" = "$want" ] && return 0
-            echo "::warning title=Kernel SDK hash differs from abi/ABI ($1)::computed $got, abi/ABI has ${want:-nothing}. If the kext ABI changed, bump abi/ABI's version to <major>.<minor+1>.0 and record the new hashes. Warn-only for now (nextbsd-kernel#376)."
-            if [ -z "$pub_fetched" ]; then
-              pub_fetched=1
-              gh release download continuous -R "${{ github.repository }}" \
-                --pattern "kernel-sdk-$T.tar.gz" --dir "$G/pub" --clobber \
-                && tar -C "$G/pub" -xzf "$G/pub/kernel-sdk-$T.tar.gz" --wildcards 'kernel-sdk/SDK-MANIFEST*'
-            fi
-            P="$G/pub/kernel-sdk/$3"
-            if [ -f "$P" ]; then
-              echo "--- $3: published (continuous) -> this build"
-              diff -u "$P" "$S/$3" | sed -n '3,$p' | grep '^[-+]' | head -400
-            else
-              echo "(the published SDK has no $3 to diff against yet)"
-            fi
-          }
-          check "sdk-$T" SDK-HASH SDK-MANIFEST
-          if [ "$T" = arm64 ]; then
-            check sdk-arm64-rpi5 SDK-HASH-NEXTBSD-RPI5 SDK-MANIFEST-NEXTBSD-RPI5
-          fi
-          # A PR that changes the recorded hashes must change major.minor. A
-          # placeholder (unset) on the base being filled in is not a change.
-          if [ "${{ github.event_name }}" = pull_request ] && [ "$T" = amd64 ]; then
-            if gh api -H 'Accept: application/vnd.github.raw' \
-                "repos/${{ github.repository }}/contents/abi/ABI?ref=${{ github.event.pull_request.base.sha }}" \
-                > "$G/ABI.base" 2>/dev/null; then
-              mm() { awk '$1 == "version" { split($2, v, "."); print v[1] "." v[2]; exit }' "$1"; }
-              changed=$(awk 'NR == FNR { if ($1 ~ /^sdk-/) b[$1] = $2; next }
-                             $1 ~ /^sdk-/ && ($1 in b) && b[$1] != "unset" && b[$1] != $2 { print $1 }' \
-                        "$G/ABI.base" abi/ABI | tr '\n' ' ')
-              if [ -n "$changed" ] && [ "$(mm "$G/ABI.base")" = "$(mm abi/ABI)" ]; then
-                echo "::warning title=abi/ABI hashes changed without an ABI bump::$changed changed but the version stays $(mm abi/ABI).x. Bump to <major>.<minor+1>.0 (nextbsd-kernel#376)."
-              else
-                echo "abi/ABI vs base: ${changed:-no hash changes}; version $(mm "$G/ABI.base") -> $(mm abi/ABI)"
-              fi
-            else
-              echo "(the base has no abi/ABI yet)"
-            fi
-          fi
-          exit 0
-
       # Artifacts are now single .tar.gz files (already gzip'd → store-only).
       # Their CONTENTS carry the perms, so the round-trip through artifacts +
       # the continuous release no longer strips the exec bit.
@@ -704,16 +639,12 @@ jobs:
             [ "$got" = "$ID" ] || { echo "FAIL: $t has KERNEL-BUILD-ID $got, expected $ID" >&2; exit 1; }
             echo "  $(basename "$t"): $got"
           done
-          # The kernel version, the kext ABI version and each SDK's hash
-          # (#376), as their own assets so a consumer can check them without
+          # The kernel version and the kext ABI version (#376), as their own
+          # assets so a consumer can check them without
           # downloading a tarball.
           tar -xzOf out/kernel-sdk-amd64.tar.gz kernel-sdk/KERNEL-VERSION > out/KERNEL-VERSION
           tar -xzOf out/kernel-sdk-amd64.tar.gz kernel-sdk/KERNEL-ABI-VERSION > out/KERNEL-ABI-VERSION
-          for a in amd64 arm64; do
-            tar -xzOf "out/kernel-sdk-$a.tar.gz" kernel-sdk/SDK-HASH > "out/SDK-HASH-$a"
-          done
-          tar -xzOf out/kernel-sdk-arm64.tar.gz kernel-sdk/SDK-HASH-NEXTBSD-RPI5 > out/SDK-HASH-arm64-rpi5
-          for f in KERNEL-VERSION KERNEL-ABI-VERSION SDK-HASH-amd64 SDK-HASH-arm64 SDK-HASH-arm64-rpi5; do
+          for f in KERNEL-VERSION KERNEL-ABI-VERSION; do
             [ -s "out/$f" ] || { echo "FAIL: no $f" >&2; exit 1; }
             echo "  $f: $(cat "out/$f")"
           done
@@ -734,10 +665,6 @@ jobs:
             echo
             echo "Kernel version: \`$(cat out/KERNEL-VERSION)\` (kern.osrelease; the \`KERNEL-VERSION\` asset)."
             echo "Kext ABI version: \`$(cat out/KERNEL-ABI-VERSION)\` (the \`KERNEL-ABI-VERSION\` asset)."
-            echo "Kernel SDK hashes (the \`SDK-HASH-<arch>\` assets, sha256 of each SDK's \`SDK-MANIFEST\`):"
-            for a in amd64 arm64 arm64-rpi5; do
-              echo "- \`sdk-$a $(cat "out/SDK-HASH-$a")\`"
-            done
             echo
             echo "Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "Commit: ${{ github.sha }}"
@@ -759,9 +686,6 @@ jobs:
             out/KERNEL-BUILD-ID
             out/KERNEL-VERSION
             out/KERNEL-ABI-VERSION
-            out/SDK-HASH-amd64
-            out/SDK-HASH-arm64
-            out/SDK-HASH-arm64-rpi5
             out/*.tar.gz
             out/rpi5-kernel8-arm64.img
             out/rpi500-kernel8-arm64.img

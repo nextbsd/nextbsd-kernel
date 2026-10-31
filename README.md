@@ -15,10 +15,10 @@ config/
   NEXTBSD     # kernel config (include GENERIC; ident NEXTBSD)
 src-overlay/  # NextBSD's own kernel sources + their sys/conf fragments
 abi/
-  ABI         # kernel version + the kext ABI's SDK hashes (see below)
+  ABI         # the kernel version, set by hand (see below)
 ci/
   prepare-src.sh  # all source preparation (see below)
-  package-sdk.sh  # the kernel SDK, its manifest and hash
+  package-sdk.sh  # the kernel SDK
 .github/workflows/build.yml
 ```
 
@@ -72,28 +72,11 @@ The scheme:
   when the ABI that kexts build against changes.
 - A patch release (27.0.x) is a kernel change that keeps the ABI.
 
-The ABI is measured, not declared. `ci/package-sdk.sh` writes `SDK-MANIFEST`
-into the kernel SDK. It is a sorted `sha256  path` list over the SDK's headers
-and `*.m`/`*.src` interface files, the `kmod.mk`/`kern*.mk` files and
-`ldscript.*`, the generated `obj/*.h` and `obj/*.inc`, and `kernel.modules`,
-followed by the compiler target triple and `cc -dumpversion`. Its sha256 is
-`SDK-HASH`. Nothing build-specific is in it (`obj/version`, `newvers.sh` and
-the `KERNEL-*`/`SDK-*` files are left out), so two builds of one commit give
-the same hash. On arm64 the NEXTBSD-RPI5 kernel gets its own
-`SDK-MANIFEST-NEXTBSD-RPI5`/`SDK-HASH-NEXTBSD-RPI5`. The SDK also carries
-`KERNEL-VERSION` (27.0.0) and `KERNEL-ABI-VERSION` (27.0). `continuous`
-publishes those two, plus `SDK-HASH-amd64`, `SDK-HASH-arm64` and
-`SDK-HASH-arm64-rpi5`, as assets and in the release notes.
-
-`abi/ABI` records the expected hashes (`sdk-amd64`, `sdk-arm64`,
-`sdk-arm64-rpi5`). The build's guard step compares each computed hash with
-it. On a mismatch it prints the manifest diff against the published SDK,
-which names the files that changed. The fix is to bump `version` to
-27.<n+1>.0 and record the new hashes the step prints. It also flags a PR that
-changes the recorded hashes without changing major.minor. **The guard is
-warn-only for now** (a `::warning::`, never a failure). It will enforce once
-rebuilds are shown to give the same hash and the kexts key on the ABI
-version.
+The version is set by hand in `abi/ABI`. It is bumped when the maintainer
+decides the ABI kexts build against has changed; no build changes it. The
+kernel SDK carries it as `KERNEL-VERSION` (27.0.0) and `KERNEL-ABI-VERSION`
+(27.0), and `continuous` publishes both as assets and lists them in the
+release notes.
 
 ## KERNEL-BUILD-ID
 
@@ -111,8 +94,8 @@ kexts whose IDs differ (#326).
 The kernel is built with `NO_MODULES=yes`. Kexts are built against
 `kernel-sdk-<arch>.tar.gz` (#327, made by `ci/package-sdk.sh`): the kernel's
 headers and the module-build inputs `kmod.mk` names, the generated
-`opt_*.h`/`*_if.h`, the exported-symbol list, the `KERNEL-BUILD-ID`, the
-kernel and ABI versions and the ABI manifest and hash (above). A
+`opt_*.h`/`*_if.h`, the exported-symbol list, the `KERNEL-BUILD-ID` and the
+kernel and ABI versions (above). A
 kext repo points `SYSDIR` (and `KERNBUILDDIR` where it wants the kernel's
 options) into it, so it needs neither this repo's source nor the obj tree, and
 never relinks the kernel. The full obj tree is not published.
