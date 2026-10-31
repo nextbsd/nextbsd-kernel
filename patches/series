@@ -63,3 +63,4 @@
 0070-NextBSD-compile-DTrace-into-the-kernel.patch
 0071-NextBSD-create-no-pflog0-at-boot-as-xnu-does.patch
 0072-NextBSD-kldload-foo.ko-of-a-compiled-in-module-retur.patch
+0073-NextBSD-linsysfs-create-DRM-render-node-entries.patch
