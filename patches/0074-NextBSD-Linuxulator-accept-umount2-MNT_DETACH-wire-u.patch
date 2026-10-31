@@ -1,0 +1,229 @@
+From 43d524e74e511bdcfb13a82806f306240a6b628e Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 31 Oct 2026 14:56:46 -0500
+Subject: [PATCH] NextBSD: Linuxulator: accept umount2(MNT_DETACH), wire
+ umount2 on arm64
+
+The AppImage type-2 runtime unmounts its FUSE payload with
+umount2(mnt, MNT_DETACH) when the app exits. linux_umount() accepted
+only MNT_FORCE and returned EINVAL for MNT_DETACH ("unsupported umount2
+flags 0x2"), and on arm64 umount2 (39) was UNIMPL, so every run left a
+dead fusefs mount and its /tmp/.mount_* directory behind.
+
+Accept MNT_DETACH (0x2) as a plain unmount: there is no lazy unmount,
+and such callers detach only after the last user has exited. Accept
+UMOUNT_NOFOLLOW (0x8). MNT_EXPIRE and unknown flags still return
+EINVAL. linux_umount() was built only under LINUX_LEGACY_SYSCALLS;
+umount2 is not legacy, so build it for every Linux ABI and wire
+syscall 39 to it in the arm64 table with the amd64 argument list
+(char *path, l_int flags). The arm64 generated syscall files are
+regenerated from syscalls.master with sys/tools/syscalls/main.lua.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/arm64/linux/linux_proto.h         |  6 ++++++
+ sys/arm64/linux/linux_syscall.h       |  1 +
+ sys/arm64/linux/linux_syscalls.c      |  2 +-
+ sys/arm64/linux/linux_sysent.c        |  2 +-
+ sys/arm64/linux/linux_systrace_args.c | 26 ++++++++++++++++++++++++++
+ sys/arm64/linux/syscalls.master       |  7 ++++++-
+ sys/compat/linux/linux_file.c         | 16 ++++++++++++++--
+ sys/compat/linux/linux_file.h         |  3 +++
+ 8 files changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/sys/arm64/linux/linux_proto.h b/sys/arm64/linux/linux_proto.h
+index 82f57f77f..7cbfbb9b0 100644
+--- a/sys/arm64/linux/linux_proto.h
++++ b/sys/arm64/linux/linux_proto.h
+@@ -197,6 +197,10 @@ struct linux_renameat_args {
+ 	char newdfd_l_[PADL_(l_int)]; l_int newdfd; char newdfd_r_[PADR_(l_int)];
+ 	char newname_l_[PADL_(const char *)]; const char * newname; char newname_r_[PADR_(const char *)];
+ };
++struct linux_umount_args {
++	char path_l_[PADL_(char *)]; char * path; char path_r_[PADR_(char *)];
++	char flags_l_[PADL_(l_int)]; l_int flags; char flags_r_[PADR_(l_int)];
++};
+ struct linux_mount_args {
+ 	char specialfile_l_[PADL_(char *)]; char * specialfile; char specialfile_r_[PADR_(char *)];
+ 	char dir_l_[PADL_(char *)]; char * dir; char dir_r_[PADR_(char *)];
+@@ -1279,6 +1283,7 @@ int	linux_unlinkat(struct thread *, struct linux_unlinkat_args *);
+ int	linux_symlinkat(struct thread *, struct linux_symlinkat_args *);
+ int	linux_linkat(struct thread *, struct linux_linkat_args *);
+ int	linux_renameat(struct thread *, struct linux_renameat_args *);
++int	linux_umount(struct thread *, struct linux_umount_args *);
+ int	linux_mount(struct thread *, struct linux_mount_args *);
+ int	linux_pivot_root(struct thread *, struct linux_pivot_root_args *);
+ int	linux_statfs(struct thread *, struct linux_statfs_args *);
+@@ -1539,6 +1544,7 @@ int	linux_fchmodat2(struct thread *, struct linux_fchmodat2_args *);
+ #define	LINUX_SYS_AUE_linux_symlinkat	AUE_SYMLINKAT
+ #define	LINUX_SYS_AUE_linux_linkat	AUE_LINKAT
+ #define	LINUX_SYS_AUE_linux_renameat	AUE_RENAMEAT
++#define	LINUX_SYS_AUE_linux_umount	AUE_UMOUNT
+ #define	LINUX_SYS_AUE_linux_mount	AUE_MOUNT
+ #define	LINUX_SYS_AUE_linux_pivot_root	AUE_PIVOT_ROOT
+ #define	LINUX_SYS_AUE_linux_statfs	AUE_STATFS
+diff --git a/sys/arm64/linux/linux_syscall.h b/sys/arm64/linux/linux_syscall.h
+index 5ddc0608a..3095ee85f 100644
+--- a/sys/arm64/linux/linux_syscall.h
++++ b/sys/arm64/linux/linux_syscall.h
+@@ -38,6 +38,7 @@
+ #define	LINUX_SYS_linux_symlinkat	36
+ #define	LINUX_SYS_linux_linkat	37
+ #define	LINUX_SYS_linux_renameat	38
++#define	LINUX_SYS_linux_umount	39
+ #define	LINUX_SYS_linux_mount	40
+ #define	LINUX_SYS_linux_pivot_root	41
+ #define	LINUX_SYS_linux_statfs	43
+diff --git a/sys/arm64/linux/linux_syscalls.c b/sys/arm64/linux/linux_syscalls.c
+index c26519dc0..170d4270f 100644
+--- a/sys/arm64/linux/linux_syscalls.c
++++ b/sys/arm64/linux/linux_syscalls.c
+@@ -44,7 +44,7 @@ const char *linux_syscallnames[] = {
+ 	"linux_symlinkat",			/* 36 = linux_symlinkat */
+ 	"linux_linkat",			/* 37 = linux_linkat */
+ 	"linux_renameat",			/* 38 = linux_renameat */
+-	"#39",			/* 39 = linux_umount2 */
++	"linux_umount",			/* 39 = linux_umount */
+ 	"linux_mount",			/* 40 = linux_mount */
+ 	"linux_pivot_root",			/* 41 = linux_pivot_root */
+ 	"#42",			/* 42 = nfsservctl */
+diff --git a/sys/arm64/linux/linux_sysent.c b/sys/arm64/linux/linux_sysent.c
+index e54a76cfd..b810885fd 100644
+--- a/sys/arm64/linux/linux_sysent.c
++++ b/sys/arm64/linux/linux_sysent.c
+@@ -53,7 +53,7 @@ struct sysent linux_sysent[] = {
+ 	{ .sy_narg = AS(linux_symlinkat_args), .sy_call = (sy_call_t *)linux_symlinkat, .sy_auevent = AUE_SYMLINKAT, .sy_flags = 0, .sy_thrcnt = SY_THR_STATIC },	/* 36 = linux_symlinkat */
+ 	{ .sy_narg = AS(linux_linkat_args), .sy_call = (sy_call_t *)linux_linkat, .sy_auevent = AUE_LINKAT, .sy_flags = 0, .sy_thrcnt = SY_THR_STATIC },	/* 37 = linux_linkat */
+ 	{ .sy_narg = AS(linux_renameat_args), .sy_call = (sy_call_t *)linux_renameat, .sy_auevent = AUE_RENAMEAT, .sy_flags = 0, .sy_thrcnt = SY_THR_STATIC },	/* 38 = linux_renameat */
+-	{ .sy_narg = 0, .sy_call = (sy_call_t *)nosys, .sy_auevent = AUE_NULL, .sy_flags = 0, .sy_thrcnt = SY_THR_ABSENT },	/* 39 = linux_umount2 */
++	{ .sy_narg = AS(linux_umount_args), .sy_call = (sy_call_t *)linux_umount, .sy_auevent = AUE_UMOUNT, .sy_flags = 0, .sy_thrcnt = SY_THR_STATIC },	/* 39 = linux_umount */
+ 	{ .sy_narg = AS(linux_mount_args), .sy_call = (sy_call_t *)linux_mount, .sy_auevent = AUE_MOUNT, .sy_flags = 0, .sy_thrcnt = SY_THR_STATIC },	/* 40 = linux_mount */
+ 	{ .sy_narg = 0, .sy_call = (sy_call_t *)linux_pivot_root, .sy_auevent = AUE_PIVOT_ROOT, .sy_flags = 0, .sy_thrcnt = SY_THR_STATIC },	/* 41 = linux_pivot_root */
+ 	{ .sy_narg = 0, .sy_call = (sy_call_t *)nosys, .sy_auevent = AUE_NULL, .sy_flags = 0, .sy_thrcnt = SY_THR_ABSENT },	/* 42 = nfsservctl */
+diff --git a/sys/arm64/linux/linux_systrace_args.c b/sys/arm64/linux/linux_systrace_args.c
+index 1b946a940..ee45c54e4 100644
+--- a/sys/arm64/linux/linux_systrace_args.c
++++ b/sys/arm64/linux/linux_systrace_args.c
+@@ -317,6 +317,14 @@ systrace_args(int sysnum, void *params, uint64_t *uarg, int *n_args)
+ 		*n_args = 4;
+ 		break;
+ 	}
++	/* linux_umount */
++	case 39: {
++		struct linux_umount_args *p = params;
++		uarg[a++] = (intptr_t)p->path; /* char * */
++		iarg[a++] = p->flags; /* l_int */
++		*n_args = 2;
++		break;
++	}
+ 	/* linux_mount */
+ 	case 40: {
+ 		struct linux_mount_args *p = params;
+@@ -2980,6 +2988,19 @@ systrace_entry_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
+ 			break;
+ 		};
+ 		break;
++	/* linux_umount */
++	case 39:
++		switch (ndx) {
++		case 0:
++			p = "userland char *";
++			break;
++		case 1:
++			p = "l_int";
++			break;
++		default:
++			break;
++		};
++		break;
+ 	/* linux_mount */
+ 	case 40:
+ 		switch (ndx) {
+@@ -6543,6 +6564,11 @@ systrace_return_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
+ 		if (ndx == 0 || ndx == 1)
+ 			p = "int";
+ 		break;
++	/* linux_umount */
++	case 39:
++		if (ndx == 0 || ndx == 1)
++			p = "int";
++		break;
+ 	/* linux_mount */
+ 	case 40:
+ 		if (ndx == 0 || ndx == 1)
+diff --git a/sys/arm64/linux/syscalls.master b/sys/arm64/linux/syscalls.master
+index 2babdcaf0..ebcda7b03 100644
+--- a/sys/arm64/linux/syscalls.master
++++ b/sys/arm64/linux/syscalls.master
+@@ -254,7 +254,12 @@
+ 		    const char *newname
+ 		);
+ 	}
+-39	AUE_NULL	UNIMPL	linux_umount2
++39	AUE_UMOUNT	STD	{
++		int linux_umount(
++		    char *path,
++		    l_int flags
++		);
++	}
+ 40	AUE_MOUNT	STD	{
+ 		int linux_mount(
+ 		    char *specialfile,
+diff --git a/sys/compat/linux/linux_file.c b/sys/compat/linux/linux_file.c
+index 30e79a53a..84ef3461e 100644
+--- a/sys/compat/linux/linux_file.c
++++ b/sys/compat/linux/linux_file.c
+@@ -1220,7 +1220,10 @@ linux_oldumount(struct thread *td, struct linux_oldumount_args *args)
+ }
+ #endif /* __i386__ || (__amd64__ && COMPAT_LINUX32) */
+ 
+-#ifdef LINUX_LEGACY_SYSCALLS
++/*
++ * NextBSD: umount2 is not a legacy syscall: arm64 has it too (39), so this
++ * is built for every Linux ABI.
++ */
+ int
+ linux_umount(struct thread *td, struct linux_umount_args *args)
+ {
+@@ -1231,6 +1234,16 @@ linux_umount(struct thread *td, struct linux_umount_args *args)
+ 		args->flags &= ~LINUX_MNT_FORCE;
+ 		flags |= MNT_FORCE;
+ 	}
++	/*
++	 * NextBSD: there is no lazy unmount, so MNT_DETACH is a plain
++	 * unmount. Callers such as the AppImage runtime detach only after
++	 * the last user has exited, so the mount is idle by then.
++	 * UMOUNT_NOFOLLOW is accepted but not enforced: kern_unmount()
++	 * resolves the path only to canonicalise it before matching it
++	 * against the mount table, and still checks unmount permission
++	 * against the mount it finds.
++	 */
++	args->flags &= ~(LINUX_MNT_DETACH | LINUX_UMOUNT_NOFOLLOW);
+ 	if (args->flags != 0) {
+ 		linux_msg(td, "unsupported umount2 flags %#x", args->flags);
+ 		return (EINVAL);
+@@ -1238,7 +1251,6 @@ linux_umount(struct thread *td, struct linux_umount_args *args)
+ 
+ 	return (kern_unmount(td, args->path, flags));
+ }
+-#endif
+ 
+ /*
+  * fcntl family of syscalls
+diff --git a/sys/compat/linux/linux_file.h b/sys/compat/linux/linux_file.h
+index 0b6ca536b..1e28ee88b 100644
+--- a/sys/compat/linux/linux_file.h
++++ b/sys/compat/linux/linux_file.h
+@@ -66,6 +66,9 @@
+  * umount2 flags
+  */
+ #define	LINUX_MNT_FORCE		0x0001
++#define	LINUX_MNT_DETACH	0x0002
++#define	LINUX_MNT_EXPIRE	0x0004
++#define	LINUX_UMOUNT_NOFOLLOW	0x0008
+ 
+ /*
+  * common open/fcntl flags
+-- 
+2.54.0 (Apple Git-157)
+
