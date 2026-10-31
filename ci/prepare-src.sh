@@ -90,7 +90,9 @@ case "$ABI_VERSION" in
 [0-9]*.[0-9]*.[0-9]*) ;;
 *) echo "prepare-src: no 'version X.Y.Z' line in $REPO/abi/ABI" >&2; exit 1 ;;
 esac
-NB_SHA=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
+# safe.directory: the CI container runs as root over a checkout owned by the
+# runner user, which git otherwise refuses ("dubious ownership").
+NB_SHA=$(git -c safe.directory='*' -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
 NB_ATTEMPT=${GITHUB_RUN_ATTEMPT:-1}
 case "$TARGET" in
 amd64) NB_ARCH_EXPR='nb_arch=X86_64' ;;
