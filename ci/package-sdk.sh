@@ -13,7 +13,7 @@
 #     KERNEL-BUILD-ID   the kernel build these headers and options are from
 #     KERNEL-VERSION    the kernel version (abi/ABI), e.g. 27.0.0 = kern.osrelease
 #     KERNEL-ABI-VERSION  its major.minor, e.g. 27.0: the kext ABI version
-#     SDK-INFO          target, kernel commit, what is inside
+#     SDK-INFO          target, kernel commit (kernel_commit=), what is inside
 #     sys/              the prepared sys/ tree, minus implementation: headers,
 #                       the interface (*.m) and vnode_if sources kmod.mk
 #                       generates from, sys/conf (kmod.mk, kern.mk, ...), the
@@ -98,11 +98,19 @@ KVER=$(awk '$1 == "version" { print $2; exit }' "$REPO/abi/ABI")
 echo "$KVER" > "$SDK/KERNEL-VERSION"
 echo "${KVER%.*}" > "$SDK/KERNEL-ABI-VERSION"
 
+# The nextbsd-kernel commit this SDK was built from, in full. Kext builds read
+# it from SDK-INFO (kernel_commit=); KERNEL-BUILD-ID will stop carrying it
+# (#376). safe.directory: the CI container runs as root over a checkout owned
+# by the runner user.
+KCOMMIT=$(git -c safe.directory='*' -C "$REPO" rev-parse HEAD 2>/dev/null || echo "${GITHUB_SHA:-}")
+[ -n "$KCOMMIT" ] || { echo "package-sdk: cannot tell the nextbsd-kernel commit of $REPO" >&2; exit 1; }
+
 {
 	echo "target=$TARGET"
 	echo "target_arch=$TARGET_ARCH"
 	echo "kernconf=NEXTBSD"
 	echo "kernel_build_id=$(cat "$OBJ/KERNEL-BUILD-ID")"
+	echo "kernel_commit=$KCOMMIT"
 	echo "kernel_version=$KVER"
 	echo "kernel_abi_version=${KVER%.*}"
 	echo "sys_files=$(wc -l < "$STAGE/sys.list" | tr -d ' ')"
