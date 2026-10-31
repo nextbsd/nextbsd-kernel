@@ -61,8 +61,17 @@ kern.version   (uname -v)  NextBSD Kernel Version 27.0.0: <date>; root:nextbsd-k
 
 `<shortsha>` is this repo's commit, `<attempt>` the CI run attempt, and
 `<ARCH>` is `X86_64`, `ARM64`, or `ARM64_BCM2712` for NEXTBSD-RPI5.
-`kern.ostype` stays `NextBSD`; `REVISION`, `__FreeBSD_version` and
-`kern.osreldate` are unchanged.
+`kern.ostype` stays `NextBSD` and `REVISION` is unchanged.
+
+`ci/prepare-src.sh` also sets `__FreeBSD_version` in `sys/sys/param.h` to
+**2700000**, so `kern.osreldate` is 2700000. The world builds with the same
+value (nextbsd-freebsd-compat). The kernel and its kexts must agree on it:
+each kext's `MODULE_KERNEL_MAXVER` is `roundup(__FreeBSD_version, 100000) - 1`,
+so a kext built at 1501000 refuses this kernel. The kext builds run
+`prepare-src.sh` too, so they get the same value. The source is still the
+releng/15.1 API and the toolchain triple stays `*-freebsd15.1`. Patch `0075`
+keeps `gone_in()` comparing against 15, so its "To be removed in FreeBSD N"
+notices and `debug.obsolete_panic` behave as on releng/15.1.
 
 The scheme:
 
@@ -80,22 +89,32 @@ release notes.
 
 ## KERNEL-BUILD-ID
 
-Each build stamps `<commit>.<run_id>.<run_attempt>` into
-`sys/NEXTBSD/KERNEL-BUILD-ID` in its obj tree, so it is in both
-`nextbsd-kernel-<arch>.tar.gz` and `kernel-sdk-<arch>.tar.gz`, and publishes it
-as the `KERNEL-BUILD-ID` release asset. Both arches and NEXTBSD-RPI5 share the
-run's ID. It is stronger than `__FreeBSD_version`: the same commit rebuilt is a
-new ID. The kext repos copy the ID from the SDK they built against into every
-kext, and packaging and the image lanes refuse a kernel and
-kexts whose IDs differ (#326).
+`KERNEL-BUILD-ID` holds the **kext ABI version**, major.minor of `abi/ABI`
+(`27.0`), #376. Each build stamps it into `sys/NEXTBSD/KERNEL-BUILD-ID` in its
+obj tree, so it is in both `nextbsd-kernel-<arch>.tar.gz` and
+`kernel-sdk-<arch>.tar.gz`, and publishes it as the `KERNEL-BUILD-ID` release
+asset; it always equals `KERNEL-ABI-VERSION`. Both arches and NEXTBSD-RPI5
+share it.
+
+The kext repos copy it from the SDK they built against into every kext's
+`NBSDKernelBuildID`, next to `NBSDKernelABIVersion` (from `KERNEL-ABI-VERSION`),
+and packaging and the image lanes refuse a kernel and kexts whose IDs differ
+(#326). A kernel change that keeps the ABI version therefore needs no kext
+rebuild; bumping `abi/ABI` to the next minor makes every kext stale until it is
+rebuilt. The key names are kept for the pinned nextbsd-ci and nextbsd-pkg
+checks.
+
+Until #376 the ID was `<commit>.<run_id>.<run_attempt>`, one per build. The
+build is still identified: the full commit is `kernel_commit=` in the SDK's
+`SDK-INFO`, and the short commit and run attempt are in `kern.version`.
 
 ## Kernel SDK
 
 The kernel is built with `NO_MODULES=yes`. Kexts are built against
 `kernel-sdk-<arch>.tar.gz` (#327, made by `ci/package-sdk.sh`): the kernel's
 headers and the module-build inputs `kmod.mk` names, the generated
-`opt_*.h`/`*_if.h`, the exported-symbol list, the `KERNEL-BUILD-ID` and the
-kernel and ABI versions (above). A
+`opt_*.h`/`*_if.h`, the exported-symbol list, the `KERNEL-BUILD-ID`, the
+kernel and ABI versions (above), and `SDK-INFO` with the kernel commit. A
 kext repo points `SYSDIR` (and `KERNBUILDDIR` where it wants the kernel's
 options) into it, so it needs neither this repo's source nor the obj tree, and
 never relinks the kernel. The full obj tree is not published.

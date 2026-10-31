@@ -84,7 +84,7 @@ done
 # ARM64_BCM2712 for NEXTBSD-RPI5; newvers.sh knows the config only at build
 # time, as ${i} (KERN_IDENT), so nb_arch is set on that same line.
 # Replaced lines are tab-indented inside an if/else; both branches get the same
-# value, which is fine. REVISION, __FreeBSD_version and osreldate are untouched.
+# value, which is fine. REVISION is untouched; __FreeBSD_version is set below.
 ABI_VERSION=$(awk '$1 == "version" { print $2; exit }' "$REPO/abi/ABI")
 case "$ABI_VERSION" in
 [0-9]*.[0-9]*.[0-9]*) ;;
@@ -110,6 +110,28 @@ sed -i \
 echo "=== newvers.sh identity after rebrand ==="
 grep -nE '^TYPE=|^RELEASE=|t=\$\(date|nb_arch=|VERINFO=|VERSTR=' "$nv" || true
 grep -q 'KERN_IDENT); .*nb_arch=' "$nv" || { echo "prepare-src: newvers.sh has no KERN_IDENT line to key the banner arch on" >&2; exit 1; }
+
+# __FreeBSD_version = 2700000 (nextbsd-kernel#376): the NextBSD 27.0.0 kernel,
+# still on the releng/15.1 API. newvers.sh reads it from param.h into
+# osreldate (kern.osreldate), and it is MODULE_VERSION(kernel, ...) and every
+# module's MODULE_KERNEL_MAXVER (roundup(__FreeBSD_version, 100000) - 1,
+# sys/module.h). Kext builds run this script too, so kernel and kexts flip
+# together; a kext built at 1501000 refuses this kernel. The world sets the
+# same value (nextbsd-freebsd-compat). Keyed on the define's NAME, not a
+# patch, like the identity above, so a releng/15.1 version bump can't break
+# it. Only the value changes: newvers.sh and other build files match
+# '^#define[[:space:]]*__FreeBSD_version' as a prefix, so no second
+# similarly named define may be added.
+FBSD_VERSION=2700000
+ph=sys/sys/param.h
+FBSD_VER_RE='^#define[[:space:]]+__FreeBSD_version[[:space:]]+'
+n=$(grep -Ec "${FBSD_VER_RE}[0-9]{7}([[:space:]]|$)" "$ph" || true)
+[ "$n" = 1 ] || { echo "prepare-src: $ph: expected one '#define __FreeBSD_version NNNNNNN', found $n" >&2; exit 1; }
+sed -i -E "s/(${FBSD_VER_RE})[0-9]{7}([[:space:]]|$)/\1${FBSD_VERSION}\2/" "$ph"
+grep -Eq "${FBSD_VER_RE}${FBSD_VERSION}([[:space:]]|$)" "$ph" \
+	|| { echo "prepare-src: $ph: __FreeBSD_version is not $FBSD_VERSION after the edit" >&2; exit 1; }
+echo "=== param.h __FreeBSD_version ==="
+grep -En "${FBSD_VER_RE}" "$ph"
 
 # ------------------------------------------------- syscall tables (sysent) ----
 # A syscalls.master patch changes the GENERATED syscall tables (init_sysent.c,

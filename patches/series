@@ -65,3 +65,4 @@
 0072-NextBSD-kldload-foo.ko-of-a-compiled-in-module-retur.patch
 0073-NextBSD-linsysfs-create-DRM-render-node-entries.patch
 0074-NextBSD-Linuxulator-accept-umount2-MNT_DETACH-wire-u.patch
+0075-NextBSD-gone_in-compares-against-the-releng-15.1-maj.patch

@@ -237,30 +237,41 @@ jobs:
       # exec bit (bmake, cross-tools) survives inside the tar stream; a raw
       # upload-artifact tree comes back 0644 and breaks make.py's bmake
       # bootstrap downstream (PermissionError on /usr/obj/bmake-install/bin/bmake).
-      # KERNEL-BUILD-ID names this exact kernel build: the commit, plus the run
-      # and attempt, because NextBSD patches the kernel and the same commit
-      # rebuilt (new toolchain, new attempt) is a different binary as far as
-      # struct layouts go -- __FreeBSD_version can't tell them apart
-      # (nextbsd-kernel#326, nextbsd-kernel-extensions-graphics#46). Both arches and
-      # NEXTBSD-RPI5 share one ID, since they come from one run and one tree.
-      # It lives in the obj dir, so it rides in the kernel tarball at
-      # .../sys/NEXTBSD/KERNEL-BUILD-ID and in the kernel SDK: the kext builds
-      # read it from the SDK and stamp it into every kext; packaging and the
-      # image lanes compare the two and refuse a mismatch.
+      # KERNEL-BUILD-ID holds the kext ABI version: major.minor of abi/ABI,
+      # e.g. 27.0 (nextbsd-kernel#376). It used to name one exact build
+      # (<commit>.<run_id>.<run_attempt>, #326), so every kernel merge needed
+      # a kext rebuild; now kexts built against any kernel with the same ABI
+      # version match it, and abi/ABI is bumped by hand when they must be
+      # rebuilt. The key name stays for the pinned nextbsd-ci and nextbsd-pkg
+      # checks, which compare it with the kexts' NBSDKernelBuildID by string
+      # equality. The commit is still recorded: SDK-INFO's kernel_commit= and
+      # kern.version (root:nextbsd-kernel-<shortsha>~<attempt>). Both arches
+      # and NEXTBSD-RPI5 share one ID. It lives in the obj dir, so it rides in
+      # the kernel tarball at .../sys/NEXTBSD/KERNEL-BUILD-ID and in the kernel
+      # SDK: the kext builds read it from the SDK and stamp it into every kext;
+      # packaging and the image lanes compare the two and refuse a mismatch.
       - name: Stamp KERNEL-BUILD-ID
         run: |
           set -eu
           OBJ="/usr/obj/usr/src/${{ matrix.target }}.${{ matrix.target_arch }}/sys/NEXTBSD"
           test -f "$OBJ/kernel" || { echo "no kernel at $OBJ" >&2; exit 1; }
-          echo "${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}" > "$OBJ/KERNEL-BUILD-ID"
-          echo "KERNEL-BUILD-ID: $(cat "$OBJ/KERNEL-BUILD-ID")"
-          # What uname -r / uname -v will say (kern.osrelease / kern.version),
-          # straight from the vers.c each kernel was linked with (#376).
+          KVER=$(awk '$1 == "version" { print $2; exit }' "$GITHUB_WORKSPACE/abi/ABI")
+          ABI_VERSION=${KVER%.*}
+          case "$ABI_VERSION" in
+          [0-9]*.[0-9]*) ;;
+          *) echo "no 'version X.Y.Z' line in abi/ABI (got '$KVER')" >&2; exit 1 ;;
+          esac
+          echo "$ABI_VERSION" > "$OBJ/KERNEL-BUILD-ID"
+          echo "KERNEL-BUILD-ID: $(cat "$OBJ/KERNEL-BUILD-ID") (kext ABI version; commit ${{ github.sha }})"
+          # What uname -r / uname -v will say (kern.osrelease / kern.version)
+          # and kern.osreldate, straight from the vers.c each kernel was
+          # linked with (#376), and the __FreeBSD_version it was built with.
+          grep -En '^#define[[:space:]]+__FreeBSD_version[[:space:]]' /usr/src/sys/sys/param.h | sed 's/^/param.h:/'
           for k in NEXTBSD NEXTBSD-RPI5; do
             V="/usr/obj/usr/src/${{ matrix.target }}.${{ matrix.target_arch }}/sys/$k/vers.c"
             [ -f "$V" ] || continue
             echo "--- $k"
-            grep -E '^#define (RELSTR|VERSTR) ' "$V" | sed 's/^/  /'
+            grep -E '^#define (RELSTR|VERSTR) |^const int osreldate' "$V" | sed 's/^/  /'
           done
 
       # The full /usr/obj is no longer published: the kext repos build against
@@ -367,12 +378,14 @@ jobs:
           export CONTRIB_TGZ="$PWD/art/nextbsd-contrib-${{ matrix.target }}.tar.gz"
           export MODULES_TGZ="$(ls art/*kext*.tar.gz 2>/dev/null | tr '\n' ' ')"
           # assemble-image.sh refuses kexts built for another kernel
-          # (KERNEL-BUILD-ID, nextbsd/nextbsd#549). This lane boots THIS run's
-          # kernel, which no kext was built for yet, so check the kexts against
-          # the published kernel instead: it still refuses kexts that are stale
-          # relative to main. (Kexts are rebuilt after a kernel merge by a merge
-          # to each kext repo, a manual run of its workflow, or
-          # freebsd-src's Sync Fork with force.)
+          # (KERNEL-BUILD-ID, nextbsd/nextbsd#549). KERNEL-BUILD-ID is the kext
+          # ABI version (27.0, #376), and the published kexts were built
+          # against the published kernel, so check them against the published
+          # KERNEL-BUILD-ID: it still refuses kexts that are stale relative to
+          # main. When this PR keeps abi/ABI's major.minor, the published ID is
+          # also this kernel's. (Kexts are rebuilt by a merge to each kext
+          # repo, a manual run of its workflow, or freebsd-src's Sync Fork
+          # with force.)
           EXPECT_KERNEL_BUILD_ID="$(gh release download continuous -R nextbsd/nextbsd-kernel \
             --pattern KERNEL-BUILD-ID --output - )"
           [ -n "$EXPECT_KERNEL_BUILD_ID" ] || { echo "FAIL: no published KERNEL-BUILD-ID" >&2; exit 1; }
@@ -621,10 +634,23 @@ jobs:
           # has not yet moved to rpi5-kernel8-arm64.img keeps building. Delete
           # once nextbsd#414 and its follow-up have landed.
           cp out/rpi5-kernel8-arm64.img out/rpi500-kernel8-arm64.img
-          # One KERNEL-BUILD-ID for the whole run, also as its own asset so a
-          # consumer can check it without downloading a tarball. Each kernel
-          # tarball and SDK must carry that same ID.
-          ID="${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}"
+          # The kernel version and the kext ABI version (#376), as their own
+          # assets so a consumer can check them without downloading a tarball.
+          # Both arches' SDKs must agree.
+          for f in KERNEL-VERSION KERNEL-ABI-VERSION; do
+            tar -xzOf out/kernel-sdk-amd64.tar.gz "kernel-sdk/$f" > "out/$f"
+            [ -s "out/$f" ] || { echo "FAIL: no $f" >&2; exit 1; }
+            for t in out/kernel-sdk-*.tar.gz; do
+              got=$(tar -xzOf "$t" "kernel-sdk/$f") \
+                || { echo "FAIL: $t carries no $f" >&2; exit 1; }
+              [ "$got" = "$(cat "out/$f")" ] || { echo "FAIL: $t has $f $got, expected $(cat "out/$f")" >&2; exit 1; }
+            done
+            echo "  $f: $(cat "out/$f")"
+          done
+          # One KERNEL-BUILD-ID for the whole run, also as its own asset. It is
+          # the kext ABI version (#376), so it must equal KERNEL-ABI-VERSION,
+          # and each kernel tarball and SDK must carry that same ID.
+          ID=$(cat out/KERNEL-ABI-VERSION)
           echo "$ID" > out/KERNEL-BUILD-ID
           for t in out/nextbsd-kernel-*.tar.gz; do
             f=$(tar -tzf "$t" | grep -m1 'sys/NEXTBSD/KERNEL-BUILD-ID$') \
@@ -639,15 +665,6 @@ jobs:
             [ "$got" = "$ID" ] || { echo "FAIL: $t has KERNEL-BUILD-ID $got, expected $ID" >&2; exit 1; }
             echo "  $(basename "$t"): $got"
           done
-          # The kernel version and the kext ABI version (#376), as their own
-          # assets so a consumer can check them without
-          # downloading a tarball.
-          tar -xzOf out/kernel-sdk-amd64.tar.gz kernel-sdk/KERNEL-VERSION > out/KERNEL-VERSION
-          tar -xzOf out/kernel-sdk-amd64.tar.gz kernel-sdk/KERNEL-ABI-VERSION > out/KERNEL-ABI-VERSION
-          for f in KERNEL-VERSION KERNEL-ABI-VERSION; do
-            [ -s "out/$f" ] || { echo "FAIL: no $f" >&2; exit 1; }
-            echo "  $f: $(cat "out/$f")"
-          done
           cat > notes.md <<'EOF'
           Rolling kernel build, refreshed on every successful `main` build.
           Consumed by nextbsd-kernel-extensions, -graphics and -nvidia (`kernel-sdk-<arch>.tar.gz`,
@@ -656,15 +673,16 @@ jobs:
           `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
           `rpi500-kernel8-arm64.img` is a transition alias for the same
           file).
-
-          KERNEL-BUILD-ID: `${{ github.sha }}.${{ github.run_id }}.${{ github.run_attempt }}`
-          (also the `KERNEL-BUILD-ID` asset, and `.../sys/NEXTBSD/KERNEL-BUILD-ID`
-          in every tarball). Kexts built against this kernel carry the same ID.
           EOF
           {
             echo
             echo "Kernel version: \`$(cat out/KERNEL-VERSION)\` (kern.osrelease; the \`KERNEL-VERSION\` asset)."
             echo "Kext ABI version: \`$(cat out/KERNEL-ABI-VERSION)\` (the \`KERNEL-ABI-VERSION\` asset)."
+            echo
+            echo "KERNEL-BUILD-ID: \`$ID\`, the kext ABI version (#376); also the \`KERNEL-BUILD-ID\`"
+            echo "asset, and \`.../sys/NEXTBSD/KERNEL-BUILD-ID\` in every tarball. Kexts built against"
+            echo "any kernel with this ABI version carry the same ID. The exact kernel commit is in"
+            echo "the SDK's \`SDK-INFO\` (\`kernel_commit=\`) and in kern.version."
             echo
             echo "Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "Commit: ${{ github.sha }}"
