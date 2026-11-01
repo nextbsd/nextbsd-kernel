@@ -1,0 +1,196 @@
+From 0f2f4e1d9f39b7205b5ba906044b056b6eb38719 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sun, 1 Nov 2026 01:48:16 -0500
+Subject: [PATCH] NextBSD: add a swap_lowspace eventhandler and
+ vm.nswap_lowat/hiwat sysctls
+
+swp_sizecheck() flips swap_pager_almost_full when free swap falls below
+nswap_lowat or rises back above nswap_hiwat, but only printf()s: userland
+has no event and a swap manager has to poll.
+
+Route every change of swap_pager_almost_full (swp_sizecheck(), a failed
+swap allocation, removing the last swap device) through
+swp_set_almost_full(), which fires a new swap_lowspace eventhandler with
+the new state and the free swap in pages. Make the two thresholds
+tunable sysctls (vm.nswap_lowat, vm.nswap_hiwat, in pages) and add
+swap_pager_set_watermarks() so kernel code can set them; a change is
+applied at once under the swap device mutex.
+
+NextBSD's Mach layer uses the event to send Darwin's
+default_pager_space_alert (HI_WAT_ALERT / LO_WAT_ALERT) to the port
+registered with macx_triggers(), the dynamic_pager interface swapd
+(nextbsd/nextbsd-userland#178) is built on. With no handler registered
+the invoke is a no-op.
+
+Refs nextbsd/nextbsd-kernel#218. Carried out-of-tree for NextBSD.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/sys/eventhandler.h |  8 ++++
+ sys/vm/swap_pager.c    | 86 +++++++++++++++++++++++++++++++++++++++---
+ sys/vm/swap_pager.h    |  1 +
+ 3 files changed, 90 insertions(+), 5 deletions(-)
+
+diff --git a/sys/sys/eventhandler.h b/sys/sys/eventhandler.h
+index ffcaadc..dfa0308 100644
+--- a/sys/sys/eventhandler.h
++++ b/sys/sys/eventhandler.h
+@@ -308,6 +308,14 @@ typedef void (*swapoff_fn)(void *, struct swdevt *);
+ EVENTHANDLER_DECLARE(swapon, swapon_fn);
+ EVENTHANDLER_DECLARE(swapoff, swapoff_fn);
+ 
++/*
++ * Swap almost-full transition (NextBSD): free swap fell below vm.nswap_lowat
++ * (almost_full 1) or rose back above vm.nswap_hiwat (almost_full 0).  avail
++ * is the free swap in pages.  Invoked with the swap device mutex held.
++ */
++typedef void (*swap_lowspace_fn)(void *, int almost_full, int avail);
++EVENTHANDLER_DECLARE(swap_lowspace, swap_lowspace_fn);
++
+ /* newbus device events */
+ enum evhdev_detach {
+ 	EVHDEV_DETACH_BEGIN,    /* Before detach() is called */
+diff --git a/sys/vm/swap_pager.c b/sys/vm/swap_pager.c
+index 834c757..54f9d8e 100644
+--- a/sys/vm/swap_pager.c
++++ b/sys/vm/swap_pager.c
+@@ -475,10 +475,28 @@ const struct pagerops swappagerops = {
+ static int nswap_lowat = 128;	/* in pages, swap_pager_almost_full warn */
+ static int nswap_hiwat = 512;	/* in pages, swap_pager_almost_full warn */
+ 
++/*
++ * NextBSD: the almost-full hysteresis thresholds are tunable, and every
++ * swap_pager_almost_full transition fires the swap_lowspace eventhandler
++ * (<sys/eventhandler.h>), so swapd can grow and shrink swap without
++ * polling.  NextBSD's Mach layer turns the event into Darwin's
++ * default_pager_space_alert for the port registered with macx_triggers().
++ */
++static int sysctl_swap_watermark(SYSCTL_HANDLER_ARGS);
++SYSCTL_PROC(_vm, OID_AUTO, nswap_lowat,
++    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, &nswap_lowat, 0,
++    sysctl_swap_watermark, "I",
++    "Free swap pages below which swap is almost full (swap_lowspace)");
++SYSCTL_PROC(_vm, OID_AUTO, nswap_hiwat,
++    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, &nswap_hiwat, 1,
++    sysctl_swap_watermark, "I",
++    "Free swap pages above which swap is no longer almost full");
++
+ SYSCTL_INT(_vm, OID_AUTO, dmmax, CTLFLAG_RD, &nsw_cluster_max, 0,
+     "Maximum size of a swap block in pages");
+ 
+ static void	swp_sizecheck(void);
++static void	swp_set_almost_full(bool full);
+ static void	swp_pager_async_iodone(struct buf *bp);
+ static bool	swp_pager_swblk_empty(struct swblk *sb, int start, int limit);
+ static void	swp_pager_free_empty_swblk(vm_object_t, struct swblk *sb);
+@@ -653,15 +671,70 @@ swp_sizecheck(void)
+ 	if (swap_pager_avail < nswap_lowat) {
+ 		if (!swap_pager_almost_full) {
+ 			printf("swap_pager: out of swap space\n");
+-			swap_pager_almost_full = true;
++			swp_set_almost_full(true);
+ 		}
+ 	} else {
+ 		swap_pager_full = false;
+ 		if (swap_pager_avail > nswap_hiwat)
+-			swap_pager_almost_full = false;
++			swp_set_almost_full(false);
+ 	}
+ }
+ 
++/*
++ * Set swap_pager_almost_full and, when it changes, fire swap_lowspace.
++ * Called with sw_dev_mtx held, so the handlers must not sleep.
++ */
++static void
++swp_set_almost_full(bool full)
++{
++
++	mtx_assert(&sw_dev_mtx, MA_OWNED);
++	if (swap_pager_almost_full == full)
++		return;
++	swap_pager_almost_full = full;
++	EVENTHANDLER_INVOKE(swap_lowspace, full ? 1 : 0, swap_pager_avail);
++}
++
++/*
++ * Set the almost-full thresholds, in pages; a negative value keeps the
++ * current one.  lowat must not exceed hiwat.  The new thresholds apply at
++ * once: swap_lowspace fires now if they move the state across them.
++ */
++int
++swap_pager_set_watermarks(int lowat, int hiwat)
++{
++
++	mtx_lock(&sw_dev_mtx);
++	if (lowat < 0)
++		lowat = nswap_lowat;
++	if (hiwat < 0)
++		hiwat = nswap_hiwat;
++	if (lowat > hiwat) {
++		mtx_unlock(&sw_dev_mtx);
++		return (EINVAL);
++	}
++	nswap_lowat = lowat;
++	nswap_hiwat = hiwat;
++	swp_sizecheck();
++	mtx_unlock(&sw_dev_mtx);
++	return (0);
++}
++
++static int
++sysctl_swap_watermark(SYSCTL_HANDLER_ARGS)
++{
++	int error, val;
++
++	val = *(int *)arg1;
++	error = sysctl_handle_int(oidp, &val, 0, req);
++	if (error != 0 || req->newptr == NULL)
++		return (error);
++	if (val < 0)
++		return (EINVAL);
++	return (arg2 == 0 ? swap_pager_set_watermarks(val, -1) :
++	    swap_pager_set_watermarks(-1, val));
++}
++
+ /*
+  * SWAP_PAGER_INIT() -	initialize the swap pager!
+  *
+@@ -966,7 +1039,8 @@ swp_pager_getswapspace(int *io_npages)
+ 		if (!swap_pager_full) {
+ 			printf("swp_pager_getswapspace(%d): failed\n",
+ 			    *io_npages);
+-			swap_pager_full = swap_pager_almost_full = true;
++			swap_pager_full = true;
++			swp_set_almost_full(true);
+ 		}
+ 		swdevhd = NULL;
+ 	}
+@@ -2894,8 +2968,10 @@ swapoff_one(struct swdevt *sp, struct ucred *cred, u_int flags)
+ 	sp->sw_id = NULL;
+ 	TAILQ_REMOVE(&swtailq, sp, sw_list);
+ 	nswapdev--;
+-	if (nswapdev == 0)
+-		swap_pager_full = swap_pager_almost_full = true;
++	if (nswapdev == 0) {
++		swap_pager_full = true;
++		swp_set_almost_full(true);
++	}
+ 	if (swdevhd == sp)
+ 		swdevhd = NULL;
+ 	mtx_unlock(&sw_dev_mtx);
+diff --git a/sys/vm/swap_pager.h b/sys/vm/swap_pager.h
+index da14577..dc5efed 100644
+--- a/sys/vm/swap_pager.h
++++ b/sys/vm/swap_pager.h
+@@ -86,6 +86,7 @@ int swap_pager_reserve(vm_object_t, vm_pindex_t, vm_pindex_t);
+ void swap_pager_status(int *total, int *used);
+ u_long swap_pager_swapped_pages(vm_object_t object);
+ void swapoff_all(void);
++int swap_pager_set_watermarks(int lowat, int hiwat);
+ bool swap_pager_init_object(vm_object_t object, void *handle,
+     struct ucred *cred, vm_ooffset_t size, vm_ooffset_t offset);
+ #endif				/* _KERNEL */
+-- 
+2.54.0 (Apple Git-157)
+
