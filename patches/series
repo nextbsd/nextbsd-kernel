@@ -66,3 +66,5 @@
 0073-NextBSD-linsysfs-create-DRM-render-node-entries.patch
 0074-NextBSD-Linuxulator-accept-umount2-MNT_DETACH-wire-u.patch
 0075-NextBSD-gone_in-compares-against-the-releng-15.1-maj.patch
+0076-namei-preserve-ABI-root-for-absolute-symlinks.patch
+0077-namei-retry-absolute-symlink-expansions-from-native-root.patch
