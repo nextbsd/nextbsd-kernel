@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 1 Nov 2026 01:44:37 -0600
+Subject: [PATCH] NextBSD: TDP2_VMPRIV gives a thread the page daemon's VM
+ privileges
+
+The VM grants the page daemon three privileges by testing
+curproc == pageproc: page allocations are raised to VM_ALLOC_SYSTEM,
+swap metadata (swblk, swpctrie) is allocated with M_USE_RESERVE, and
+vm_wait_doms()/vm_wait_domain() let it wait on its own, short, channel
+instead of queueing in "vmwait" behind ordinary allocators.  A thread
+that works on the pageout path on behalf of the page daemon, but is not
+part of pageproc, gets none of this.  It sleeps in vm_wait behind the
+daemon it is meant to be helping.
+
+Add TDP2_VMPRIV, a td_pflags2 bit (td_pflags has no free bits), and
+three inlines in sys/proc.h:
+
+  vm_thread_privileged()  curproc == pageproc || TDP2_VMPRIV is set
+  vm_thread_priv_enter()  set the flag, return the old state
+  vm_thread_priv_exit()   restore it, so marks nest
+
+Use vm_thread_privileged() at the sites that grant privileges:
+vm_domain_allocate(), vm_page_reclaim_contig_domain_ext(),
+vm_page_zone_import(), vm_wait_doms(), vm_wait_domain(),
+swblk_trie_alloc() and swp_pager_meta_build().
+
+Sites that ask whether the caller *is* the page daemon keep the
+pageproc test: pagedaemon_wakeup() (a privileged thread must still wake
+the daemon), swap_pager_putpages()'s async decision (the async pbufs are
+the daemon's; any other caller, privileged or not, writes swap objects
+synchronously from its own context, so the I/O is issued while the
+thread still holds its privileges), and linuxkpi current_is_kswapd().
+
+The flag is not inherited across fork or thread creation: td_pflags2 is
+in the zeroed part of struct thread.  Nothing sets it yet; this is
+defence in depth for the swap paths (nextbsd-kernel#214), not their
+correctness argument.
+
+Refs: nextbsd/nextbsd-kernel#219
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/sys/proc.h      | 42 ++++++++++++++++++++++++++++++++++++++++++
+ sys/vm/swap_pager.c | 13 ++++++++++---
+ sys/vm/vm_page.c    | 26 +++++++++++++++++---------
+ sys/vm/vm_pageout.c |  4 ++++
+ 4 files changed, 73 insertions(+), 12 deletions(-)
+
+diff --git a/sys/sys/proc.h b/sys/sys/proc.h
+index 6d8f50be..16716083 100644
+--- a/sys/sys/proc.h
++++ b/sys/sys/proc.h
+@@ -574,6 +574,7 @@ enum {
+ #define	TDP2_SAN_QUIET	0x00000008 /* Disable warnings from K(A|M)SAN */
+ #define	TDP2_EXTERR	0x00000010 /* Kernel reported ext error */
+ #define	TDP2_UEXTERR	0x00000020 /* User set ext error reporting ptr */
++#define	TDP2_VMPRIV	0x00000040 /* NextBSD: VM-privileged, as pageproc */
+ 
+ /*
+  * Reasons that the current thread can not be run yet.
+@@ -1323,6 +1324,47 @@ curthread_pflags2_restore(int save)
+ 	curthread->td_pflags2 &= save;
+ }
+ 
++/*
++ * NextBSD: VM-privileged threads.
++ *
++ * The page daemon (pageproc) may dig into the free-page reserve, allocates
++ * swap metadata from the UMA reserve, and waits for free pages in its own
++ * way rather than queueing behind ordinary allocators in vm_wait.  A thread
++ * that sits on the pageout path but is not part of pageproc can ask for the
++ * same treatment by setting TDP2_VMPRIV around that work:
++ *
++ *	save = vm_thread_priv_enter();
++ *	...
++ *	vm_thread_priv_exit(save);
++ *
++ * The flag is per thread, nests, and is not inherited by fork or
++ * thread creation (td_pflags2 is in the zeroed part of struct thread).
++ * It grants reserve privileges only: code that asks whether it *is* the
++ * page daemon (pagedaemon_wakeup(), the async swap write path) still
++ * tests curproc == pageproc.
++ */
++static __inline bool
++vm_thread_privileged(void)
++{
++
++	return (curproc == pageproc ||
++	    (curthread->td_pflags2 & TDP2_VMPRIV) != 0);
++}
++
++static __inline int
++vm_thread_priv_enter(void)
++{
++
++	return (curthread_pflags2_set(TDP2_VMPRIV));
++}
++
++static __inline void
++vm_thread_priv_exit(int save)
++{
++
++	curthread_pflags2_restore(save);
++}
++
+ static __inline __pure2 struct td_sched *
+ td_get_sched(struct thread *td)
+ {
+diff --git a/sys/vm/swap_pager.c b/sys/vm/swap_pager.c
+index 834c757a..aab372d0 100644
+--- a/sys/vm/swap_pager.c
++++ b/sys/vm/swap_pager.c
+@@ -528,7 +528,7 @@ static void *
+ swblk_trie_alloc(struct pctrie *ptree)
+ {
+ 
+-	return (uma_zalloc(swpctrie_zone, M_NOWAIT | (curproc == pageproc ?
++	return (uma_zalloc(swpctrie_zone, M_NOWAIT | (vm_thread_privileged() ?
+ 	    M_USE_RESERVE : 0)));
+ }
+ 
+@@ -1576,6 +1576,13 @@ swap_pager_putpages(vm_object_t object, vm_page_t *ma, int count,
+ 	    __func__, object, ma[0]->object));
+ 
+ 	VM_OBJECT_WUNLOCK(object);
++	/*
++	 * Only the page daemon itself writes asynchronously: it must not
++	 * block on its own I/O, and the nsw_wcount_async pbufs are sized for
++	 * it.  Every other caller, VM-privileged threads included, issues
++	 * the write synchronously from its own context, so the I/O is
++	 * dispatched while this thread still holds its privileges.
++	 */
+ 	async = curproc == pageproc && (flags & VM_PAGER_PUT_SYNC) == 0;
+ 	swp_pager_init_freerange(&range);
+ 
+@@ -2170,8 +2177,8 @@ swp_pager_meta_build(struct pctrie_iter *blks, vm_object_t object,
+ 		if (swapblk == SWAPBLK_NONE)
+ 			return (SWAPBLK_NONE);
+ 		for (;;) {
+-			sb = uma_zalloc(swblk_zone, M_NOWAIT | (curproc ==
+-			    pageproc ? M_USE_RESERVE : 0));
++			sb = uma_zalloc(swblk_zone, M_NOWAIT |
++			    (vm_thread_privileged() ? M_USE_RESERVE : 0));
+ 			if (sb != NULL) {
+ 				sb->p = rounddown(pindex, SWAP_META_PAGES);
+ 				for (i = 0; i < SWAP_META_PAGES; i++)
+diff --git a/sys/vm/vm_page.c b/sys/vm/vm_page.c
+index cd95cc62..8f26d798 100644
+--- a/sys/vm/vm_page.c
++++ b/sys/vm/vm_page.c
+@@ -2083,10 +2083,11 @@ vm_domain_allocate(struct vm_domain *vmd, int req, int npages)
+ 	int req_class;
+ 
+ 	/*
+-	 * The page daemon is allowed to dig deeper into the free page list.
++	 * The page daemon, and threads marked VM-privileged (TDP2_VMPRIV),
++	 * are allowed to dig deeper into the free page list.
+ 	 */
+ 	req_class = req & VM_ALLOC_CLASS_MASK;
+-	if (curproc == pageproc && req_class != VM_ALLOC_INTERRUPT)
++	if (vm_thread_privileged() && req_class != VM_ALLOC_INTERRUPT)
+ 		req_class = VM_ALLOC_SYSTEM;
+ 	return (_vm_domain_allocate(vmd, req_class, npages));
+ }
+@@ -2739,9 +2740,10 @@ vm_page_zone_import(void *arg, void **store, int cnt, int domain, int flags)
+ 
+ 	/*
+ 	 * The page daemon should avoid creating extra memory pressure since its
+-	 * main purpose is to replenish the store of free pages.
++	 * main purpose is to replenish the store of free pages.  The same holds
++	 * for VM-privileged threads, which work on its behalf.
+ 	 */
+-	if (vmd->vmd_severeset || curproc == pageproc ||
++	if (vmd->vmd_severeset || vm_thread_privileged() ||
+ 	    !_vm_domain_allocate(vmd, VM_ALLOC_NORMAL, cnt))
+ 		return (0);
+ 	domain = vmd->vmd_domain;
+@@ -3243,10 +3245,11 @@ vm_page_reclaim_contig_domain_ext(int domain, int req, u_long npages,
+ 		alignment = ptoa(minalign);
+ 
+ 	/*
+-	 * The page daemon is allowed to dig deeper into the free page list.
++	 * The page daemon, and threads marked VM-privileged (TDP2_VMPRIV),
++	 * are allowed to dig deeper into the free page list.
+ 	 */
+ 	req_class = req & VM_ALLOC_CLASS_MASK;
+-	if (curproc == pageproc && req_class != VM_ALLOC_INTERRUPT)
++	if (vm_thread_privileged() && req_class != VM_ALLOC_INTERRUPT)
+ 		req_class = VM_ALLOC_SYSTEM;
+ 
+ 	start_segind = vm_phys_lookup_segind(low);
+@@ -3484,9 +3487,10 @@ vm_wait_doms(const domainset_t *wdoms, int mflags)
+ 	 * To handle this, we only sleep for one tick in this instance.  It
+ 	 * is expected that most allocations for the pageproc will come from
+ 	 * kmem or vm_page_grab* which will use the more specific and
+-	 * race-free vm_wait_domain().
++	 * race-free vm_wait_domain().  VM-privileged threads wait the same
++	 * way, so they never queue behind ordinary allocators in vmwait.
+ 	 */
+-	if (curproc == pageproc) {
++	if (vm_thread_privileged()) {
+ 		mtx_lock(&vm_domainset_lock);
+ 		vm_pageproc_waiters++;
+ 		error = msleep(&vm_pageproc_waiters, &vm_domainset_lock,
+@@ -3525,7 +3529,11 @@ vm_wait_domain(int domain)
+ 	vmd = VM_DOMAIN(domain);
+ 	vm_domain_free_assert_unlocked(vmd);
+ 
+-	if (curproc == pageproc) {
++	/*
++	 * The page daemon and VM-privileged threads wait only while the
++	 * domain is below its pageout reserve, not behind vm_min_waiters.
++	 */
++	if (vm_thread_privileged()) {
+ 		mtx_lock(&vm_domainset_lock);
+ 		if (vmd->vmd_free_count < vmd->vmd_pageout_free_min) {
+ 			vmd->vmd_pageout_pages_needed = 1;
+diff --git a/sys/vm/vm_pageout.c b/sys/vm/vm_pageout.c
+index 418a9cff..e65d3895 100644
+--- a/sys/vm/vm_pageout.c
++++ b/sys/vm/vm_pageout.c
+@@ -2437,6 +2437,10 @@ pagedaemon_wakeup(int domain)
+ 
+ 	vmd = VM_DOMAIN(domain);
+ 	vm_domain_pageout_assert_unlocked(vmd);
++	/*
++	 * Only the page daemon skips this: a VM-privileged thread
++	 * (TDP2_VMPRIV) still has to wake it.
++	 */
+ 	if (curproc == pageproc)
+ 		return;
+ 
