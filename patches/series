@@ -75,3 +75,4 @@
 0083-NextBSD-TDP2_VMPRIV-gives-a-thread-the-page-daemon-s.patch
 0084-NextBSD-file-backed-kernel-dumper-crash-dumps-to-a-p.patch
 0085-NextBSD-g_part-allow-GEOM-kerneldump-on-a-UFS-partit.patch
+0086-NextBSD-pager-level-swap-encryption-with-an-ephemera.patch

@@ -1,0 +1,411 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 1 Nov 2026 03:14:51 -0600
+Subject: [PATCH 86/86] NextBSD: pager-level swap encryption with an ephemeral
+ AES-XTS key
+
+geli cannot encrypt a sub-range of a provider, and a swap file on UFS
+(0082) is a set of sub-ranges, so `geli onetime` does not cover it.
+Encrypt in the swap pager instead, as xnu does (vm_swap_encrypt):
+
+- When enabled, every page written to swap is AES-256-XTS ciphertext.
+  The data unit is one page and its tweak is the page's global swap
+  block number.
+- The 512-bit XTS key is drawn with arc4random_buf() when the first swap
+  device of a session is added and explicit_bzero()ed when the last one
+  is removed, which swapoff_all() does at shutdown.  It lives only in
+  kernel memory: it is never stored and never survives a reboot.
+- All swap I/O goes through swp_pager_strategy(), which now encrypts, so
+  GEOM partitions, UFS swap files and NFS swap are all covered.
+- Writes cannot encrypt in place: the pages stay resident and readable
+  while being written.  They are encrypted into bounce pages that stand
+  in for them in b_pages[] until the write completes, when the object's
+  pages are put back before the normal completion runs.  Eight bounce
+  buffers of MAX_PAGEOUT_CLUSTER pages (1 MB) are allocated once, when
+  swap is first enabled, never in the pageout path; a writer that finds
+  none free sleeps until an in-flight write returns one, as it already
+  does for a pbuf.
+- Reads decrypt in place in the completion, before the pages are made
+  valid.  The pages are exclusive busy, invalid and unmapped there.
+- The cipher is the table-driven rijndael from sys/crypto: synchronous,
+  no allocation, no locks and no FPU state, so it is safe in the
+  pagedaemon and in GEOM's completion thread.
+
+vm.swap_encrypt (tunable and sysctl, default 0) selects whether the next
+swap session encrypts.  Encryption is off by default and opt-in: set
+vm.swap_encrypt=1 in loader.conf, or with sysctl(8) while no swap is in
+use.  Data already on swap was written under the current session's
+mode, so a change applies only once no swap is in use.
+vm.swap_encrypted reports the current session.
+
+No structure layout or existing function signature changes.  A buf's
+original b_iodone, starting block and bounce buffer travel in its
+b_fsprivate1..3 between strategy and completion; pbufs do not otherwise
+use them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/vm/swap_pager.c | 280 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 280 insertions(+)
+
+diff --git a/sys/vm/swap_pager.c b/sys/vm/swap_pager.c
+index bd9a328b..28abcc8e 100644
+--- a/sys/vm/swap_pager.c
++++ b/sys/vm/swap_pager.c
+@@ -75,6 +75,7 @@
+ #include <sys/conf.h>
+ #include <sys/disk.h>
+ #include <sys/disklabel.h>
++#include <sys/endian.h>
+ #include <sys/eventhandler.h>
+ #include <sys/exterrvar.h>
+ #include <sys/fcntl.h>
+@@ -121,6 +122,8 @@
+ #include <geom/geom.h>
+ #include <geom/geom_vfs.h>
+ 
++#include <crypto/rijndael/rijndael.h>
++
+ /*
+  * MAX_PAGEOUT_CLUSTER must be a power of 2 between 1 and 64.
+  * The 64-page limit is due to the radix code (kern/subr_blist.c).
+@@ -165,6 +168,10 @@ static struct sx swdev_syscall_lock;	/* serialize swap(on|off) */
+ 
+ static int swaponfile(struct thread *td, struct vnode *vp);
+ 
++static bool swcrypt_session_prepare(uint8_t *key);
++static void swcrypt_session_start(const uint8_t *key, bool encrypt);
++static void swcrypt_session_end(void);
++
+ static __exclusive_cache_line u_long swap_reserved;
+ static u_long swap_total;
+ static int sysctl_page_shift(SYSCTL_HANDLER_ARGS);
+@@ -1081,15 +1088,280 @@ swp_pager_isondev(daddr_t blk, struct swdevt *sp)
+ 	return (blk >= sp->sw_first && blk < sp->sw_end);
+ }
+ 
++/*
++ * Pager-level swap encryption (nextbsd-kernel#224).
++ *
++ * geli cannot encrypt a sub-range of a provider, and a swap file is a set
++ * of sub-ranges, so the pager encrypts, as xnu does: when enabled, every
++ * page written to swap is AES-XTS ciphertext under a random key that
++ * exists only in kernel memory.  The key is drawn when the first swap
++ * device of a session is added and wiped when the last one is removed
++ * (swapoff_all() at shutdown included), so it never survives a reboot
++ * and is never stored.  The data unit is one page and its tweak is the
++ * page's global swap block number.
++ *
++ * Every swap I/O goes through swp_pager_strategy(), so partitions, swap
++ * files and NFS swap are all covered.  A write cannot encrypt in place:
++ * the pages stay resident and readable (only write access is revoked)
++ * while they are being written, so they are encrypted into bounce pages
++ * that stand in for them in b_pages[] until the write completes.  The
++ * bounce buffers are allocated when swap is enabled, not in the pageout
++ * path; a writer that finds none free waits for an in-flight write to
++ * complete, as it already does for a pbuf.  A read decrypts in place in
++ * the completion, before the pages are made valid.  The cipher is the
++ * table-driven rijndael from sys/crypto: synchronous, no allocation, no
++ * locks, no FPU state, so it is safe from the pageout path and in GEOM's
++ * completion thread.
++ *
++ * vm.swap_encrypt (default 0, off: encryption is opt-in) selects whether
++ * the next swap session encrypts.  It cannot change while swap is in use,
++ * since data already on swap was written under the session's mode.
++ * vm.swap_encrypted reports the current session.
++ *
++ * Between swp_pager_strategy() and the completion, a buf's original
++ * b_iodone, starting swap block and bounce buffer are kept in its
++ * b_fsprivate1..3, which pbufs do not otherwise use.
++ */
++#define	SWCRYPT_NBUF		8
++#define	SWCRYPT_KEYLEN		64	/* XTS: AES-256 data key + tweak key */
++#define	SWCRYPT_BLKLEN		16
++
++static int swap_encrypt = 0;
++SYSCTL_INT(_vm, OID_AUTO, swap_encrypt, CTLFLAG_RWTUN, &swap_encrypt, 0,
++    "Encrypt swap with an ephemeral AES-XTS key (applies when swap is "
++    "next enabled with no swap in use)");
++static bool swcrypt_on;
++SYSCTL_BOOL(_vm, OID_AUTO, swap_encrypted, CTLFLAG_RD, &swcrypt_on, 0,
++    "Swap in use is encrypted");
++
++static struct {
++	int		nr;
++	uint32_t	ek[4 * (RIJNDAEL_MAXNR + 1)];	/* data, encrypt */
++	uint32_t	dk[4 * (RIJNDAEL_MAXNR + 1)];	/* data, decrypt */
++	uint32_t	tk[4 * (RIJNDAEL_MAXNR + 1)];	/* tweak, encrypt */
++} swcrypt_key;
++
++struct swcrypt_buf {
++	TAILQ_ENTRY(swcrypt_buf) sb_link;
++	char		*sb_kva;
++	vm_page_t	sb_orig[MAX_PAGEOUT_CLUSTER];
++	vm_page_t	sb_bounce[MAX_PAGEOUT_CLUSTER];
++};
++
++static struct mtx swcrypt_mtx;
++MTX_SYSINIT(swcrypt_mtx, &swcrypt_mtx, "swap crypt bufs", MTX_DEF);
++static TAILQ_HEAD(, swcrypt_buf) swcrypt_free =
++    TAILQ_HEAD_INITIALIZER(swcrypt_free);
++static int swcrypt_nbuf;
++
++/*
++ * XTS-AES-256 over one page: in and out may be the same buffer.
++ */
++static void
++swcrypt_xts(const uint8_t *in, uint8_t *out, daddr_t blk, bool encrypt)
++{
++	uint8_t tweak[SWCRYPT_BLKLEN], block[SWCRYPT_BLKLEN];
++	uint64_t lo, hi;
++	u_int i, off;
++
++	le64enc(tweak, (uint64_t)blk);
++	le64enc(tweak + 8, 0);
++	rijndaelEncrypt(swcrypt_key.tk, swcrypt_key.nr, tweak, tweak);
++	for (off = 0; off < PAGE_SIZE; off += SWCRYPT_BLKLEN) {
++		for (i = 0; i < SWCRYPT_BLKLEN; i++)
++			block[i] = in[off + i] ^ tweak[i];
++		if (encrypt)
++			rijndaelEncrypt(swcrypt_key.ek, swcrypt_key.nr, block,
++			    block);
++		else
++			rijndaelDecrypt(swcrypt_key.dk, swcrypt_key.nr, block,
++			    block);
++		for (i = 0; i < SWCRYPT_BLKLEN; i++)
++			out[off + i] = block[i] ^ tweak[i];
++
++		/* Multiply the tweak by x in GF(2^128). */
++		lo = le64dec(tweak);
++		hi = le64dec(tweak + 8);
++		le64enc(tweak + 8, (hi << 1) | (lo >> 63));
++		le64enc(tweak, (lo << 1) ^ ((hi >> 63) != 0 ? 0x87 : 0));
++	}
++	explicit_bzero(block, sizeof(block));
++	explicit_bzero(tweak, sizeof(tweak));
++}
++
++/*
++ * Allocate the bounce buffers once, while swap is being enabled.  They
++ * are kept for the life of the system.
++ */
++static void
++swcrypt_pool_init(void)
++{
++	struct swcrypt_buf *sb;
++	int i;
++
++	for (;;) {
++		mtx_lock(&swcrypt_mtx);
++		i = swcrypt_nbuf;
++		mtx_unlock(&swcrypt_mtx);
++		if (i >= SWCRYPT_NBUF)
++			return;
++		sb = malloc(sizeof(*sb), M_VMPGDATA, M_WAITOK | M_ZERO);
++		sb->sb_kva = kmem_malloc(ptoa(MAX_PAGEOUT_CLUSTER), M_WAITOK);
++		for (i = 0; i < MAX_PAGEOUT_CLUSTER; i++)
++			sb->sb_bounce[i] = PHYS_TO_VM_PAGE(pmap_kextract(
++			    (vm_offset_t)sb->sb_kva + ptoa(i)));
++		mtx_lock(&swcrypt_mtx);
++		if (swcrypt_nbuf < SWCRYPT_NBUF) {
++			TAILQ_INSERT_TAIL(&swcrypt_free, sb, sb_link);
++			swcrypt_nbuf++;
++			sb = NULL;
++		}
++		mtx_unlock(&swcrypt_mtx);
++		if (sb != NULL) {
++			kmem_free(sb->sb_kva, ptoa(MAX_PAGEOUT_CLUSTER));
++			free(sb, M_VMPGDATA);
++		}
++	}
++}
++
++/*
++ * Before swap is added, in case this starts a new session: snapshot
++ * vm.swap_encrypt and, if set, make sure the bounce buffers exist and
++ * draw a key.  May sleep.
++ */
++static bool
++swcrypt_session_prepare(uint8_t *key)
++{
++
++	if (atomic_load_int(&swap_encrypt) == 0)
++		return (false);
++	swcrypt_pool_init();
++	arc4random_buf(key, SWCRYPT_KEYLEN);
++	return (true);
++}
++
++/*
++ * The first swap device of a session is being added (sw_dev_mtx held,
++ * nswapdev == 0): no swap I/O can be in flight, so the mode and key can
++ * change.
++ */
++static void
++swcrypt_session_start(const uint8_t *key, bool encrypt)
++{
++
++	mtx_assert(&sw_dev_mtx, MA_OWNED);
++	MPASS(nswapdev == 0);
++	swcrypt_session_end();
++	if (!encrypt)
++		return;
++	swcrypt_key.nr = rijndaelKeySetupEnc(swcrypt_key.ek, key, 256);
++	(void)rijndaelKeySetupDec(swcrypt_key.dk, key, 256);
++	(void)rijndaelKeySetupEnc(swcrypt_key.tk, key + SWCRYPT_KEYLEN / 2,
++	    256);
++	swcrypt_on = true;
++}
++
++/*
++ * The last swap device is gone (sw_dev_mtx held): wipe the key.
++ */
++static void
++swcrypt_session_end(void)
++{
++
++	mtx_assert(&sw_dev_mtx, MA_OWNED);
++	swcrypt_on = false;
++	explicit_bzero(&swcrypt_key, sizeof(swcrypt_key));
++}
++
++static void
++swcrypt_done(struct buf *bp)
++{
++	void (*iodone)(struct buf *);
++	struct swcrypt_buf *sb;
++	vm_offset_t va;
++	vm_page_t m;
++	daddr_t blk;
++	int i;
++
++	iodone = (void (*)(struct buf *))(uintptr_t)bp->b_fsprivate1;
++	blk = (daddr_t)(uintptr_t)bp->b_fsprivate2;
++	sb = bp->b_fsprivate3;
++	bp->b_fsprivate1 = bp->b_fsprivate2 = bp->b_fsprivate3 = NULL;
++
++	if (bp->b_iocmd == BIO_WRITE) {
++		/* Put the object's pages back for swp_pager_async_iodone(). */
++		for (i = 0; i < bp->b_npages; i++)
++			bp->b_pages[i] = sb->sb_orig[i];
++		mtx_lock(&swcrypt_mtx);
++		TAILQ_INSERT_HEAD(&swcrypt_free, sb, sb_link);
++		mtx_unlock(&swcrypt_mtx);
++		wakeup_one(&swcrypt_free);
++	} else if ((bp->b_ioflags & BIO_ERROR) == 0) {
++		/* The pages are exclusive busy, invalid and unmapped. */
++		for (i = 0; i < bp->b_npages; i++) {
++			m = bp->b_pages[i];
++			if (m == bogus_page)
++				continue;
++			va = pmap_quick_enter_page(m);
++			swcrypt_xts((uint8_t *)va, (uint8_t *)va, blk + i,
++			    false);
++			pmap_quick_remove_page(va);
++		}
++	}
++	bp->b_iodone = NULL;
++	iodone(bp);
++}
++
++/*
++ * Called from swp_pager_strategy() for a session that encrypts, before
++ * the buf is mapped.  A write may sleep for a bounce buffer, which only
++ * the completion of an earlier write returns.
++ */
++static void
++swcrypt_start(struct buf *bp)
++{
++	struct swcrypt_buf *sb;
++	vm_offset_t va;
++	int i;
++
++	sb = NULL;
++	if (bp->b_iocmd == BIO_WRITE) {
++		KASSERT(bp->b_npages <= MAX_PAGEOUT_CLUSTER,
++		    ("swcrypt: write of %d pages", bp->b_npages));
++		mtx_lock(&swcrypt_mtx);
++		while ((sb = TAILQ_FIRST(&swcrypt_free)) == NULL)
++			msleep(&swcrypt_free, &swcrypt_mtx, PVM, "swcrypt", 0);
++		TAILQ_REMOVE(&swcrypt_free, sb, sb_link);
++		mtx_unlock(&swcrypt_mtx);
++		for (i = 0; i < bp->b_npages; i++) {
++			sb->sb_orig[i] = bp->b_pages[i];
++			va = pmap_quick_enter_page(bp->b_pages[i]);
++			swcrypt_xts((const uint8_t *)va,
++			    (uint8_t *)sb->sb_kva + ptoa(i),
++			    bp->b_blkno + i, true);
++			pmap_quick_remove_page(va);
++			bp->b_pages[i] = sb->sb_bounce[i];
++		}
++	}
++	bp->b_fsprivate1 = (void *)(uintptr_t)bp->b_iodone;
++	bp->b_fsprivate2 = (void *)(uintptr_t)bp->b_blkno;
++	bp->b_fsprivate3 = sb;
++	bp->b_iodone = swcrypt_done;
++}
++
+ static void
+ swp_pager_strategy(struct buf *bp)
+ {
+ 	struct swdevt *sp;
++	bool crypt;
+ 
+ 	mtx_lock(&sw_dev_mtx);
+ 	TAILQ_FOREACH(sp, &swtailq, sw_list) {
+ 		if (swp_pager_isondev(bp->b_blkno, sp)) {
++			crypt = swcrypt_on;
+ 			mtx_unlock(&sw_dev_mtx);
++			if (crypt)
++				swcrypt_start(bp);
+ 			if ((sp->sw_flags & SW_UNMAPPED) != 0 &&
+ 			    unmapped_buf_allowed) {
+ 				bp->b_data = unmapped_buf;
+@@ -2831,8 +3103,10 @@ static int
+ swaponsomething(struct vnode *vp, void *id, u_long nblks,
+     sw_strategy_t *strategy, sw_close_t *close, dev_t dev, int flags)
+ {
++	uint8_t key[SWCRYPT_KEYLEN];
+ 	struct swdevt *sp, *tsp;
+ 	daddr_t dvbase;
++	bool encrypt;
+ 
+ 	/*
+ 	 * nblks is in DEV_BSIZE'd chunks, convert to PAGE_SIZE'd chunks.
+@@ -2845,6 +3119,8 @@ swaponsomething(struct vnode *vp, void *id, u_long nblks,
+ 	if (nblks == 0)
+ 		return (EXTERROR(EINVAL, "swap device too small"));
+ 
++	encrypt = swcrypt_session_prepare(key);
++
+ 	sp = malloc(sizeof *sp, M_VMPGDATA, M_WAITOK | M_ZERO);
+ 	sp->sw_blist = blist_create(nblks, M_WAITOK);
+ 	sp->sw_vp = vp;
+@@ -2877,6 +3153,8 @@ swaponsomething(struct vnode *vp, void *id, u_long nblks,
+ 	}
+ 	sp->sw_first = dvbase;
+ 	sp->sw_end = dvbase + nblks;
++	if (nswapdev == 0)
++		swcrypt_session_start(key, encrypt);
+ 	TAILQ_INSERT_TAIL(&swtailq, sp, sw_list);
+ 	nswapdev++;
+ 	swap_pager_avail += nblks - howmany(BBSIZE, PAGE_SIZE);
+@@ -2885,6 +3163,7 @@ swaponsomething(struct vnode *vp, void *id, u_long nblks,
+ 	swp_watermarks_auto();
+ 	swp_sizecheck();
+ 	mtx_unlock(&sw_dev_mtx);
++	explicit_bzero(key, sizeof(key));
+ 	EVENTHANDLER_INVOKE(swapon, sp);
+ 
+ 	return (0);
+@@ -3012,6 +3291,7 @@ swapoff_one(struct swdevt *sp, struct ucred *cred, u_int flags)
+ 	if (nswapdev == 0) {
+ 		swap_pager_full = true;
+ 		swp_set_almost_full(true);
++		swcrypt_session_end();
+ 	}
+ 	if (swdevhd == sp)
+ 		swdevhd = NULL;
+-- 
+2.54.0 (Apple Git-157)
+
