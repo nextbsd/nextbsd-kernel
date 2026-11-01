@@ -73,6 +73,17 @@
 #define	IOCAT_PROVIDER_IOVIRTIODEVICE	8
 #define	IOCAT_VMBUS_PREFIX		"vmbus:"
 
+/*
+ * nextbsd-kernel#364: disk content, as Darwin loads CoreStorage and AppleRAID.
+ * IOMedia (IOProviderClass IOMedia + "Content Mask") personalities go through
+ * the device-tree string path like ACPI ids, prefixed "media:". A GEOM
+ * provider's content is the GEOM class metadata in its last sector, by its
+ * magic ("media:GEOM::ELI", "media:GEOM::MIRROR"), or its GPT partition type
+ * GUID in Darwin's upper-case form ("media:53746F72-6167-11AA-AA11-00306543ECAC").
+ * No new record, ioctl or provider class: the kextd ABI is unchanged.
+ */
+#define	IOCAT_MEDIA_PREFIX		"media:"
+
 /* Longest FDT compatible string we will store, including NUL. */
 #define	IOCAT_COMPAT_MAX		128
 
@@ -212,6 +223,16 @@ int	iocat_lookup_word(uint32_t provider, uint32_t word, char *buf,
 	    size_t buflen, int32_t *score_out);
 int	iocat_lookup_masked(uint32_t provider, uint32_t word, char *buf,
 	    size_t buflen, int32_t *score_out);
+
+/*
+ * nextbsd-kernel#364: offer a GEOM provider's content (`metadata`, the GEOM
+ * class magic in its last sector; `parttype`, its GPT type GUID; either may be
+ * NULL) to the matcher. Called by the IOMedia GEOM class from its taste
+ * method; may sleep. A hit asks kextd to load the bundle, whose GEOM class
+ * then tastes the provider itself.
+ */
+void	iocat_media_offer(const char *provider, const char *metadata,
+	    const char *parttype);
 #endif /* _KERNEL */
 
 #endif /* _SYS_IOCATALOGUE_H_ */

@@ -389,6 +389,7 @@ enum iocat_kind {
 	IOCAT_KIND_HID,		/* match_word (product<<16|vendor) + class_word (page<<16|usage) */
 	IOCAT_KIND_VIRTIO,	/* match_word (virtio device type) */
 	IOCAT_KIND_VMBUS,	/* compat ("vmbus:<class GUID>") */
+	IOCAT_KIND_MEDIA,	/* compat, compat2 ("media:<content>", #364) */
 };
 
 struct iocat_match_work {
@@ -415,6 +416,11 @@ struct iocat_match_work {
 	 * ACPI: the namespace node. Its _HID and first _CID are read once, in
 	 * thread context, into compat/compat2 ("acpi:"-prefixed); every later
 	 * re-match compares strings and does not touch the namespace again.
+	 *
+	 * IOMedia (#364): compat is the GEOM metadata the provider carries
+	 * ("media:GEOM::ELI"), compat2 its GPT partition type ("media:<GUID>");
+	 * either may be empty. The metadata wins: it names the layer stacked on
+	 * the partition, as Darwin's content hint names CoreStorage's.
 	 */
 	void	       *acpi_handle;
 	char		compat2[IOCAT_COMPAT_MAX];
@@ -426,8 +432,16 @@ static STAILQ_HEAD(, iocat_match_work) iocat_work =
  * re-checks these when a personality is added. Both lists use iocat_work_mtx. */
 static STAILQ_HEAD(, iocat_match_work) iocat_pending =
     STAILQ_HEAD_INITIALIZER(iocat_pending);
+/*
+ * Initialised statically rather than in MOD_LOAD: the IOMedia GEOM class
+ * (iokit_media.c, #364) tastes providers from the GEOM event thread, and
+ * nothing orders that against this module's MOD_LOAD.
+ */
 static struct mtx iocat_work_mtx;
-static struct task iocat_match_task;
+MTX_SYSINIT(iocat_work_mtx, &iocat_work_mtx, "iocat_work", MTX_DEF);
+static void iocat_match_taskfn(void *, int);
+static struct task iocat_match_task =
+    TASK_INITIALIZER(0, iocat_match_taskfn, NULL);
 static eventhandler_tag iocat_nomatch_tag;
 
 /*
@@ -568,6 +582,14 @@ iocat_lookup_work(const struct iocat_match_work *w, char *buf, size_t buflen,
 			return (0);
 		return (iocat_lookup_masked(IOCAT_PROVIDER_IOUSBHOSTINTERFACE,
 		    w->class_word, buf, buflen, score_out));
+	case IOCAT_KIND_MEDIA:
+		if (w->compat[0] != '\0' &&
+		    iocat_lookup_compat(w->compat, buf, buflen, score_out) == 0)
+			return (0);
+		if (w->compat2[0] != '\0')
+			return (iocat_lookup_compat(w->compat2, buf, buflen,
+			    score_out));
+		return (ENOENT);
 	case IOCAT_KIND_ACPI:
 #ifdef DEV_ACPI
 		/* Resolved by iocat_acpi_resolve() before any lookup. */
@@ -621,6 +643,18 @@ iocat_remember_pending(struct iocat_match_work *w)
 	mtx_lock(&iocat_work_mtx);
 	STAILQ_FOREACH(p, &iocat_pending, link) {
 		if (strcmp(p->devname, w->devname) == 0) {
+			/*
+			 * A GEOM provider is re-tasted when its content may
+			 * have changed (geli init on a partition, #364): keep
+			 * the newest content, not the first seen.
+			 */
+			if (w->kind == IOCAT_KIND_MEDIA &&
+			    p->kind == IOCAT_KIND_MEDIA) {
+				strlcpy(p->compat, w->compat,
+				    sizeof(p->compat));
+				strlcpy(p->compat2, w->compat2,
+				    sizeof(p->compat2));
+			}
 			mtx_unlock(&iocat_work_mtx);
 			free(w, M_IOCAT);
 			return;
@@ -1291,6 +1325,44 @@ queue:
 	taskqueue_enqueue(taskqueue_thread, &iocat_match_task);
 }
 
+/*
+ * An IOMedia (#364): a GEOM provider, as the IOMedia GEOM class tasted it
+ * (iokit_media.c). `metadata` is the GEOM class magic in its last sector
+ * ("GEOM::ELI"), `parttype` its GPT partition type GUID in Darwin's form; either
+ * may be NULL or empty. Matched against "media:"-prefixed personality strings
+ * (IOProviderClass IOMedia + Content Mask, as CoreStorage and AppleRAID match
+ * on Darwin) on the taskqueue, like a device_nomatch capture, so a provider
+ * seen before kextd pushed is re-matched when it does.
+ */
+void
+iocat_media_offer(const char *provider, const char *metadata,
+    const char *parttype)
+{
+	struct iocat_match_work *w;
+
+	if ((metadata == NULL || *metadata == '\0') &&
+	    (parttype == NULL || *parttype == '\0'))
+		return;
+	w = malloc(sizeof(*w), M_IOCAT, M_WAITOK | M_ZERO);
+	w->kind = IOCAT_KIND_MEDIA;
+	strlcpy(w->devname, provider, sizeof(w->devname));
+	if (metadata != NULL && *metadata != '\0')
+		snprintf(w->compat, sizeof(w->compat), "%s%s",
+		    IOCAT_MEDIA_PREFIX, metadata);
+	if (parttype != NULL && *parttype != '\0')
+		snprintf(w->compat2, sizeof(w->compat2), "%s%s",
+		    IOCAT_MEDIA_PREFIX, parttype);
+	if (bootverbose)
+		printf("iokit: IOMedia %s: content %s%s%s\n", w->devname,
+		    w->compat[0] != '\0' ? w->compat : "",
+		    w->compat[0] != '\0' && w->compat2[0] != '\0' ? " " : "",
+		    w->compat2);
+	mtx_lock(&iocat_work_mtx);
+	STAILQ_INSERT_TAIL(&iocat_work, w, link);
+	mtx_unlock(&iocat_work_mtx);
+	taskqueue_enqueue(taskqueue_thread, &iocat_match_task);
+}
+
 /* ---- /dev/iocatalogue: ioctl ingestion from userland (kextd) ---- */
 
 static d_ioctl_t iocat_ioctl;
@@ -1396,16 +1468,12 @@ iocat_modevent(module_t mod __unused, int type, void *data __unused)
 
 	switch (type) {
 	case MOD_LOAD:
-		mtx_init(&iocat_work_mtx, "iocat_work", NULL, MTX_DEF);
-		TASK_INIT(&iocat_match_task, 0, iocat_match_taskfn, NULL);
 		TIMEOUT_TASK_INIT(taskqueue_thread, &iocat_present_task, 0,
 		    iocat_present_taskfn, NULL);
 		iocat_dev = make_dev(&iocat_cdevsw, 0, UID_ROOT, GID_WHEEL,
 		    0600, "iocatalogue");
-		if (iocat_dev == NULL) {
-			mtx_destroy(&iocat_work_mtx);
+		if (iocat_dev == NULL)
 			return (ENXIO);
-		}
 		/* Registered before SI_SUB_CONFIGURE, so it sees boot nomatches. */
 		iocat_nomatch_tag = EVENTHANDLER_REGISTER(device_nomatch,
 		    iocat_device_nomatch, NULL, EVENTHANDLER_PRI_ANY);
@@ -1425,7 +1493,6 @@ iocat_modevent(module_t mod __unused, int type, void *data __unused)
 			STAILQ_REMOVE_HEAD(&iocat_pending, link);
 			free(w, M_IOCAT);
 		}
-		mtx_destroy(&iocat_work_mtx);
 		iocat_flush();
 		return (0);
 	default:
