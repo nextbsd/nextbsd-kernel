@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 1 Nov 2026 00:00:00 -0500
+Subject: [PATCH] NextBSD: dwmmc: poll the controller while dumping
+
+dwmmc_request() starts a command and returns, relying on the controller
+interrupt to finish it. At panic time the scheduler is stopped and the
+interrupt is never delivered, so an mmcsd dump on a dwmmc host hangs.
+Mirror sdhci_generic_request(): when dumping, call dwmmc_intr() directly
+and spin until the request is done. Also skip the bus_busy wait in
+dwmmc_acquire_host() while dumping, since msleep() returns at once with
+the scheduler stopped and the bus owner can no longer run.
+
+No struct or header changes (nextbsd-kernel#226).
+---
+ sys/dev/mmc/host/dwmmc.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/sys/dev/mmc/host/dwmmc.c b/sys/dev/mmc/host/dwmmc.c
+index a422d86d6..b56374d71 100644
+--- a/sys/dev/mmc/host/dwmmc.c
++++ b/sys/dev/mmc/host/dwmmc.c
+@@ -1255,6 +1255,19 @@ dwmmc_request(device_t brdev, device_t reqdev, struct mmc_request *req)
+ 	dwmmc_next_operation(sc);
+ 	DWMMC_UNLOCK(sc);
+ 
++	/*
++	 * While dumping, the scheduler is stopped and interrupts are not
++	 * delivered, so the request would never complete and the mmcsd
++	 * dump routine would wait forever. Poll the controller instead,
++	 * the same way sdhci does, until the request has been finished.
++	 */
++	if (dumping) {
++		while (sc->req != NULL) {
++			dwmmc_intr(sc);
++			DELAY(10);
++		}
++	}
++
+ 	return (0);
+ }
+ 
+@@ -1275,7 +1288,11 @@ dwmmc_acquire_host(device_t brdev, device_t reqdev)
+ 	sc = device_get_softc(brdev);
+ 
+ 	DWMMC_LOCK(sc);
+-	while (sc->bus_busy)
++	/*
++	 * msleep() returns at once when the scheduler is stopped, so do not
++	 * wait for a bus owner that can no longer run while dumping.
++	 */
++	while (sc->bus_busy && !dumping)
+ 		msleep(sc, &sc->sc_mtx, PZERO, "dwmmcah", hz / 5);
+ 	sc->bus_busy++;
+ 	DWMMC_UNLOCK(sc);
+-- 
+2.50.0
+
