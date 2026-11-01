@@ -23,7 +23,8 @@
  *                 threshold, as it sets maximum_pages_free in xnu.
  *
  * A zero hi_water or low_water leaves that threshold alone. Both are swap
- * pager state, so a macx_triggers() also changes the vm.nswap_* sysctls.
+ * pager state, so a macx_triggers() also changes the vm.nswap_* sysctls,
+ * and setting them stops their default scaling with the configured swap.
  *
  * As in xnu each registration is one-shot: the port is consumed by the
  * alert it receives and the caller re-arms with another macx_triggers().
