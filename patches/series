@@ -68,3 +68,4 @@
 0075-NextBSD-gone_in-compares-against-the-releng-15.1-maj.patch
 0076-namei-preserve-ABI-root-for-absolute-symlinks.patch
 0077-namei-retry-absolute-symlink-expansions-from-native-root.patch
+0078-NextBSD-Linuxulator-let-pread64-work-on-memfd-and-sh.patch
