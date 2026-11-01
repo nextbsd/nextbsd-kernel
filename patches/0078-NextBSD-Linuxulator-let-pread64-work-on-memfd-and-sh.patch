@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 1 Nov 2026 00:26:32 -0600
+Subject: [PATCH] NextBSD: Linuxulator: let pread64 work on memfd and shm
+ descriptors
+
+linux_pread() did the read with kern_pread() and only then called
+fgetvp() on the descriptor to return EISDIR for a directory. fgetvp()
+returns EINVAL for any file without a vnode (kern_descrip.c
+_fgetvp()), so pread64 on a memfd, which is a DTYPE_SHM file with
+f_vnode == NULL, copied the data into the caller's buffer and then
+failed with EINVAL. A glibc loader reading a library from a memfd
+fails with "cannot read file data: Invalid argument".
+
+Do the directory check before the read, and only for files that have
+a vnode. Non-seekable files (pipes, sockets, FIFOs) still get ESPIPE
+from kern_preadv(), as on Linux.
+
+Fixes: nextbsd/nextbsd#512
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linux/linux_file.c | 30 ++++++++++++++++++------------
+ 1 file changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/sys/compat/linux/linux_file.c b/sys/compat/linux/linux_file.c
+index 84ef3461e..d39fc9c71 100644
+--- a/sys/compat/linux/linux_file.c
++++ b/sys/compat/linux/linux_file.c
+@@ -1025,7 +1025,7 @@ linux_sync_file_range(struct thread *td, struct linux_sync_file_range_args *uap)
+ int
+ linux_pread(struct thread *td, struct linux_pread_args *uap)
+ {
+-	struct vnode *vp;
++	struct file *fp;
+ 	off_t offset;
+ 	int error;
+ 
+@@ -1035,17 +1035,23 @@ linux_pread(struct thread *td, struct linux_pread_args *uap)
+ 	offset = uap->offset;
+ #endif
+ 
+-	error = kern_pread(td, uap->fd, uap->buf, uap->nbyte, offset);
+-	if (error == 0) {
+-		/* This seems to violate POSIX but Linux does it. */
+-		error = fgetvp(td, uap->fd, &cap_pread_rights, &vp);
+-		if (error != 0)
+-			return (error);
+-		if (vp->v_type == VDIR)
+-			error = EISDIR;
+-		vrele(vp);
+-	}
+-	return (error);
++	/*
++	 * Linux fails pread(2) on a directory with EISDIR, which can differ
++	 * from our behaviour when reading directories is allowed.  Check
++	 * before the read, and only for descriptors backed by a vnode:
++	 * memfd and other shm descriptors have no vnode, are seekable and
++	 * must be preadable as on Linux.
++	 */
++	error = fget(td, uap->fd, &cap_pread_rights, &fp);
++	if (error != 0)
++		return (error);
++	if (fp->f_vnode != NULL && fp->f_vnode->v_type == VDIR)
++		error = EISDIR;
++	fdrop(fp, td);
++	if (error != 0)
++		return (error);
++
++	return (kern_pread(td, uap->fd, uap->buf, uap->nbyte, offset));
+ }
+ 
+ int

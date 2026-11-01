@@ -136,15 +136,7 @@ sys_macx_swapoff(struct thread *td, struct macx_swapoff_args *uap)
 	return (ENOSYS);
 }
 
-int
-sys_macx_triggers(struct thread *td, struct macx_triggers_args *uap)
-{
-
-	MDPRINTF(("sys_mach_macx_triggers(%d, %d, %d, 0x%x);\n",
-	    uap->hi_water, uap->low_water, uap->flags,
-			 uap->alert_port));
-	return (ENOSYS);
-}
+/* sys_macx_triggers is in mach_swap_triggers.c (nextbsd-kernel#218). */
 
 
 int

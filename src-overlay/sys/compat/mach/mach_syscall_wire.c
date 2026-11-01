@@ -60,6 +60,7 @@ struct task_for_pid_args;
 struct task_name_for_pid_args;
 struct task_set_importance_watchports_np_args;
 struct task_importance_assertion_np_args;
+struct macx_triggers_args;
 
 SYSCTL_DECL(_mach);
 static SYSCTL_NODE(_mach, OID_AUTO, syscall, CTLFLAG_RW, 0,
@@ -100,6 +101,7 @@ int sys_task_set_importance_watchports_np(struct thread *,
     struct task_set_importance_watchports_np_args *);
 int sys_task_importance_assertion_np(struct thread *,
     struct task_importance_assertion_np_args *);
+int sys_macx_triggers(struct thread *, struct macx_triggers_args *);
 
 /*
  * Phase C2: lazy Mach init. If the calling process/thread has no
@@ -366,6 +368,24 @@ sys_task_set_importance_watchports_np_guarded(struct thread *td,
 	return (sys_task_set_importance_watchports_np(td, uap));
 }
 
+/*
+ * macx_triggers (nextbsd-kernel#218) — registers a receive right in the
+ * caller's space for default_pager_space_alert. Returns xnu's values
+ * (0/EINVAL/EPERM) in td_retval; on no-Mach-state there is no space to take
+ * the right from, so EINVAL, what xnu returns for a bad alert_port.
+ */
+static int
+sys_macx_triggers_guarded(struct thread *td, struct macx_triggers_args *uap)
+{
+	if (td->td_proc->p_machdata == NULL)
+		mach_task_init_lazy(td->td_proc);
+	if (td->td_proc->p_machdata == NULL) {
+		td->td_retval[0] = 22;	/* EINVAL */
+		return (0);
+	}
+	return (sys_macx_triggers(td, uap));
+}
+
 static struct sysent mach_reply_port_sysent = {
 	.sy_narg	= 0,
 	.sy_call	= (sy_call_t *)sys_mach_reply_port_guarded,
@@ -520,6 +540,14 @@ static struct sysent task_importance_assertion_np_sysent = {
 	.sy_flags	= 0,
 };
 
+/* macx_triggers sysent. 4 args: (hi_water, low_water, flags, alert_port). */
+static struct sysent macx_triggers_sysent = {
+	.sy_narg	= 4,
+	.sy_call	= (sy_call_t *)sys_macx_triggers_guarded,
+	.sy_auevent	= AUE_NULL,
+	.sy_flags	= 0,
+};
+
 static int mach_reply_port_offset = NO_SYSCALL;
 static struct sysent mach_reply_port_old_sysent;
 
@@ -567,6 +595,9 @@ static struct sysent task_name_for_pid_old_sysent;
 
 static int task_importance_assertion_np_offset = NO_SYSCALL;
 static struct sysent task_importance_assertion_np_old_sysent;
+
+static int macx_triggers_offset = NO_SYSCALL;
+static struct sysent macx_triggers_old_sysent;
 
 SYSCTL_INT(_mach_syscall, OID_AUTO, mach_reply_port, CTLFLAG_RD,
     &mach_reply_port_offset, 0,
@@ -662,6 +693,11 @@ SYSCTL_INT(_mach_syscall, OID_AUTO, task_importance_assertion_np,
     "Dynamically-allocated FreeBSD syscall number for "
     "task_importance_assertion_np (1-arg syscall; -1 if registration "
     "failed)");
+
+SYSCTL_INT(_mach_syscall, OID_AUTO, macx_triggers, CTLFLAG_RD,
+    &macx_triggers_offset, 0,
+    "Dynamically-allocated FreeBSD syscall number for macx_triggers "
+    "(4-arg syscall; -1 if registration failed)");
 
 static void
 wire_one(const char *name, int *offset, struct sysent *sy,
@@ -771,12 +807,16 @@ mach_syscall_wire_register(void *arg __unused)
 	    &task_importance_assertion_np_offset,
 	    &task_importance_assertion_np_sysent,
 	    &task_importance_assertion_np_old_sysent);
+	wire_one("macx_triggers", &macx_triggers_offset,
+	    &macx_triggers_sysent, &macx_triggers_old_sysent);
 }
 
 static void
 mach_syscall_wire_deregister(void *arg __unused)
 {
 
+	unwire_one("macx_triggers", &macx_triggers_offset,
+	    &macx_triggers_old_sysent);
 	unwire_one("task_importance_assertion_np",
 	    &task_importance_assertion_np_offset,
 	    &task_importance_assertion_np_old_sysent);

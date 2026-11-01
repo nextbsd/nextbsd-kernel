@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 1 Nov 2026 01:49:58 -0500
+Subject: [PATCH 81/82] NextBSD: VIRF_SWAP refuses write, truncate, unlink and
+ rename of a pinned swap file
+
+Once a swap (or dump) file is pinned, the kernel holds the physical
+addresses of its blocks and writes them directly, outside the
+filesystem. Its blocks must never move, be freed, or receive a dirty
+buffer through the buffer cache.
+
+Add VIRF_SWAP to v_irflag, the analogue of xnu's VSWAP and Linux's
+S_SWAPFILE, and VN_IS_SWAP(). With it set:
+
+- ffs_write() returns ETXTBSY;
+- ffs_truncate() of the data (IO_NORMAL) and ufs_setattr(va_size)
+  return ETXTBSY, so ftruncate(2) and open(O_TRUNC) fail;
+- ufs_remove() returns ETXTBSY, and so does ufs_rename() when the
+  pinned file is either the source or the target;
+- vop_stdallocate() and vop_stddeallocate(), which UFS uses for
+  posix_fallocate(2) and fspacectl(2), return ETXTBSY.
+
+Reads, stat and chmod/chown still work. Nothing sets the flag yet: the
+extent-map swap pager sets it at swapon and clears it at swapoff.
+
+The flag lives in v_irflag rather than v_vflag because all sixteen
+v_vflag bits are taken; v_irflag has free bits, is readable without
+the vnode lock (vn_irflag_read), and adding a bit changes no structure
+layout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/kern/vfs_default.c  | 4 ++++
+ sys/kern/vfs_subr.c     | 5 ++++-
+ sys/sys/vnode.h         | 6 ++++++
+ sys/ufs/ffs/ffs_inode.c | 3 +++
+ sys/ufs/ffs/ffs_vnops.c | 6 ++++++
+ sys/ufs/ufs/ufs_vnops.c | 9 +++++++++
+ 6 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/sys/kern/vfs_default.c b/sys/kern/vfs_default.c
+index 76f63b187..b74cb456a 100644
+--- a/sys/kern/vfs_default.c
++++ b/sys/kern/vfs_default.c
+@@ -828,6 +828,8 @@ vop_stdallocate(struct vop_allocate_args *ap)
+ 	size_t iosize;
+ 	int error;
+ 
++	if (VN_IS_SWAP(ap->a_vp))
++		return (ETXTBSY);
+ 	buf = NULL;
+ 	error = 0;
+ 	td = curthread;
+@@ -1009,6 +1011,8 @@ vop_stddeallocate(struct vop_deallocate_args *ap)
+ 	off_t noff, xfersize, rem;
+ 
+ 	vp = ap->a_vp;
++	if (VN_IS_SWAP(vp))
++		return (ETXTBSY);
+ 	offset = *ap->a_offset;
+ 	cred = ap->a_cred;
+ 
+diff --git a/sys/kern/vfs_subr.c b/sys/kern/vfs_subr.c
+index 5248f7fad..65ffe4487 100644
+--- a/sys/kern/vfs_subr.c
++++ b/sys/kern/vfs_subr.c
+@@ -4597,7 +4597,10 @@ vn_printf(struct vnode *vp, const char *fmt, ...)
+ 		strlcat(buf, "|VIRF_MOUNTPOINT", sizeof(buf));
+ 	if (irflag & VIRF_TEXT_REF)
+ 		strlcat(buf, "|VIRF_TEXT_REF", sizeof(buf));
+-	flags = irflag & ~(VIRF_DOOMED | VIRF_PGREAD | VIRF_MOUNTPOINT | VIRF_TEXT_REF);
++	if (irflag & VIRF_SWAP)
++		strlcat(buf, "|VIRF_SWAP", sizeof(buf));
++	flags = irflag & ~(VIRF_DOOMED | VIRF_PGREAD | VIRF_MOUNTPOINT | VIRF_TEXT_REF |
++	    VIRF_SWAP);
+ 	if (flags != 0) {
+ 		snprintf(buf2, sizeof(buf2), "|VIRF(0x%lx)", flags);
+ 		strlcat(buf, buf2, sizeof(buf));
+diff --git a/sys/sys/vnode.h b/sys/sys/vnode.h
+index e48c4db95..fc6e7a4c0 100644
+--- a/sys/sys/vnode.h
++++ b/sys/sys/vnode.h
+@@ -260,6 +260,11 @@ _Static_assert(sizeof(struct vnode) <= 448, "vnode size crosses 448 bytes");
+ #define	VIRF_INOTIFY	0x0080	/* This vnode is being watched */
+ #define	VIRF_INOTIFY_PARENT 0x0100 /* A parent of this vnode may be being
+ 				      watched */
++#define	VIRF_SWAP	0x0200	/* Pinned swap or dump file: the kernel
++				   holds its physical block addresses, so
++				   write, truncate, unlink, rename and
++				   (de)allocate refuse with ETXTBSY
++				   (xnu VSWAP, Linux S_SWAPFILE) */
+ 
+ #define	VI_UNUSED0	0x0001	/* unused */
+ #define	VI_MOUNT	0x0002	/* Mount in progress */
+@@ -1113,6 +1118,7 @@ do {									\
+ #endif
+ 
+ #define	VN_IS_DOOMED(vp)	__predict_false((vn_irflag_read(vp) & VIRF_DOOMED) != 0)
++#define	VN_IS_SWAP(vp)		__predict_false((vn_irflag_read(vp) & VIRF_SWAP) != 0)
+ 
+ void	vput(struct vnode *vp);
+ void	vrele(struct vnode *vp);
+diff --git a/sys/ufs/ffs/ffs_inode.c b/sys/ufs/ffs/ffs_inode.c
+index f47cfd08f..6263ca49f 100644
+--- a/sys/ufs/ffs/ffs_inode.c
++++ b/sys/ufs/ffs/ffs_inode.c
+@@ -274,6 +274,9 @@ ffs_truncate(struct vnode *vp,
+ 	 */
+ 	if ((flags & (IO_EXT | IO_NORMAL)) == 0)
+ 		flags |= IO_NORMAL;
++	/* The blocks of a pinned swap or dump file must not move. */
++	if ((flags & IO_NORMAL) != 0 && VN_IS_SWAP(vp))
++		return (ETXTBSY);
+ 	if (!DOINGSOFTDEP(vp) && !DOINGASYNC(vp))
+ 		flags |= IO_SYNC;
+ 	waitforupdate = (flags & IO_SYNC) != 0 || !DOINGASYNC(vp);
+diff --git a/sys/ufs/ffs/ffs_vnops.c b/sys/ufs/ffs/ffs_vnops.c
+index c7e2b3f4b..4a27346c7 100644
+--- a/sys/ufs/ffs/ffs_vnops.c
++++ b/sys/ufs/ffs/ffs_vnops.c
+@@ -847,6 +847,12 @@ ffs_write(
+ 	int blkoffset, error, flags, ioflag, size, xfersize;
+ 
+ 	vp = ap->a_vp;
++	/*
++	 * A pinned swap or dump file is written only through its
++	 * extent map, never through the buffer cache.
++	 */
++	if (VN_IS_SWAP(vp))
++		return (ETXTBSY);
+ 	if (DOINGSUJ(vp))
+ 		softdep_prealloc(vp, MNT_WAIT);
+ 	if (vp->v_data == NULL)
+diff --git a/sys/ufs/ufs/ufs_vnops.c b/sys/ufs/ufs/ufs_vnops.c
+index 4abbd4ee8..c010d5aef 100644
+--- a/sys/ufs/ufs/ufs_vnops.c
++++ b/sys/ufs/ufs/ufs_vnops.c
+@@ -741,6 +741,8 @@ ufs_setattr(
+ 				return (EROFS);
+ 			if (IS_SNAPSHOT(ip))
+ 				return (EPERM);
++			if (VN_IS_SWAP(vp))
++				return (ETXTBSY);
+ 			break;
+ 		default:
+ 			/*
+@@ -1040,6 +1042,8 @@ ufs_remove(
+ 	if ((ip->i_flags & (NOUNLINK | IMMUTABLE | APPEND)) ||
+ 	    (VTOI(dvp)->i_flags & APPEND))
+ 		return (EPERM);
++	if (VN_IS_SWAP(vp))
++		return (ETXTBSY);
+ 	if (DOINGSUJ(dvp)) {
+ 		error = softdep_prelink(dvp, vp, ap->a_cnp);
+ 		if (error != 0) {
+@@ -1398,6 +1402,11 @@ ufs_rename(
+ 		error = EEXIST;
+ 		goto unlockout;
+ 	}
++	/* Neither move nor replace a pinned swap or dump file. */
++	if (VN_IS_SWAP(fvp) || (tvp != NULL && VN_IS_SWAP(tvp))) {
++		error = ETXTBSY;
++		goto unlockout;
++	}
+ 
+ 	if (DOINGSUJ(fdvp) &&
+ 	    (seqc_in_modify(fdvp_s) || !vn_seqc_consistent(fdvp, fdvp_s) ||
+-- 
+2.54.0 (Apple Git-157)
+
