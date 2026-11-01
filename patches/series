@@ -70,3 +70,4 @@
 0077-namei-retry-absolute-symlink-expansions-from-native-root.patch
 0078-NextBSD-Linuxulator-let-pread64-work-on-memfd-and-sh.patch
 0080-NextBSD-add-a-swap_lowspace-eventhandler-and-vm.nswa.patch
+0081-NextBSD-VIRF_SWAP-refuses-write-truncate-unlink-and-.patch
