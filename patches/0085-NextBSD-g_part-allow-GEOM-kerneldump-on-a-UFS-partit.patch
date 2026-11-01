@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 1 Nov 2026 03:05:09 -0600
+Subject: [PATCH 85/85] NextBSD: g_part: allow GEOM::kerneldump on a UFS
+ partition for the file dumper
+
+g_part answers GEOM::kerneldump only on a partition whose scheme says it
+can take dumps (G_PART_DUMPTO: swap and dump types) or when the request
+comes from a nested scheme. The file-backed kernel dumper asks for the
+dump routine under a UFS filesystem through the filesystem's own g_vfs
+consumer, so on a partitioned disk it was refused with ENODEV.
+
+Also allow the request on a freebsd-ufs partition when it was issued by
+a g_vfs ("VFS" class) consumer, either directly or through pass-through
+geoms such as labels, which clone the request (the root of the bio's
+parent chain is checked). The dumper writes only the blocks of its
+pinned file, so the rest of the filesystem is never touched. Every other
+request keeps the swap-type check and its "not suitable for kernel
+dumps" message.
+
+UFS only. A ZFS dump path would need the same for freebsd-zfs and is
+left for a follow-up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/geom/part/g_part.c | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/sys/geom/part/g_part.c b/sys/geom/part/g_part.c
+index 88e44b33..487adc22 100644
+--- a/sys/geom/part/g_part.c
++++ b/sys/geom/part/g_part.c
+@@ -2217,6 +2217,31 @@ g_part_spoiled(struct g_consumer *cp)
+ 	g_part_wither(cp->geom, ENXIO);
+ }
+ 
++/*
++ * NextBSD: the file-backed kernel dumper (kern_dumpfile.c) asks a
++ * filesystem's own g_vfs consumer for GEOM::kerneldump, to find the disk
++ * dump routine under a pinned dump file.  It writes only that file's
++ * blocks, so allow the request on a UFS partition when it was issued by a
++ * filesystem consumer, whether directly or through pass-through geoms such
++ * as labels above the partition.  Only UFS for now; ZFS has no file
++ * dumper yet.
++ */
++static bool
++g_part_filedump_ok(struct bio *bp, struct g_part_table *table,
++    struct g_part_entry *entry)
++{
++	struct bio *root;
++	char buf[64];
++
++	for (root = bp; root->bio_parent != NULL; root = root->bio_parent)
++		;
++	if (root->bio_from == NULL ||
++	    strcmp(root->bio_from->geom->class->name, "VFS") != 0)
++		return (false);
++	return (strcmp(G_PART_TYPE(table, entry, buf, sizeof(buf)),
++	    g_part_alias_name(G_PART_ALIAS_FREEBSD_UFS)) == 0);
++}
++
+ static void
+ g_part_start(struct bio *bp)
+ {
+@@ -2298,11 +2323,13 @@ g_part_start(struct bio *bp)
+ 			 * Check that the partition is suitable for kernel
+ 			 * dumps. Typically only swap partitions should be
+ 			 * used. If the request comes from the nested scheme
+-			 * we allow dumping there as well.
++			 * we allow dumping there as well, and on a UFS
++			 * partition for the NextBSD file dumper.
+ 			 */
+ 			if ((bp->bio_from == NULL ||
+ 			    bp->bio_from->geom->class != &g_part_class) &&
+-			    G_PART_DUMPTO(table, entry) == 0) {
++			    G_PART_DUMPTO(table, entry) == 0 &&
++			    !g_part_filedump_ok(bp, table, entry)) {
+ 				g_io_deliver(bp, ENODEV);
+ 				printf("GEOM_PART: Partition '%s' not suitable"
+ 				    " for kernel dumps (wrong type?)\n",
+-- 
+2.54.0 (Apple Git-157)
+

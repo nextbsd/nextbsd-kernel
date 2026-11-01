@@ -1,0 +1,1330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 1 Nov 2026 03:05:09 -0600
+Subject: [PATCH 84/85] NextBSD: file-backed kernel dumper: crash dumps to a
+ pinned UFS file
+
+Crash dumps need a swap or dump partition today. Let dumpon(8) name a
+preallocated regular file on UFS, such as /private/var/vm/kernelcore,
+and write the dump through the file's physical extent map at panic
+time, as xnu's kern_open_file_for_direct_io() does.
+
+- The pinning and extent-map code of the swap-file backend is
+  generalized into vn_extmap_pin(), vn_extmap_unpin() and
+  vn_extmap_lookup() (swap_pager.c, declared in swap_pager.h), and the
+  swap-file backend now uses them. Pinning is unchanged: VOP_FSYNC,
+  vinvalbuf, a hole-free VOP_BMAP walk, then VIRF_SWAP, so the file
+  cannot be written, truncated, unlinked or renamed. A file is pinned
+  by swap or by the dumper, never both.
+- New kern/kern_dumpfile.c. DIOCSKERNELDUMP on an open regular file
+  (vn_ioctl) pins it and asks the filesystem's own g_vfs consumer for
+  GEOM::kerneldump, which returns the disk's polled dump routine with
+  the partition offset added. The registered dumperinfo has
+  mediaoffset 0, mediasize the file's whole pages, a 4096-byte block
+  (what savecore(8) uses for a regular file) and the leaf's maximum
+  I/O size. No struct dumperinfo change is needed: netdump already
+  registers a dumper that ignores media offsets.
+- dumpfile_write() maps each write through the extent table, splits
+  it at extent boundaries and calls the leaf at leaf.mediaoffset plus
+  the physical offset. It takes no locks and allocates nothing. The
+  final (NULL, 0, 0) flush goes to the leaf as is. EKCD encryption and
+  gzip/zstd compression sit above dump_write() and need no change.
+- The dumper is named by the file's absolute path, so "dumpon -l"
+  prints a name savecore(8) and "dumpon -r" accept. A file can back
+  several dumper configurations and stays pinned while any of them is
+  registered. dumper_destroy() tells kern_dumpfile.c when a copy goes
+  away ("dumpon -r", "dumpon off", a failed insert), and a task unpins
+  the file after the last one.
+- dounmount() removes the dumpers of files on the mount and unpins
+  them before VFS_UNMOUNT, so the dumper never outlives the mount.
+  Unlike a swap file, a dump file does not hold the mount.
+
+On a partitioned disk the GEOM::kerneldump request needs the next
+patch, which lets g_part answer it on a freebsd-ufs partition; without
+it dumpon fails there with ENODEV and nothing else changes.
+
+Only UFS. ZFS needs its own dump path and is left for a follow-up.
+No structure layout or existing function signature changes; the new
+interfaces are additions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/conf/files           |   1 +
+ sys/kern/kern_dumpfile.c | 507 +++++++++++++++++++++++++++++++++++++++
+ sys/kern/kern_shutdown.c |   2 +
+ sys/kern/vfs_mount.c     |   6 +-
+ sys/kern/vfs_vnops.c     |   6 +
+ sys/sys/conf.h           |  10 +
+ sys/vm/swap_pager.c      | 374 ++++++++++++++++-------------
+ sys/vm/swap_pager.h      |  29 +++
+ 8 files changed, 772 insertions(+), 163 deletions(-)
+ create mode 100644 sys/kern/kern_dumpfile.c
+
+diff --git a/sys/conf/files b/sys/conf/files
+index 895f27ca..1223800f 100644
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -3838,6 +3838,7 @@ kern/kern_descrip.c		standard
+ kern/kern_devctl.c		standard
+ kern/kern_dtrace.c		optional kdtrace_hooks
+ kern/kern_dump.c		standard
++kern/kern_dumpfile.c		standard
+ kern/kern_environment.c		standard
+ kern/kern_et.c			standard
+ kern/kern_event.c		standard
+diff --git a/sys/kern/kern_dumpfile.c b/sys/kern/kern_dumpfile.c
+new file mode 100644
+index 00000000..097f3606
+--- /dev/null
++++ b/sys/kern/kern_dumpfile.c
+@@ -0,0 +1,507 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The NextBSD Project
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * File-backed kernel dumper (NextBSD).
++ *
++ * Crash dumps go to a preallocated regular file, such as
++ * /private/var/vm/kernelcore, instead of a swap or dump partition.  The
++ * design follows xnu's kern_open_file_for_direct_io(): the file is pinned
++ * and its blocks are resolved once, while the system is healthy, into a
++ * table of physical extents on the disk under the filesystem.  At panic
++ * time the dump is written through that table by the disk's own polled
++ * dump routine, with the filesystem, the buffer cache and GEOM's threads
++ * all off the path.
++ *
++ * Pinning is the swap-file machinery's (vn_extmap_pin(), swap_pager.c):
++ * the file is synced and invalidated, must have no holes, and carries
++ * VIRF_SWAP, so the filesystem refuses to write, truncate, unlink or
++ * rename it until it is unpinned.
++ *
++ * The disk's dump routine comes from GEOM::kerneldump, asked of the
++ * filesystem's own g_vfs consumer: it returns the leaf dumperinfo with
++ * the partition's offset already added, as it does for dumpon(8) on a
++ * partition.  g_part allows that request on a UFS partition when it comes
++ * from a filesystem's consumer.
++ *
++ * The registered dumper is an ordinary dumperinfo: mediaoffset 0,
++ * mediasize the file's whole pages, a 4096-byte block (savecore(8) reads a
++ * regular file in 4096-byte sectors) and the leaf's maximum I/O size.
++ * dumpfile_write() maps each write through the extent table, splitting it
++ * at extent boundaries, and hands the pieces to the leaf at
++ * leaf.mediaoffset + physical offset.  The final (NULL, 0, 0) flush goes
++ * to the leaf as is.  EKCD encryption and gzip/zstd compression sit above
++ * dump_write() and need nothing here.
++ *
++ * dumpon(8) reaches dumpfile_ioctl() with DIOCSKERNELDUMP on the open file
++ * (vn_ioctl()).  The dumper is named by the file's absolute path, so
++ * "dumpon -l" prints a name that savecore(8) and "dumpon -r" accept.  A
++ * file may back several dumper configurations (say, with and without
++ * compression); it stays pinned while any of them is registered.  When the
++ * last one is removed -- "dumpon -r", "dumpon off", or a failed insert --
++ * dumper_destroy() calls dumpfile_dumper_destroyed() and a task unpins
++ * the file.  dounmount() calls dumpfile_unmount(), which removes the
++ * dumpers of files on that mount and unpins them before the filesystem
++ * goes away.
++ *
++ * Only UFS is supported, like the swap-file backend.  ZFS needs its own
++ * dump path and is not handled here.
++ */
++
++/*
++ * The messages come from the same pinned-file machinery as swap files',
++ * so they share the swap category rather than adding one that libc's
++ * table does not know.
++ */
++#define	EXTERR_CATEGORY		EXTERR_CAT_SWAP
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/exterrvar.h>
++#include <sys/fcntl.h>
++#include <sys/kerneldump.h>
++#include <sys/kernel.h>
++#include <sys/limits.h>
++#include <sys/lock.h>
++#include <sys/malloc.h>
++#include <sys/mount.h>
++#include <sys/mutex.h>
++#include <sys/priv.h>
++#include <sys/proc.h>
++#include <sys/queue.h>
++#include <sys/sx.h>
++#include <sys/taskqueue.h>
++#include <sys/vnode.h>
++
++#include <vm/vm.h>
++#include <vm/vm_param.h>
++#include <vm/swap_pager.h>
++
++#include <geom/geom.h>
++
++/* savecore(8) reads a dump file in sectors of this size. */
++#define	DUMPFILE_BLKSZ		4096
++CTASSERT(PAGE_SIZE % DUMPFILE_BLKSZ == 0);
++
++static MALLOC_DEFINE(M_DUMPFILE, "dumpfile", "File-backed kernel dumper");
++
++struct dumpfile {
++	LIST_ENTRY(dumpfile) df_link;	/* dumpfiles, while listed */
++	struct vn_extmap df_map;
++	struct task	df_task;	/* unpins and frees, at refs 0 */
++	u_int		df_refs;	/* dumper configs, under dumpfile_mtx */
++	bool		df_listed;	/* under dumpfile_sx */
++	volatile bool	df_pinned;	/* under dumpfile_sx; read at dump */
++
++	/* The leaf dump routine GEOM::kerneldump returned. */
++	dumper_t	*df_dumper;
++	void		*df_priv;
++	u_int		df_blocksize;
++	u_int		df_maxiosize;
++	off_t		df_mediaoffset;
++	off_t		df_mediasize;
++
++	char		*df_name;	/* absolute path; the dumper's name */
++};
++
++static LIST_HEAD(, dumpfile) dumpfiles = LIST_HEAD_INITIALIZER(dumpfiles);
++static struct sx dumpfile_sx;
++static struct mtx dumpfile_mtx;
++SX_SYSINIT(dumpfile_sx, &dumpfile_sx, "dumpfile");
++MTX_SYSINIT(dumpfile_mtx, &dumpfile_mtx, "dumpfile refs", MTX_DEF);
++
++static dumper_t dumpfile_write;
++static task_fn_t dumpfile_task;
++
++/*
++ * The dumper.  Runs at panic time with the scheduler stopped: no locks,
++ * no allocation, only arithmetic and the leaf's polled dump routine.
++ * dump_write() has already checked that the write is block-aligned and
++ * inside [0, mediasize).
++ */
++static int
++dumpfile_write(void *priv, void *virtual, off_t offset, size_t length)
++{
++	struct dumpfile *df;
++	const struct vn_extent *ve;
++	vm_pindex_t lpage;
++	off_t end;
++	size_t n;
++	int error;
++
++	df = priv;
++	if (!df->df_pinned)
++		return (ENXIO);
++	if (length == 0)
++		return (df->df_dumper(df->df_priv, virtual, offset, 0));
++
++	while (length > 0) {
++		lpage = atop(offset);
++		if (offset < 0 || lpage >= df->df_map.em_npages)
++			return (ENOSPC);
++		ve = vn_extmap_lookup(&df->df_map, lpage);
++		end = ptoa(ve->ve_lpage + ve->ve_npages);
++		n = MIN(length, (size_t)(end - offset));
++		error = df->df_dumper(df->df_priv, virtual,
++		    df->df_mediaoffset + ve->ve_poff +
++		    (offset - ptoa(ve->ve_lpage)), n);
++		if (error != 0)
++			return (error);
++		offset += n;
++		length -= n;
++		if (virtual != NULL)
++			virtual = (char *)virtual + n;
++	}
++	return (0);
++}
++
++static struct dumpfile *
++dumpfile_lookup(struct vnode *vp)
++{
++	struct dumpfile *df;
++
++	sx_assert(&dumpfile_sx, SA_LOCKED);
++	LIST_FOREACH(df, &dumpfiles, df_link) {
++		if (df->df_map.em_vp == vp)
++			return (df);
++	}
++	return (NULL);
++}
++
++/*
++ * Ask GEOM for the dump routine of the disk under the filesystem and check
++ * that every extent of the file can be written through it.
++ */
++static int
++dumpfile_leaf(struct dumpfile *df)
++{
++	struct g_kerneldump kd;
++	const struct vn_extent *ve;
++	u_int i;
++	int error, len;
++
++	len = sizeof(kd);
++	memset(&kd, 0, len);
++	kd.offset = 0;
++	kd.length = OFF_MAX;
++	error = g_io_getattr("GEOM::kerneldump", df->df_map.em_cp, &len, &kd);
++	if (error != 0)
++		return (EXTERROR(error,
++		    "the disk under this file cannot take kernel dumps"));
++	if (kd.di.dumper == NULL || kd.di.dumper_start != NULL ||
++	    kd.di.dumper_hdr != NULL)
++		return (EXTERROR(EOPNOTSUPP,
++		    "the disk under this file has an unsupported dump routine"));
++	if (kd.di.blocksize == 0 || DUMPFILE_BLKSZ % kd.di.blocksize != 0 ||
++	    kd.di.mediaoffset % kd.di.blocksize != 0)
++		return (EXTERROR(EINVAL,
++		    "the dump block size is not a multiple of the disk's"));
++	if (kd.di.maxiosize < DUMPFILE_BLKSZ)
++		return (EXTERROR(EINVAL, "the disk's dump I/O size is too small"));
++	for (i = 0; i < df->df_map.em_next; i++) {
++		ve = &df->df_map.em_ext[i];
++		if (ve->ve_poff + (off_t)ptoa(ve->ve_npages) >
++		    kd.di.mediasize)
++			return (EXTERROR(EINVAL,
++			    "file extent outside the dump device"));
++	}
++	df->df_dumper = kd.di.dumper;
++	df->df_priv = kd.di.priv;
++	df->df_blocksize = kd.di.blocksize;
++	df->df_maxiosize = rounddown(kd.di.maxiosize, DUMPFILE_BLKSZ);
++	df->df_mediaoffset = kd.di.mediaoffset;
++	df->df_mediasize = kd.di.mediasize;
++	return (0);
++}
++
++/*
++ * Pin vp for dumping and list it.  Called with dumpfile_sx held and the
++ * mount busied; vp is unlocked.
++ */
++static int
++dumpfile_create(struct thread *td, struct vnode *vp, struct dumpfile **dfp)
++{
++	struct dumpfile *df;
++	char *fullpath, *freepath;
++	int error;
++
++	sx_assert(&dumpfile_sx, SA_XLOCKED);
++	freepath = NULL;
++	error = vn_fullpath_global(vp, &fullpath, &freepath);
++	if (error != 0)
++		return (EXTERROR(error, "cannot resolve the file's path"));
++
++	df = malloc(sizeof(*df), M_DUMPFILE, M_WAITOK | M_ZERO);
++	df->df_name = strdup(fullpath, M_DUMPFILE);
++	free(freepath, M_TEMP);
++	TASK_INIT(&df->df_task, 0, dumpfile_task, df);
++
++	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
++	error = vn_extmap_pin(td, vp, &df->df_map);
++	if (error != 0) {
++		VOP_UNLOCK(vp);
++		goto fail;
++	}
++	error = dumpfile_leaf(df);
++	if (error != 0) {
++		vn_extmap_unpin(td, &df->df_map);
++		VOP_UNLOCK(vp);
++		goto fail;
++	}
++	VOP_UNLOCK(vp);
++
++	/* The pin keeps its own reference; dumpon(8)'s fd goes away. */
++	vref(vp);
++	df->df_pinned = true;
++	df->df_listed = true;
++	LIST_INSERT_HEAD(&dumpfiles, df, df_link);
++	*dfp = df;
++	return (0);
++fail:
++	free(df->df_name, M_DUMPFILE);
++	free(df, M_DUMPFILE);
++	return (error);
++}
++
++/* Unpin and unlist df.  dumpfile_sx is held exclusively. */
++static void
++dumpfile_unpin(struct thread *td, struct dumpfile *df)
++{
++	struct vnode *vp;
++
++	sx_assert(&dumpfile_sx, SA_XLOCKED);
++	if (df->df_listed) {
++		LIST_REMOVE(df, df_link);
++		df->df_listed = false;
++	}
++	if (!df->df_pinned)
++		return;
++	df->df_pinned = false;
++	vp = df->df_map.em_vp;
++	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
++	vn_extmap_unpin(td, &df->df_map);
++	vput(vp);
++}
++
++/*
++ * The last dumper configuration of df is gone: unpin the file and free df,
++ * unless a new configuration took it again first.
++ */
++static void
++dumpfile_task(void *arg, int pending __unused)
++{
++	struct dumpfile *df;
++	u_int refs;
++
++	df = arg;
++	sx_xlock(&dumpfile_sx);
++	mtx_lock(&dumpfile_mtx);
++	refs = df->df_refs;
++	mtx_unlock(&dumpfile_mtx);
++	if (refs != 0) {
++		sx_xunlock(&dumpfile_sx);
++		return;
++	}
++	dumpfile_unpin(curthread, df);
++	sx_xunlock(&dumpfile_sx);
++
++	/*
++	 * Unlisted with no references, df can be queued no more, but a
++	 * second enqueue may have landed while this one ran.
++	 */
++	taskqueue_cancel(taskqueue_thread, &df->df_task, NULL);
++	free(df->df_name, M_DUMPFILE);
++	free(df, M_DUMPFILE);
++}
++
++/*
++ * Called by dumper_destroy() for every dumperinfo it frees, under the
++ * dumper list mutex.  Each copy of a file dumper holds one reference on
++ * its dumpfile; the last one queues the unpin.
++ */
++void
++dumpfile_dumper_destroyed(struct dumperinfo *di)
++{
++	struct dumpfile *df;
++
++	if (di->dumper != dumpfile_write)
++		return;
++	df = di->priv;
++	mtx_lock(&dumpfile_mtx);
++	KASSERT(df->df_refs > 0, ("dumpfile %p: no references", df));
++	if (--df->df_refs == 0)
++		taskqueue_enqueue(taskqueue_thread, &df->df_task);
++	mtx_unlock(&dumpfile_mtx);
++}
++
++static int
++dumpfile_insert(struct thread *td, struct vnode *vp,
++    struct diocskerneldump_arg *kda)
++{
++	struct dumperinfo di;
++	struct dumpfile *df;
++	struct mount *mp;
++	int error;
++
++	if (!vn_extmap_supported(vp))
++		return (EXTERROR(EOPNOTSUPP,
++		    "kernel dumps to a file need a file on UFS"));
++	vn_lock(vp, LK_SHARED | LK_RETRY);
++	error = VOP_ACCESS(vp, VREAD | VWRITE, td->td_ucred, td);
++	VOP_UNLOCK(vp);
++	if (error != 0)
++		return (error);
++
++	/*
++	 * Keep the filesystem mounted until the dumper is registered and
++	 * listed: an unmount waits for this, then finds it in
++	 * dumpfile_unmount().
++	 */
++	mp = vp->v_mount;
++	if (mp == NULL || vfs_busy(mp, MBF_NOWAIT) != 0)
++		return (EBUSY);
++	sx_xlock(&dumpfile_sx);
++	df = dumpfile_lookup(vp);
++	if (df == NULL) {
++		error = dumpfile_create(td, vp, &df);
++		if (error != 0)
++			goto out;
++	}
++
++	mtx_lock(&dumpfile_mtx);
++	df->df_refs++;
++	mtx_unlock(&dumpfile_mtx);
++
++	bzero(&di, sizeof(di));
++	di.dumper = dumpfile_write;
++	di.priv = df;
++	di.blocksize = DUMPFILE_BLKSZ;
++	di.maxiosize = df->df_maxiosize;
++	di.mediaoffset = 0;
++	di.mediasize = ptoa(df->df_map.em_npages);
++
++	/*
++	 * Every copy dumper_insert() makes holds the reference just taken.
++	 * If it fails after making one, dumper_destroy() has already
++	 * dropped it, and a file pinned for this call alone is unpinned by
++	 * the task.  The privilege check that dumper_insert() makes before
++	 * copying was passed in dumpfile_ioctl().
++	 */
++	error = dumper_insert(&di, df->df_name, kda);
++	if (error == 0)
++		printf("kernel dumps on %s\n", df->df_name);
++out:
++	sx_xunlock(&dumpfile_sx);
++	vfs_unbusy(mp);
++	return (error);
++}
++
++/*
++ * DIOCSKERNELDUMP on an open regular file, from vn_ioctl().
++ */
++int
++dumpfile_ioctl(struct vnode *vp, struct diocskerneldump_arg *kda,
++    struct thread *td)
++{
++	struct dumpfile *df;
++	uint8_t *encryptedkey;
++	int error;
++
++	error = priv_check(td, PRIV_SETDUMPER);
++	if (error != 0)
++		goto out;
++
++	switch (kda->kda_index) {
++	case KDA_REMOVE_ALL:
++		error = dumper_remove(NULL, kda);
++		goto out;
++	case KDA_REMOVE:
++	case KDA_REMOVE_DEV:
++		/* Held across dumper_remove(): the task may free df. */
++		sx_xlock(&dumpfile_sx);
++		df = dumpfile_lookup(vp);
++		if (df == NULL)
++			error = kda->kda_index == KDA_REMOVE ? ENOENT : 0;
++		else
++			error = dumper_remove(df->df_name, kda);
++		sx_xunlock(&dumpfile_sx);
++		goto out;
++	}
++
++	encryptedkey = NULL;
++	if (kda->kda_encryption != KERNELDUMP_ENC_NONE) {
++		if (kda->kda_encryptedkeysize == 0 ||
++		    kda->kda_encryptedkeysize > KERNELDUMP_ENCKEY_MAX_SIZE) {
++			error = EINVAL;
++			goto out;
++		}
++		encryptedkey = malloc(kda->kda_encryptedkeysize, M_TEMP,
++		    M_WAITOK);
++		error = copyin(kda->kda_encryptedkey, encryptedkey,
++		    kda->kda_encryptedkeysize);
++	}
++	if (error == 0) {
++		kda->kda_encryptedkey = encryptedkey;
++		error = dumpfile_insert(td, vp, kda);
++	}
++	zfree(encryptedkey, M_TEMP);
++out:
++	explicit_bzero(kda, sizeof(*kda));
++	return (error);
++}
++
++/*
++ * dounmount(): remove the dumpers of files on mp and unpin them before the
++ * filesystem goes away.  Fails, and so fails the unmount, only if the
++ * caller may not change the dump configuration.
++ */
++int
++dumpfile_unmount(struct mount *mp)
++{
++	struct diocskerneldump_arg kda;
++	struct dumpfile *df, *tdf;
++	int error;
++
++	error = 0;
++	sx_xlock(&dumpfile_sx);
++	LIST_FOREACH_SAFE(df, &dumpfiles, df_link, tdf) {
++		if (df->df_map.em_mp != mp)
++			continue;
++		bzero(&kda, sizeof(kda));
++		kda.kda_index = KDA_REMOVE_DEV;
++		error = dumper_remove(df->df_name, &kda);
++		if (error != 0)
++			break;
++		printf("kernel dumps on %s removed at unmount\n",
++		    df->df_name);
++		/* The task frees df once it sees it unlisted. */
++		dumpfile_unpin(curthread, df);
++	}
++	sx_xunlock(&dumpfile_sx);
++	return (error != 0 ? EBUSY : 0);
++}
+diff --git a/sys/kern/kern_shutdown.c b/sys/kern/kern_shutdown.c
+index 38a98010..89500436 100644
+--- a/sys/kern/kern_shutdown.c
++++ b/sys/kern/kern_shutdown.c
+@@ -1229,6 +1229,8 @@ dumper_destroy(struct dumperinfo *di)
+ 	if (di == NULL)
+ 		return;
+ 
++	/* A file dumper's copy holds a reference on its pinned file. */
++	dumpfile_dumper_destroyed(di);
+ 	zfree(di->blockbuf, M_DUMPER);
+ 	kerneldumpcomp_destroy(di);
+ #ifdef EKCD
+diff --git a/sys/kern/vfs_mount.c b/sys/kern/vfs_mount.c
+index 1b28b49f..7606cc3f 100644
+--- a/sys/kern/vfs_mount.c
++++ b/sys/kern/vfs_mount.c
+@@ -2382,11 +2382,13 @@ dounmount(struct mount *mp, uint64_t flags, struct thread *td)
+ 	/*
+ 	 * A swap file in use pins the device consumer the swap pager writes
+ 	 * through; not even a forced unmount may take it away.  Checked after
+-	 * the drain above, which waits out a swapon in progress.
++	 * the drain above, which waits out a swapon in progress.  A kernel
++	 * dump file does not hold the mount: its dumpers are removed and the
++	 * file unpinned before the filesystem goes.
+ 	 */
+ 	if (swap_pager_mount_busy(mp))
+ 		error = EBUSY;
+-	else
++	else if ((error = dumpfile_unmount(mp)) == 0)
+ 		error = VFS_UNMOUNT(mp, flags);
+ 	vn_finished_write(mp);
+ 	vfs_rel(mp);
+diff --git a/sys/kern/vfs_vnops.c b/sys/kern/vfs_vnops.c
+index 393353d8..9f0e7864 100644
+--- a/sys/kern/vfs_vnops.c
++++ b/sys/kern/vfs_vnops.c
+@@ -46,6 +46,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/buf.h>
++#include <sys/conf.h>
+ #include <sys/disk.h>
+ #include <sys/dirent.h>
+ #include <sys/fail.h>
+@@ -1884,6 +1885,11 @@ vn_ioctl(struct file *fp, u_long com, void *data, struct ucred *active_cred,
+ 		case FIONBIO:
+ 		case FIOASYNC:
+ 			return (0);
++		case DIOCSKERNELDUMP:
++			/* NextBSD: dumpon(8) on a regular file. */
++			if (vp->v_type == VREG)
++				return (dumpfile_ioctl(vp, data, td));
++			/* FALLTHROUGH */
+ 		default:
+ 			return (VOP_IOCTL(vp, com, data, fp->f_flag,
+ 			    active_cred, td));
+diff --git a/sys/sys/conf.h b/sys/sys/conf.h
+index a830c9d4..cebc14ae 100644
+--- a/sys/sys/conf.h
++++ b/sys/sys/conf.h
+@@ -387,6 +387,16 @@ int dumper_insert(const struct dumperinfo *di_template, const char *devname,
+     const struct diocskerneldump_arg *kda);
+ int dumper_remove(const char *devname, const struct diocskerneldump_arg *kda);
+ 
++/*
++ * File-backed kernel dumper (NextBSD, kern/kern_dumpfile.c): dumpon(8) on
++ * a regular file, and the hooks that unpin the file when its dumper goes.
++ */
++struct mount;
++int dumpfile_ioctl(struct vnode *vp, struct diocskerneldump_arg *kda,
++    struct thread *td);
++int dumpfile_unmount(struct mount *mp);
++void dumpfile_dumper_destroyed(struct dumperinfo *di);
++
+ /* For ddb(4)-time use only. */
+ void dumper_ddb_insert(struct dumperinfo *);
+ void dumper_ddb_remove(struct dumperinfo *);
+diff --git a/sys/vm/swap_pager.c b/sys/vm/swap_pager.c
+index b3ec7eb9..062918b8 100644
+--- a/sys/vm/swap_pager.c
++++ b/sys/vm/swap_pager.c
+@@ -163,7 +163,6 @@ static int nswapdev;		/* Number of swap devices */
+ int swap_pager_avail;
+ static struct sx swdev_syscall_lock;	/* serialize swap(on|off) */
+ 
+-static bool swapfile_fs_supported(struct vnode *vp);
+ static int swaponfile(struct thread *td, struct vnode *vp);
+ 
+ static __exclusive_cache_line u_long swap_reserved;
+@@ -2785,7 +2784,7 @@ sys_swapon(struct thread *td, struct swapon_args *uap)
+ 		 * way that nfs_mountroot() sets up diskless swapping.
+ 		 */
+ 		error = swaponvp(td, vp, attr.va_size / DEV_BSIZE);
+-	} else if (swapfile_fs_supported(vp)) {
++	} else if (vn_extmap_supported(vp)) {
+ 		/*
+ 		 * A local regular file: pin it and swap through its
+ 		 * physical extent map.  Other filesystems keep ENOTBLK.
+@@ -3534,51 +3533,46 @@ swaponvp(struct thread *td, struct vnode *vp, u_long nblks)
+ }
+ 
+ /*
+- * Extent-map backend (NextBSD)
++ * Pinned-file extent maps (NextBSD)
+  *
+- * Swapping onto a regular file on a local filesystem that maps its blocks
+- * with VOP_BMAP (UFS), without md(4) and without the filesystem on the
+- * I/O path.
+- *
+- * At swapon the file is pinned: flushed with VOP_FSYNC(MNT_WAIT), so no
++ * A regular file on a local filesystem that maps its blocks with
++ * VOP_BMAP (UFS) can be pinned: flushed with VOP_FSYNC(MNT_WAIT), so no
+  * soft-updates dependency is left pending on it, and invalidated with
+  * vinvalbuf(), which drops its cached buffers and pages.  Its blocks are
+- * then resolved once into a table of physical extents, and VIRF_SWAP is
+- * set, which makes the filesystem refuse to write, truncate, unlink or
+- * rename it.  From then on swapfile_strategy() translates each swap block
+- * through the table and sends bios straight to the GEOM consumer the
+- * filesystem mounted its device with, as swapgeom_strategy() does for a
+- * partition: no vnode lock, no buffer cache, no allocation that can sleep
+- * on a write.  The md(4) path, whose kthread enters VOP_WRITE and can
+- * sleep in vm_wait() behind the pagedaemon it is meant to serve, is not
+- * used.
++ * then resolved once into a table of physical extents on the provider
++ * below the mount, and VIRF_SWAP is set, which makes the filesystem
++ * refuse to write, truncate, unlink or rename it.  The kernel can then
++ * write the file's blocks itself, with the filesystem off the I/O path.
++ *
++ * Two clients use it: the swap-file backend below, and the file-backed
++ * kernel dumper (kern_dumpfile.c), which writes a crash dump through the
++ * map at panic time.  A file is pinned by at most one of them at a time.
+  *
+  * Bypass writes are invisible to soft updates and to UFS snapshot
+  * copy-on-write, both of which hook buffer-cache writes in
+  * ffs_geom_strategy().  Nothing is pending on a synced file, and a
+- * snapshot's image of the swap file only ever holds swap contents, which
+- * nothing reading a snapshot interprets.
++ * snapshot's image of a pinned file only ever holds swap or dump
++ * contents, which nothing reading a snapshot interprets.
++ *
++ * The extent map is never cached: it is rebuilt at every pin.  Only UFS
++ * is accepted.  Other local filesystems, ZFS among them, are refused.
+  *
+- * The extent map is never cached: it is rebuilt at every swapon.  The
+- * mount cannot be unmounted, even forcibly, or downgraded to read-only
+- * while one of its files is in use for swap (swap_pager_mount_busy()).
++ * Swap files swap through their pinned extent map, without md(4).
++ * swapfile_strategy() translates each swap block through the
++ * table and sends bios straight to the GEOM consumer the filesystem
++ * mounted its device with, as swapgeom_strategy() does for a partition:
++ * no vnode lock, no buffer cache, no allocation that can sleep on a
++ * write.  The md(4) path, whose kthread enters VOP_WRITE and can sleep
++ * in vm_wait() behind the pagedaemon it is meant to serve, is not used.
+  *
+- * Only UFS is accepted.  Other local filesystems, ZFS among them, keep
+- * failing with ENOTBLK as before, so swapon(8) can fall back to md(4).
++ * The mount cannot be unmounted, even forcibly, or downgraded to
++ * read-only while one of its files is in use for swap
++ * (swap_pager_mount_busy()).  Filesystems other than UFS keep failing
++ * with ENOTBLK as before, so swapon(8) can fall back to md(4).
+  */
+ 
+-struct swapfile_extent {
+-	vm_pindex_t	se_lpage;	/* first page within the file */
+-	vm_pindex_t	se_npages;	/* length in pages */
+-	off_t		se_poff;	/* byte offset on the provider */
+-};
+-
+ struct swapfile {
+-	struct vnode	*sf_vp;
+-	struct mount	*sf_mp;
+-	struct g_consumer *sf_cp;	/* the filesystem's g_vfs consumer */
+-	struct swapfile_extent *sf_ext;
+-	u_int		sf_next;
++	struct vn_extmap sf_map;
+ 	u_int		sf_inflight;	/* bufs in flight, under sw_dev_mtx */
+ };
+ 
+@@ -3589,8 +3583,8 @@ static sw_close_t swapfile_close;
+  * Filesystems whose VOP_BMAP returns a full, hole-free physical block map
+  * and whose write paths honour VIRF_SWAP.
+  */
+-static bool
+-swapfile_fs_supported(struct vnode *vp)
++bool
++vn_extmap_supported(struct vnode *vp)
+ {
+ 
+ 	return (vp->v_type == VREG && vp->v_mount != NULL &&
+@@ -3615,7 +3609,7 @@ swap_pager_mount_busy(struct mount *mp)
+ 		if (sp->sw_strategy != swapfile_strategy)
+ 			continue;
+ 		sf = sp->sw_id;
+-		if (sf != NULL && sf->sf_mp == mp) {
++		if (sf != NULL && sf->sf_map.em_mp == mp) {
+ 			busy = true;
+ 			break;
+ 		}
+@@ -3625,33 +3619,33 @@ swap_pager_mount_busy(struct mount *mp)
+ }
+ 
+ static int
+-swapfile_ext_append(struct swapfile *sf, u_int *cap, vm_pindex_t lpage,
++vn_extmap_append(struct vn_extmap *em, u_int *cap, vm_pindex_t lpage,
+     vm_pindex_t npages, off_t poff)
+ {
+-	struct swapfile_extent *se, *nse;
++	struct vn_extent *ve, *nve;
+ 
+-	if (sf->sf_next > 0) {
+-		se = &sf->sf_ext[sf->sf_next - 1];
+-		if (se->se_lpage + se->se_npages == lpage &&
+-		    se->se_poff + (off_t)ptoa(se->se_npages) == poff) {
+-			se->se_npages += npages;
++	if (em->em_next > 0) {
++		ve = &em->em_ext[em->em_next - 1];
++		if (ve->ve_lpage + ve->ve_npages == lpage &&
++		    ve->ve_poff + (off_t)ptoa(ve->ve_npages) == poff) {
++			ve->ve_npages += npages;
+ 			return (0);
+ 		}
+ 	}
+-	if (sf->sf_next == *cap) {
++	if (em->em_next == *cap) {
+ 		if (*cap >= UINT_MAX / 2)
+-			return (EXTERROR(EFBIG, "swap file too fragmented"));
+-		nse = mallocarray(*cap * 2, sizeof(*nse), M_VMPGDATA,
++			return (EXTERROR(EFBIG, "pinned file too fragmented"));
++		nve = mallocarray(*cap * 2, sizeof(*nve), M_VMPGDATA,
+ 		    M_WAITOK);
+-		memcpy(nse, sf->sf_ext, sf->sf_next * sizeof(*nse));
+-		free(sf->sf_ext, M_VMPGDATA);
+-		sf->sf_ext = nse;
++		memcpy(nve, em->em_ext, em->em_next * sizeof(*nve));
++		free(em->em_ext, M_VMPGDATA);
++		em->em_ext = nve;
+ 		*cap *= 2;
+ 	}
+-	se = &sf->sf_ext[sf->sf_next++];
+-	se->se_lpage = lpage;
+-	se->se_npages = npages;
+-	se->se_poff = poff;
++	ve = &em->em_ext[em->em_next++];
++	ve->ve_lpage = lpage;
++	ve->ve_npages = npages;
++	ve->ve_poff = poff;
+ 	return (0);
+ }
+ 
+@@ -3660,12 +3654,12 @@ swapfile_ext_append(struct swapfile *sf, u_int *cap, vm_pindex_t lpage,
+  * provider under the filesystem.  Holes are refused.
+  */
+ static int
+-swapfile_map(struct vnode *vp, vm_pindex_t npages, struct swapfile *sf)
++vn_extmap_build(struct vnode *vp, vm_pindex_t npages, struct vn_extmap *em)
+ {
+ 	struct bufobj *bo, *bo0;
+ 	struct g_consumer *cp;
+ 	struct g_provider *pp;
+-	struct swapfile_extent *se;
++	struct vn_extent *ve;
+ 	daddr_t bn, lbn, nlbn;
+ 	vm_pindex_t lpage, n, pgs_per_blk;
+ 	u_int cap, i;
+@@ -3680,9 +3674,9 @@ swapfile_map(struct vnode *vp, vm_pindex_t npages, struct swapfile *sf)
+ 	nlbn = howmany(npages, pgs_per_blk);
+ 
+ 	cap = 16;
+-	sf->sf_ext = mallocarray(cap, sizeof(*sf->sf_ext), M_VMPGDATA,
++	em->em_ext = mallocarray(cap, sizeof(*em->em_ext), M_VMPGDATA,
+ 	    M_WAITOK);
+-	sf->sf_next = 0;
++	em->em_next = 0;
+ 	bo0 = NULL;
+ 	error = 0;
+ 	for (lbn = 0; lbn < nlbn; lbn += run + 1) {
+@@ -3693,13 +3687,13 @@ swapfile_map(struct vnode *vp, vm_pindex_t npages, struct swapfile *sf)
+ 			break;
+ 		if (bn == -1) {
+ 			error = EXTERROR(EINVAL,
+-			    "swap file has holes; preallocate it");
++			    "file has holes; preallocate it");
+ 			break;
+ 		}
+ 		if (bo == NULL || bo->bo_ops != g_vfs_bufops ||
+ 		    (bo0 != NULL && bo != bo0)) {
+ 			error = EXTERROR(EINVAL,
+-			    "swap file blocks are not on a GEOM provider");
++			    "file blocks are not on a GEOM provider");
+ 			break;
+ 		}
+ 		bo0 = bo;
+@@ -3709,13 +3703,13 @@ swapfile_map(struct vnode *vp, vm_pindex_t npages, struct swapfile *sf)
+ 			run = nlbn - lbn - 1;
+ 		lpage = lbn * pgs_per_blk;
+ 		n = MIN((vm_pindex_t)(run + 1) * pgs_per_blk, npages - lpage);
+-		error = swapfile_ext_append(sf, &cap, lpage, n,
++		error = vn_extmap_append(em, &cap, lpage, n,
+ 		    (off_t)bn * DEV_BSIZE);
+ 		if (error != 0)
+ 			break;
+ 	}
+-	if (error == 0 && sf->sf_next == 0)
+-		error = EXTERROR(EINVAL, "swap file is empty");
++	if (error == 0 && em->em_next == 0)
++		error = EXTERROR(EINVAL, "file is empty");
+ 	if (error != 0)
+ 		goto fail;
+ 
+@@ -3733,89 +3727,58 @@ swapfile_map(struct vnode *vp, vm_pindex_t npages, struct swapfile *sf)
+ 		    "device sector size does not divide the page size");
+ 		goto fail;
+ 	}
+-	for (i = 0; i < sf->sf_next; i++) {
+-		se = &sf->sf_ext[i];
+-		if (se->se_poff < 0 || se->se_poff % pp->sectorsize != 0 ||
+-		    se->se_poff + (off_t)ptoa(se->se_npages) > pp->mediasize) {
++	for (i = 0; i < em->em_next; i++) {
++		ve = &em->em_ext[i];
++		if (ve->ve_poff < 0 || ve->ve_poff % pp->sectorsize != 0 ||
++		    ve->ve_poff + (off_t)ptoa(ve->ve_npages) > pp->mediasize) {
+ 			g_topology_unlock();
+ 			error = EXTERROR(EINVAL,
+-			    "swap file extent outside the device");
++			    "file extent outside the device");
+ 			goto fail;
+ 		}
+ 	}
+ 	g_topology_unlock();
+-	sf->sf_cp = cp;
++	em->em_cp = cp;
++	em->em_npages = npages;
+ 	return (0);
+ fail:
+-	free(sf->sf_ext, M_VMPGDATA);
+-	sf->sf_ext = NULL;
+-	sf->sf_next = 0;
++	free(em->em_ext, M_VMPGDATA);
++	em->em_ext = NULL;
++	em->em_next = 0;
+ 	return (error);
+ }
+ 
+ /*
+- * Pin vp and register it as a swap device.  vp is locked exclusively on
+- * entry and on return; the reference namei() took becomes the swap
+- * device's on success.
++ * Pin vp and build its extent map over every whole page of the file.
++ *
++ * vp is a regular file on a filesystem vn_extmap_supported() accepts,
++ * locked exclusively on entry and on return (the lock is dropped around
++ * vn_start_write()).  The caller holds vfs_busy() on vp's mount until it
++ * has published the pin where its unmount check can see it.  On success
++ * the file is open FREAD | FWRITE, VIRF_SWAP is set and em is filled in;
++ * no vnode reference is taken.
+  */
+-static int
+-swaponfile(struct thread *td, struct vnode *vp)
++int
++vn_extmap_pin(struct thread *td, struct vnode *vp, struct vn_extmap *em)
+ {
+ 	struct vattr va;
+ 	struct mount *mp, *wmp;
+-	struct swapfile *sf;
+-	struct swdevt *sp;
+ 	vm_pindex_t npages;
+-	int error, flags;
+-	bool busied, opened, writing;
++	int error;
++	bool writing;
+ 
+ 	ASSERT_VOP_ELOCKED(vp, __func__);
+ 	mp = vp->v_mount;
+-	sf = NULL;
+-	busied = opened = writing = false;
++	writing = false;
++	bzero(em, sizeof(*em));
+ 
+-	mtx_lock(&sw_dev_mtx);
+-	TAILQ_FOREACH(sp, &swtailq, sw_list) {
+-		if (sp->sw_vp == vp) {
+-			mtx_unlock(&sw_dev_mtx);
+-			return (EBUSY);
+-		}
+-	}
+-	mtx_unlock(&sw_dev_mtx);
+ 	if (VN_IS_SWAP(vp))
+ 		return (EBUSY);
+ 	if ((mp->mnt_flag & MNT_RDONLY) != 0)
+ 		return (EROFS);
+-
+-	error = VOP_GETATTR(vp, &va, td->td_ucred);
+-	if (error != 0)
+-		return (error);
+-	if ((va.va_flags & SF_SNAPSHOT) != 0)
+-		return (EXTERROR(EINVAL, "cannot swap on a snapshot file"));
+-	npages = va.va_size / PAGE_SIZE;
+-	if (npages <= howmany(BBSIZE, PAGE_SIZE) || npages > INT_MAX)
+-		return (EXTERROR(EINVAL, "swap file size out of range"));
+-
+-#ifdef MAC
+-	error = mac_system_check_swapon(td->td_ucred, vp);
+-	if (error != 0)
+-		return (error);
+-#endif
+ 	error = VOP_OPEN(vp, FREAD | FWRITE, td->td_ucred, td, NULL);
+ 	if (error != 0)
+ 		return (error);
+-	opened = true;
+-
+-	/*
+-	 * Keep the filesystem mounted while it is pinned: a concurrent
+-	 * unmount waits for this reference, then finds the swap device in
+-	 * swap_pager_mount_busy().
+-	 */
+-	if (vfs_busy(mp, MBF_NOWAIT) != 0) {
+-		error = EBUSY;
+-		goto out;
+-	}
+-	busied = true;
+ 
+ 	/* fsync(2)'s order: vn_start_write() before the vnode lock. */
+ 	VOP_UNLOCK(vp);
+@@ -3834,10 +3797,24 @@ swaponfile(struct thread *td, struct vnode *vp)
+ 		goto out;
+ 	}
+ 
++	/* The size is read under the lock that VIRF_SWAP is set under. */
++	error = VOP_GETATTR(vp, &va, td->td_ucred);
++	if (error != 0)
++		goto out;
++	if ((va.va_flags & SF_SNAPSHOT) != 0) {
++		error = EXTERROR(EINVAL, "cannot pin a snapshot file");
++		goto out;
++	}
++	npages = va.va_size / PAGE_SIZE;
++	if (npages == 0) {
++		error = EXTERROR(EINVAL, "file is smaller than a page");
++		goto out;
++	}
++
+ 	/*
+ 	 * Leave nothing dirty or pending (soft updates included), then drop
+ 	 * every cached buffer and page so no stale copy can be written back
+-	 * over a block the swap pager owns.
++	 * over a block the kernel now owns.
+ 	 */
+ 	error = VOP_FSYNC(vp, MNT_WAIT, td);
+ 	if (error == 0)
+@@ -3845,62 +3822,140 @@ swaponfile(struct thread *td, struct vnode *vp)
+ 	if (error != 0)
+ 		goto out;
+ 
+-	sf = malloc(sizeof(*sf), M_VMPGDATA, M_WAITOK | M_ZERO);
+-	sf->sf_vp = vp;
+-	sf->sf_mp = mp;
+-	error = swapfile_map(vp, npages, sf);
++	error = vn_extmap_build(vp, npages, em);
+ 	if (error != 0)
+ 		goto out;
++	em->em_vp = vp;
++	em->em_mp = mp;
+ 
+ 	/* From here the filesystem refuses to move or free the blocks. */
+ 	vn_irflag_set(vp, VIRF_SWAP);
++out:
++	if (writing)
++		vn_finished_write(wmp);
++	if (error != 0)
++		VOP_CLOSE(vp, FREAD | FWRITE, td->td_ucred, td);
++	return (error);
++}
++
++/*
++ * Undo vn_extmap_pin().  The vnode is locked exclusively by the caller,
++ * which still owns its reference.  The file becomes writable again; its
++ * cached buffers and pages are dropped, as at pin time, since the kernel
++ * may have written the blocks underneath them.
++ */
++void
++vn_extmap_unpin(struct thread *td, struct vn_extmap *em)
++{
++	struct vnode *vp;
++
++	vp = em->em_vp;
++	ASSERT_VOP_ELOCKED(vp, __func__);
++	vn_irflag_unset(vp, VIRF_SWAP);
++	(void)vinvalbuf(vp, 0, 0, 0);
++	VOP_CLOSE(vp, FREAD | FWRITE, td->td_ucred, td);
++	free(em->em_ext, M_VMPGDATA);
++	em->em_ext = NULL;
++	em->em_next = 0;
++}
++
++/*
++ * Pin vp and register it as a swap device.  vp is locked exclusively on
++ * entry and on return; the reference namei() took becomes the swap
++ * device's on success.
++ */
++static int
++swaponfile(struct thread *td, struct vnode *vp)
++{
++	struct mount *mp;
++	struct swapfile *sf;
++	struct swdevt *sp;
++	vm_pindex_t npages;
++	int error, flags;
++	bool pinned;
++
++	ASSERT_VOP_ELOCKED(vp, __func__);
++	mp = vp->v_mount;
++	pinned = false;
++
++	mtx_lock(&sw_dev_mtx);
++	TAILQ_FOREACH(sp, &swtailq, sw_list) {
++		if (sp->sw_vp == vp) {
++			mtx_unlock(&sw_dev_mtx);
++			return (EBUSY);
++		}
++	}
++	mtx_unlock(&sw_dev_mtx);
++	if (VN_IS_SWAP(vp))
++		return (EBUSY);
++
++#ifdef MAC
++	error = mac_system_check_swapon(td->td_ucred, vp);
++	if (error != 0)
++		return (error);
++#endif
++
++	/*
++	 * Keep the filesystem mounted while it is pinned: a concurrent
++	 * unmount waits for this reference, then finds the swap device in
++	 * swap_pager_mount_busy().
++	 */
++	if (vfs_busy(mp, MBF_NOWAIT) != 0)
++		return (EBUSY);
++
++	sf = malloc(sizeof(*sf), M_VMPGDATA, M_WAITOK | M_ZERO);
++	error = vn_extmap_pin(td, vp, &sf->sf_map);
++	if (error != 0)
++		goto out;
++	pinned = true;
++	npages = sf->sf_map.em_npages;
++	if (npages <= howmany(BBSIZE, PAGE_SIZE) || npages > INT_MAX) {
++		error = EXTERROR(EINVAL, "swap file size out of range");
++		goto out;
++	}
+ 
+ 	flags = 0;
+ 	g_topology_lock();
+-	if ((sf->sf_cp->provider->flags & G_PF_ACCEPT_UNMAPPED) != 0)
++	if ((sf->sf_map.em_cp->provider->flags & G_PF_ACCEPT_UNMAPPED) != 0)
+ 		flags |= SW_UNMAPPED;
+ 	g_topology_unlock();
+ 	error = swaponsomething(vp, sf, ctodb(npages), swapfile_strategy,
+ 	    swapfile_close, NODEV, flags);
+-	if (error != 0) {
+-		vn_irflag_unset(vp, VIRF_SWAP);
+-		goto out;
+-	}
+-	sf = NULL;
+-	opened = false;
++	if (error == 0)
++		sf = NULL;
+ out:
+-	if (writing)
+-		vn_finished_write(wmp);
+-	if (busied)
+-		vfs_unbusy(mp);
+ 	if (sf != NULL) {
+-		free(sf->sf_ext, M_VMPGDATA);
++		if (pinned)
++			vn_extmap_unpin(td, &sf->sf_map);
+ 		free(sf, M_VMPGDATA);
+ 	}
+-	if (opened)
+-		VOP_CLOSE(vp, FREAD | FWRITE, td->td_ucred, td);
++	vfs_unbusy(mp);
+ 	return (error);
+ }
+ 
+-static struct swapfile_extent *
+-swapfile_lookup(struct swapfile *sf, vm_pindex_t lpage)
++/*
++ * The extent holding file page lpage, which must be below em_npages.
++ * Lock-free; safe at panic time.
++ */
++const struct vn_extent *
++vn_extmap_lookup(const struct vn_extmap *em, vm_pindex_t lpage)
+ {
+-	struct swapfile_extent *se;
++	const struct vn_extent *ve;
+ 	u_int lo, hi, mid;
+ 
+ 	lo = 0;
+-	hi = sf->sf_next;
++	hi = em->em_next;
+ 	while (hi - lo > 1) {
+ 		mid = lo + (hi - lo) / 2;
+-		if (sf->sf_ext[mid].se_lpage <= lpage)
++		if (em->em_ext[mid].ve_lpage <= lpage)
+ 			lo = mid;
+ 		else
+ 			hi = mid;
+ 	}
+-	se = &sf->sf_ext[lo];
+-	KASSERT(lpage >= se->se_lpage && lpage < se->se_lpage + se->se_npages,
+-	    ("swapfile: page %ju outside the extent map", (uintmax_t)lpage));
+-	return (se);
++	ve = &em->em_ext[lo];
++	KASSERT(lpage >= ve->ve_lpage && lpage < ve->ve_lpage + ve->ve_npages,
++	    ("vn_extmap: page %ju outside the extent map", (uintmax_t)lpage));
++	return (ve);
+ }
+ 
+ static void
+@@ -3919,7 +3974,7 @@ swapfile_finish(struct buf *bp, struct swapfile *sf, int error,
+ {
+ 	struct g_consumer *cp;
+ 
+-	cp = sf->sf_cp;
++	cp = sf->sf_map.em_cp;
+ 	bp->b_ioflags = 0;
+ 	if (error != 0)
+ 		bp->b_ioflags |= BIO_ERROR;
+@@ -3987,7 +4042,7 @@ swapfile_strategy(struct buf *bp, struct swdevt *sp)
+ 	TAILQ_HEAD(, bio) queue;
+ 	struct bio *bio, *pbio;
+ 	struct swapfile *sf;
+-	struct swapfile_extent *se;
++	const struct vn_extent *ve;
+ 	vm_pindex_t lpage, n, npages, done;
+ 	int error, pieces;
+ 
+@@ -4003,7 +4058,7 @@ swapfile_strategy(struct buf *bp, struct swdevt *sp)
+ 	sf->sf_inflight++;
+ 	mtx_unlock(&sw_dev_mtx);
+ 
+-	error = g_vfs_io_start(sf->sf_cp);
++	error = g_vfs_io_start(sf->sf_map.em_cp);
+ 	if (error != 0) {
+ 		swapfile_release(sf);
+ 		bp->b_error = error;
+@@ -4021,17 +4076,17 @@ swapfile_strategy(struct buf *bp, struct swdevt *sp)
+ 	TAILQ_INIT(&queue);
+ 	pieces = 0;
+ 	for (done = 0; done < npages; done += n) {
+-		se = swapfile_lookup(sf, lpage + done);
++		ve = vn_extmap_lookup(&sf->sf_map, lpage + done);
+ 		n = MIN(npages - done,
+-		    se->se_lpage + se->se_npages - (lpage + done));
++		    ve->ve_lpage + ve->ve_npages - (lpage + done));
+ 		bio = swapfile_new_bio(bp);
+ 		if (bio == NULL)
+ 			goto nomem;
+ 		bio->bio_caller1 = sf;
+ 		bio->bio_caller2 = bp;
+ 		bio->bio_cmd = bp->b_iocmd;
+-		bio->bio_offset = se->se_poff +
+-		    (off_t)ptoa(lpage + done - se->se_lpage);
++		bio->bio_offset = ve->ve_poff +
++		    (off_t)ptoa(lpage + done - ve->ve_lpage);
+ 		bio->bio_length = ptoa(n);
+ 		bio->bio_done = swapfile_done;
+ 		bio->bio_flags |= BIO_SWAP;
+@@ -4065,7 +4120,7 @@ swapfile_strategy(struct buf *bp, struct swdevt *sp)
+ 	while ((bio = TAILQ_FIRST(&queue)) != NULL) {
+ 		TAILQ_REMOVE(&queue, bio, bio_queue);
+ 		bio->bio_parent = pbio;
+-		g_io_request(bio, sf->sf_cp);
++		g_io_request(bio, sf->sf_map.em_cp);
+ 	}
+ 	return;
+ 
+@@ -4075,7 +4130,7 @@ swapfile_strategy(struct buf *bp, struct swdevt *sp)
+ 		g_destroy_bio(bio);
+ 	}
+ 	printf("swap_pager: cannot allocate bio\n");
+-	g_vfs_io_done(sf->sf_cp);
++	g_vfs_io_done(sf->sf_map.em_cp);
+ 	swapfile_release(sf);
+ 	bp->b_error = ENOMEM;
+ 	bp->b_ioflags |= BIO_ERROR;
+@@ -4100,13 +4155,10 @@ swapfile_close(struct thread *td, struct swdevt *sp)
+ 		msleep(&sf->sf_inflight, &sw_dev_mtx, PVM, "swfcls", 0);
+ 	mtx_unlock(&sw_dev_mtx);
+ 
+-	vp = sf->sf_vp;
++	vp = sf->sf_map.em_vp;
+ 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+-	vn_irflag_unset(vp, VIRF_SWAP);
+-	(void)vinvalbuf(vp, 0, 0, 0);
+-	VOP_CLOSE(vp, FREAD | FWRITE, td->td_ucred, td);
++	vn_extmap_unpin(td, &sf->sf_map);
+ 	vput(vp);
+-	free(sf->sf_ext, M_VMPGDATA);
+ 	free(sf, M_VMPGDATA);
+ }
+ 
+diff --git a/sys/vm/swap_pager.h b/sys/vm/swap_pager.h
+index 81cf3d59..9d028374 100644
+--- a/sys/vm/swap_pager.h
++++ b/sys/vm/swap_pager.h
+@@ -91,5 +91,34 @@ void swapoff_all(void);
+ int swap_pager_set_watermarks(int lowat, int hiwat);
+ bool swap_pager_init_object(vm_object_t object, void *handle,
+     struct ucred *cred, vm_ooffset_t size, vm_ooffset_t offset);
++
++/*
++ * Pinned-file extent maps (NextBSD): a regular file whose blocks the
++ * kernel writes directly, used by swap files and by the file-backed
++ * kernel dumper.  See vn_extmap_pin() in swap_pager.c.
++ */
++struct g_consumer;
++struct vnode;
++
++struct vn_extent {
++	vm_pindex_t	ve_lpage;	/* first page within the file */
++	vm_pindex_t	ve_npages;	/* length in pages */
++	off_t		ve_poff;	/* byte offset on the provider */
++};
++
++struct vn_extmap {
++	struct vnode	*em_vp;
++	struct mount	*em_mp;
++	struct g_consumer *em_cp;	/* the filesystem's g_vfs consumer */
++	struct vn_extent *em_ext;
++	u_int		em_next;
++	vm_pindex_t	em_npages;	/* pages mapped, from page 0 */
++};
++
++bool vn_extmap_supported(struct vnode *vp);
++int vn_extmap_pin(struct thread *td, struct vnode *vp, struct vn_extmap *em);
++void vn_extmap_unpin(struct thread *td, struct vn_extmap *em);
++const struct vn_extent *vn_extmap_lookup(const struct vn_extmap *em,
++    vm_pindex_t lpage);
+ #endif				/* _KERNEL */
+ #endif				/* _VM_SWAP_PAGER_H_ */
+-- 
+2.54.0 (Apple Git-157)
+
