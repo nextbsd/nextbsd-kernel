@@ -71,3 +71,4 @@
 0078-NextBSD-Linuxulator-let-pread64-work-on-memfd-and-sh.patch
 0080-NextBSD-add-a-swap_lowspace-eventhandler-and-vm.nswa.patch
 0081-NextBSD-VIRF_SWAP-refuses-write-truncate-unlink-and-.patch
+0082-NextBSD-extent-map-swap-pager-swapon-2-on-a-local-UF.patch

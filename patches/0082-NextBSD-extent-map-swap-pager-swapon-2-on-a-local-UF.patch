@@ -1,0 +1,842 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 1 Nov 2026 01:56:58 -0500
+Subject: [PATCH 82/82] NextBSD: extent-map swap pager: swapon(2) on a local
+ UFS regular file
+
+sys_swapon() accepts a regular file only on a network filesystem, so a
+local swap file has to go through md(4), whose kthread is not pageproc
+and sleeps in vm_wait() inside VOP_WRITE behind the pagedaemon it is
+supposed to serve.
+
+Accept a regular file on UFS and swap on it with the filesystem off the
+I/O path, as Linux (swap_activate) and xnu (kern_open_file_for_direct_io)
+do:
+
+- At swapon the file is pinned: VOP_FSYNC(MNT_WAIT), so no soft-updates
+  dependency is pending, then vinvalbuf(), which drops its cached
+  buffers and pages.  VOP_BMAP is walked once into a table of physical
+  extents on the provider below the mount; a hole refuses swapon
+  (EINVAL, "preallocate it").  VIRF_SWAP is then set, so the file can
+  no longer be written, truncated, unlinked or renamed.
+- swapfile_strategy() translates each swap block through the table and
+  sends bios to the filesystem's own g_vfs consumer, as
+  swapgeom_strategy() does for a partition: writes allocate with
+  g_new_bio() and never sleep, and a buf that crosses an extent
+  boundary is split under a counting parent bio.
+- g_vfs_io_start()/g_vfs_io_done(), split out of g_vfs_done(), count
+  that I/O in the g_vfs softc so an orphaned provider is torn down only
+  after it completes; after an orphan the swap I/O fails with ENXIO.
+- swap_pager_mount_busy(): dounmount() refuses even a forced unmount,
+  and vfs_domount_update() a downgrade to read-only, while a file on
+  the mount is in use for swap.  swapon holds vfs_busy() while it pins,
+  so a racing unmount either waits and then sees the swap device or
+  makes swapon fail.  Shutdown already runs swapoff_all() before
+  vfs_unmountall().
+- swapoff waits for in-flight I/O, clears VIRF_SWAP, drops the file's
+  cache again, and closes and releases the vnode.
+
+The extent map is rebuilt at every swapon and never cached.  Bypass
+writes skip soft updates and UFS snapshot copy-on-write, which both
+hook buffer-cache writes in ffs_geom_strategy(); a snapshot's view of
+the swap file therefore holds live swap contents, which nothing that
+reads a snapshot interprets.
+
+Only UFS is accepted.  ZFS and other local filesystems still fail with
+ENOTBLK exactly as before, and NFS keeps its swapdev path.  No
+structure layout or existing function signature changes: the swap
+file's state hangs off swdevt's opaque sw_id, and the new interfaces
+are additions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/geom/geom_vfs.c  |  40 ++-
+ sys/geom/geom_vfs.h  |   3 +
+ sys/kern/vfs_mount.c |  22 +-
+ sys/vm/swap_pager.c  | 588 +++++++++++++++++++++++++++++++++++++++++++
+ sys/vm/swap_pager.h  |   2 +
+ 5 files changed, 650 insertions(+), 5 deletions(-)
+
+diff --git a/sys/geom/geom_vfs.c b/sys/geom/geom_vfs.c
+index 122e2f6a0..0e0f13e16 100644
+--- a/sys/geom/geom_vfs.c
++++ b/sys/geom/geom_vfs.c
+@@ -97,10 +97,8 @@ static void
+ g_vfs_done(struct bio *bip)
+ {
+ 	struct g_consumer *cp;
+-	struct g_event *event;
+ 	struct g_vfs_softc *sc;
+ 	struct buf *bp;
+-	int destroy;
+ 	struct mount *mp;
+ 	struct vnode *vp;
+ 	struct cdev *cdevp;
+@@ -168,6 +166,42 @@ g_vfs_done(struct bio *bip)
+ 	bp->b_resid = bp->b_bcount - bip->bio_completed;
+ 	g_destroy_bio(bip);
+ 
++	g_vfs_io_done(cp);
++
++	bufdone(bp);
++}
++
++/*
++ * Account for I/O that a kernel client (the NextBSD swap-file pager)
++ * sends straight to a filesystem's consumer, bypassing the buffer
++ * cache, so that an orphaned provider is torn down only after it
++ * completes.  g_vfs_io_start() fails with ENXIO once the provider is
++ * gone; each successful call is paired with one g_vfs_io_done().
++ */
++int
++g_vfs_io_start(struct g_consumer *cp)
++{
++	struct g_vfs_softc *sc;
++
++	sc = cp->geom->softc;
++	mtx_lock(&sc->sc_mtx);
++	if (sc->sc_orphaned || sc->sc_enxio_active) {
++		mtx_unlock(&sc->sc_mtx);
++		return (ENXIO);
++	}
++	sc->sc_active++;
++	mtx_unlock(&sc->sc_mtx);
++	return (0);
++}
++
++void
++g_vfs_io_done(struct g_consumer *cp)
++{
++	struct g_event *event;
++	struct g_vfs_softc *sc;
++	int destroy;
++
++	sc = cp->geom->softc;
+ 	mtx_lock(&sc->sc_mtx);
+ 	destroy = ((--sc->sc_active) == 0 && sc->sc_orphaned);
+ 	if (destroy) {
+@@ -178,8 +212,6 @@ g_vfs_done(struct bio *bip)
+ 	mtx_unlock(&sc->sc_mtx);
+ 	if (destroy)
+ 		g_post_event_ep(g_vfs_destroy, cp, event, NULL);
+-
+-	bufdone(bp);
+ }
+ 
+ void
+diff --git a/sys/geom/geom_vfs.h b/sys/geom/geom_vfs.h
+index 56b91dd10..7b5e06c96 100644
+--- a/sys/geom/geom_vfs.h
++++ b/sys/geom/geom_vfs.h
+@@ -32,11 +32,14 @@
+ struct vnode;
+ struct bufobj;
+ struct buf;
++struct g_consumer;
+ 
+ extern struct buf_ops *g_vfs_bufops;
+ 
+ void g_vfs_strategy(struct bufobj *bo, struct buf *bp);
+ int g_vfs_open(struct vnode *vp, struct g_consumer **cpp, const char *fsname, int wr);
+ void g_vfs_close(struct g_consumer *cp);
++int g_vfs_io_start(struct g_consumer *cp);
++void g_vfs_io_done(struct g_consumer *cp);
+ 
+ #endif /* _GEOM_GEOM_VFS_H_ */
+diff --git a/sys/kern/vfs_mount.c b/sys/kern/vfs_mount.c
+index 6f6182ae8..1b28b49fd 100644
+--- a/sys/kern/vfs_mount.c
++++ b/sys/kern/vfs_mount.c
+@@ -64,6 +64,8 @@
+ #include <sys/systm.h>
+ #include <sys/taskqueue.h>
+ #include <sys/vnode.h>
++#include <vm/vm.h>
++#include <vm/swap_pager.h>
+ #include <vm/uma.h>
+ 
+ #include <geom/geom.h>
+@@ -1407,6 +1409,16 @@ vfs_domount_update(
+ 		vfs_deleteopt(*optlist, "fsid");
+ 	}
+ 
++	/*
++	 * The swap pager writes a swap file's blocks through the mount's
++	 * device consumer; it must stay writable while one is in use.
++	 */
++	if ((fsflags & MNT_RDONLY) != 0 && (flag & MNT_RDONLY) == 0 &&
++	    swap_pager_mount_busy(mp)) {
++		error = EBUSY;
++		goto end;
++	}
++
+ 	mnt_union = 0;
+ 	MNT_ILOCK(mp);
+ 	if ((mp->mnt_kern_flag & MNTK_UNMOUNT) != 0) {
+@@ -2367,7 +2379,15 @@ dounmount(struct mount *mp, uint64_t flags, struct thread *td)
+ 	mp->mnt_kern_flag &= ~MNTK_ASYNC;
+ 	MNT_IUNLOCK(mp);
+ 	vfs_deallocate_syncvnode(mp);
+-	error = VFS_UNMOUNT(mp, flags);
++	/*
++	 * A swap file in use pins the device consumer the swap pager writes
++	 * through; not even a forced unmount may take it away.  Checked after
++	 * the drain above, which waits out a swapon in progress.
++	 */
++	if (swap_pager_mount_busy(mp))
++		error = EBUSY;
++	else
++		error = VFS_UNMOUNT(mp, flags);
+ 	vn_finished_write(mp);
+ 	vfs_rel(mp);
+ 	/*
+diff --git a/sys/vm/swap_pager.c b/sys/vm/swap_pager.c
+index 834c757aa..d277242fa 100644
+--- a/sys/vm/swap_pager.c
++++ b/sys/vm/swap_pager.c
+@@ -92,6 +92,7 @@
+ #include <sys/resourcevar.h>
+ #include <sys/rwlock.h>
+ #include <sys/sbuf.h>
++#include <sys/stat.h>
+ #include <sys/sysctl.h>
+ #include <sys/sysproto.h>
+ #include <sys/systm.h>
+@@ -118,6 +119,7 @@
+ #include <vm/uma.h>
+ 
+ #include <geom/geom.h>
++#include <geom/geom_vfs.h>
+ 
+ /*
+  * MAX_PAGEOUT_CLUSTER must be a power of 2 between 1 and 64.
+@@ -161,6 +163,9 @@ static int nswapdev;		/* Number of swap devices */
+ int swap_pager_avail;
+ static struct sx swdev_syscall_lock;	/* serialize swap(on|off) */
+ 
++static bool swapfile_fs_supported(struct vnode *vp);
++static int swaponfile(struct thread *td, struct vnode *vp);
++
+ static __exclusive_cache_line u_long swap_reserved;
+ static u_long swap_total;
+ static int sysctl_page_shift(SYSCTL_HANDLER_ARGS);
+@@ -2684,6 +2689,12 @@ sys_swapon(struct thread *td, struct swapon_args *uap)
+ 		 * way that nfs_mountroot() sets up diskless swapping.
+ 		 */
+ 		error = swaponvp(td, vp, attr.va_size / DEV_BSIZE);
++	} else if (swapfile_fs_supported(vp)) {
++		/*
++		 * A local regular file: pin it and swap through its
++		 * physical extent map.  Other filesystems keep ENOTBLK.
++		 */
++		error = swaponfile(td, vp);
+ 	}
+ 
+ 	if (error != 0)
+@@ -3422,6 +3433,583 @@ swaponvp(struct thread *td, struct vnode *vp, u_long nblks)
+ 	return (error);
+ }
+ 
++/*
++ * Extent-map backend (NextBSD)
++ *
++ * Swapping onto a regular file on a local filesystem that maps its blocks
++ * with VOP_BMAP (UFS), without md(4) and without the filesystem on the
++ * I/O path.
++ *
++ * At swapon the file is pinned: flushed with VOP_FSYNC(MNT_WAIT), so no
++ * soft-updates dependency is left pending on it, and invalidated with
++ * vinvalbuf(), which drops its cached buffers and pages.  Its blocks are
++ * then resolved once into a table of physical extents, and VIRF_SWAP is
++ * set, which makes the filesystem refuse to write, truncate, unlink or
++ * rename it.  From then on swapfile_strategy() translates each swap block
++ * through the table and sends bios straight to the GEOM consumer the
++ * filesystem mounted its device with, as swapgeom_strategy() does for a
++ * partition: no vnode lock, no buffer cache, no allocation that can sleep
++ * on a write.  The md(4) path, whose kthread enters VOP_WRITE and can
++ * sleep in vm_wait() behind the pagedaemon it is meant to serve, is not
++ * used.
++ *
++ * Bypass writes are invisible to soft updates and to UFS snapshot
++ * copy-on-write, both of which hook buffer-cache writes in
++ * ffs_geom_strategy().  Nothing is pending on a synced file, and a
++ * snapshot's image of the swap file only ever holds swap contents, which
++ * nothing reading a snapshot interprets.
++ *
++ * The extent map is never cached: it is rebuilt at every swapon.  The
++ * mount cannot be unmounted, even forcibly, or downgraded to read-only
++ * while one of its files is in use for swap (swap_pager_mount_busy()).
++ *
++ * Only UFS is accepted.  Other local filesystems, ZFS among them, keep
++ * failing with ENOTBLK as before, so swapon(8) can fall back to md(4).
++ */
++
++struct swapfile_extent {
++	vm_pindex_t	se_lpage;	/* first page within the file */
++	vm_pindex_t	se_npages;	/* length in pages */
++	off_t		se_poff;	/* byte offset on the provider */
++};
++
++struct swapfile {
++	struct vnode	*sf_vp;
++	struct mount	*sf_mp;
++	struct g_consumer *sf_cp;	/* the filesystem's g_vfs consumer */
++	struct swapfile_extent *sf_ext;
++	u_int		sf_next;
++	u_int		sf_inflight;	/* bufs in flight, under sw_dev_mtx */
++};
++
++static sw_strategy_t swapfile_strategy;
++static sw_close_t swapfile_close;
++
++/*
++ * Filesystems whose VOP_BMAP returns a full, hole-free physical block map
++ * and whose write paths honour VIRF_SWAP.
++ */
++static bool
++swapfile_fs_supported(struct vnode *vp)
++{
++
++	return (vp->v_type == VREG && vp->v_mount != NULL &&
++	    (vp->v_mount->mnt_vfc->vfc_flags & VFCF_NETWORK) == 0 &&
++	    strcmp(vp->v_mount->mnt_vfc->vfc_name, "ufs") == 0);
++}
++
++/*
++ * True when a file on mp is in use for swap; dounmount() and
++ * vfs_domount_update() refuse to unmount or downgrade such a mount.
++ */
++bool
++swap_pager_mount_busy(struct mount *mp)
++{
++	struct swdevt *sp;
++	struct swapfile *sf;
++	bool busy;
++
++	busy = false;
++	mtx_lock(&sw_dev_mtx);
++	TAILQ_FOREACH(sp, &swtailq, sw_list) {
++		if (sp->sw_strategy != swapfile_strategy)
++			continue;
++		sf = sp->sw_id;
++		if (sf != NULL && sf->sf_mp == mp) {
++			busy = true;
++			break;
++		}
++	}
++	mtx_unlock(&sw_dev_mtx);
++	return (busy);
++}
++
++static int
++swapfile_ext_append(struct swapfile *sf, u_int *cap, vm_pindex_t lpage,
++    vm_pindex_t npages, off_t poff)
++{
++	struct swapfile_extent *se, *nse;
++
++	if (sf->sf_next > 0) {
++		se = &sf->sf_ext[sf->sf_next - 1];
++		if (se->se_lpage + se->se_npages == lpage &&
++		    se->se_poff + (off_t)ptoa(se->se_npages) == poff) {
++			se->se_npages += npages;
++			return (0);
++		}
++	}
++	if (sf->sf_next == *cap) {
++		if (*cap >= UINT_MAX / 2)
++			return (EXTERROR(EFBIG, "swap file too fragmented"));
++		nse = mallocarray(*cap * 2, sizeof(*nse), M_VMPGDATA,
++		    M_WAITOK);
++		memcpy(nse, sf->sf_ext, sf->sf_next * sizeof(*nse));
++		free(sf->sf_ext, M_VMPGDATA);
++		sf->sf_ext = nse;
++		*cap *= 2;
++	}
++	se = &sf->sf_ext[sf->sf_next++];
++	se->se_lpage = lpage;
++	se->se_npages = npages;
++	se->se_poff = poff;
++	return (0);
++}
++
++/*
++ * Resolve the first npages pages of vp to physical extents on the
++ * provider under the filesystem.  Holes are refused.
++ */
++static int
++swapfile_map(struct vnode *vp, vm_pindex_t npages, struct swapfile *sf)
++{
++	struct bufobj *bo, *bo0;
++	struct g_consumer *cp;
++	struct g_provider *pp;
++	struct swapfile_extent *se;
++	daddr_t bn, lbn, nlbn;
++	vm_pindex_t lpage, n, pgs_per_blk;
++	u_int cap, i;
++	int error, run;
++
++	ASSERT_VOP_ELOCKED(vp, __func__);
++	if (vp->v_mount->mnt_stat.f_iosize < PAGE_SIZE ||
++	    vp->v_mount->mnt_stat.f_iosize % PAGE_SIZE != 0)
++		return (EXTERROR(EINVAL,
++		    "filesystem block size is not a multiple of the page size"));
++	pgs_per_blk = vp->v_mount->mnt_stat.f_iosize / PAGE_SIZE;
++	nlbn = howmany(npages, pgs_per_blk);
++
++	cap = 16;
++	sf->sf_ext = mallocarray(cap, sizeof(*sf->sf_ext), M_VMPGDATA,
++	    M_WAITOK);
++	sf->sf_next = 0;
++	bo0 = NULL;
++	error = 0;
++	for (lbn = 0; lbn < nlbn; lbn += run + 1) {
++		bo = NULL;
++		run = 0;
++		error = VOP_BMAP(vp, lbn, &bo, &bn, &run, NULL);
++		if (error != 0)
++			break;
++		if (bn == -1) {
++			error = EXTERROR(EINVAL,
++			    "swap file has holes; preallocate it");
++			break;
++		}
++		if (bo == NULL || bo->bo_ops != g_vfs_bufops ||
++		    (bo0 != NULL && bo != bo0)) {
++			error = EXTERROR(EINVAL,
++			    "swap file blocks are not on a GEOM provider");
++			break;
++		}
++		bo0 = bo;
++		if (run < 0)
++			run = 0;
++		if (run > nlbn - lbn - 1)
++			run = nlbn - lbn - 1;
++		lpage = lbn * pgs_per_blk;
++		n = MIN((vm_pindex_t)(run + 1) * pgs_per_blk, npages - lpage);
++		error = swapfile_ext_append(sf, &cap, lpage, n,
++		    (off_t)bn * DEV_BSIZE);
++		if (error != 0)
++			break;
++	}
++	if (error == 0 && sf->sf_next == 0)
++		error = EXTERROR(EINVAL, "swap file is empty");
++	if (error != 0)
++		goto fail;
++
++	cp = bo0->bo_private;
++	g_topology_lock();
++	pp = cp->provider;
++	if (pp == NULL || pp->error != 0 || cp->acw == 0) {
++		g_topology_unlock();
++		error = EXTERROR(ENXIO, "filesystem device is not writable");
++		goto fail;
++	}
++	if (pp->sectorsize == 0 || PAGE_SIZE % pp->sectorsize != 0) {
++		g_topology_unlock();
++		error = EXTERROR(EINVAL,
++		    "device sector size does not divide the page size");
++		goto fail;
++	}
++	for (i = 0; i < sf->sf_next; i++) {
++		se = &sf->sf_ext[i];
++		if (se->se_poff < 0 || se->se_poff % pp->sectorsize != 0 ||
++		    se->se_poff + (off_t)ptoa(se->se_npages) > pp->mediasize) {
++			g_topology_unlock();
++			error = EXTERROR(EINVAL,
++			    "swap file extent outside the device");
++			goto fail;
++		}
++	}
++	g_topology_unlock();
++	sf->sf_cp = cp;
++	return (0);
++fail:
++	free(sf->sf_ext, M_VMPGDATA);
++	sf->sf_ext = NULL;
++	sf->sf_next = 0;
++	return (error);
++}
++
++/*
++ * Pin vp and register it as a swap device.  vp is locked exclusively on
++ * entry and on return; the reference namei() took becomes the swap
++ * device's on success.
++ */
++static int
++swaponfile(struct thread *td, struct vnode *vp)
++{
++	struct vattr va;
++	struct mount *mp, *wmp;
++	struct swapfile *sf;
++	struct swdevt *sp;
++	vm_pindex_t npages;
++	int error, flags;
++	bool busied, opened, writing;
++
++	ASSERT_VOP_ELOCKED(vp, __func__);
++	mp = vp->v_mount;
++	sf = NULL;
++	busied = opened = writing = false;
++
++	mtx_lock(&sw_dev_mtx);
++	TAILQ_FOREACH(sp, &swtailq, sw_list) {
++		if (sp->sw_vp == vp) {
++			mtx_unlock(&sw_dev_mtx);
++			return (EBUSY);
++		}
++	}
++	mtx_unlock(&sw_dev_mtx);
++	if (VN_IS_SWAP(vp))
++		return (EBUSY);
++	if ((mp->mnt_flag & MNT_RDONLY) != 0)
++		return (EROFS);
++
++	error = VOP_GETATTR(vp, &va, td->td_ucred);
++	if (error != 0)
++		return (error);
++	if ((va.va_flags & SF_SNAPSHOT) != 0)
++		return (EXTERROR(EINVAL, "cannot swap on a snapshot file"));
++	npages = va.va_size / PAGE_SIZE;
++	if (npages <= howmany(BBSIZE, PAGE_SIZE) || npages > INT_MAX)
++		return (EXTERROR(EINVAL, "swap file size out of range"));
++
++#ifdef MAC
++	error = mac_system_check_swapon(td->td_ucred, vp);
++	if (error != 0)
++		return (error);
++#endif
++	error = VOP_OPEN(vp, FREAD | FWRITE, td->td_ucred, td, NULL);
++	if (error != 0)
++		return (error);
++	opened = true;
++
++	/*
++	 * Keep the filesystem mounted while it is pinned: a concurrent
++	 * unmount waits for this reference, then finds the swap device in
++	 * swap_pager_mount_busy().
++	 */
++	if (vfs_busy(mp, MBF_NOWAIT) != 0) {
++		error = EBUSY;
++		goto out;
++	}
++	busied = true;
++
++	/* fsync(2)'s order: vn_start_write() before the vnode lock. */
++	VOP_UNLOCK(vp);
++	wmp = NULL;
++	error = vn_start_write(vp, &wmp, V_WAIT | V_PCATCH);
++	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
++	if (error != 0)
++		goto out;
++	writing = true;
++	if (VN_IS_DOOMED(vp)) {
++		error = ENOENT;
++		goto out;
++	}
++	if (VN_IS_SWAP(vp)) {
++		error = EBUSY;
++		goto out;
++	}
++
++	/*
++	 * Leave nothing dirty or pending (soft updates included), then drop
++	 * every cached buffer and page so no stale copy can be written back
++	 * over a block the swap pager owns.
++	 */
++	error = VOP_FSYNC(vp, MNT_WAIT, td);
++	if (error == 0)
++		error = vinvalbuf(vp, V_SAVE, 0, 0);
++	if (error != 0)
++		goto out;
++
++	sf = malloc(sizeof(*sf), M_VMPGDATA, M_WAITOK | M_ZERO);
++	sf->sf_vp = vp;
++	sf->sf_mp = mp;
++	error = swapfile_map(vp, npages, sf);
++	if (error != 0)
++		goto out;
++
++	/* From here the filesystem refuses to move or free the blocks. */
++	vn_irflag_set(vp, VIRF_SWAP);
++
++	flags = 0;
++	g_topology_lock();
++	if ((sf->sf_cp->provider->flags & G_PF_ACCEPT_UNMAPPED) != 0)
++		flags |= SW_UNMAPPED;
++	g_topology_unlock();
++	error = swaponsomething(vp, sf, ctodb(npages), swapfile_strategy,
++	    swapfile_close, NODEV, flags);
++	if (error != 0) {
++		vn_irflag_unset(vp, VIRF_SWAP);
++		goto out;
++	}
++	sf = NULL;
++	opened = false;
++out:
++	if (writing)
++		vn_finished_write(wmp);
++	if (busied)
++		vfs_unbusy(mp);
++	if (sf != NULL) {
++		free(sf->sf_ext, M_VMPGDATA);
++		free(sf, M_VMPGDATA);
++	}
++	if (opened)
++		VOP_CLOSE(vp, FREAD | FWRITE, td->td_ucred, td);
++	return (error);
++}
++
++static struct swapfile_extent *
++swapfile_lookup(struct swapfile *sf, vm_pindex_t lpage)
++{
++	struct swapfile_extent *se;
++	u_int lo, hi, mid;
++
++	lo = 0;
++	hi = sf->sf_next;
++	while (hi - lo > 1) {
++		mid = lo + (hi - lo) / 2;
++		if (sf->sf_ext[mid].se_lpage <= lpage)
++			lo = mid;
++		else
++			hi = mid;
++	}
++	se = &sf->sf_ext[lo];
++	KASSERT(lpage >= se->se_lpage && lpage < se->se_lpage + se->se_npages,
++	    ("swapfile: page %ju outside the extent map", (uintmax_t)lpage));
++	return (se);
++}
++
++static void
++swapfile_release(struct swapfile *sf)
++{
++
++	mtx_lock(&sw_dev_mtx);
++	if (--sf->sf_inflight == 0)
++		wakeup(&sf->sf_inflight);
++	mtx_unlock(&sw_dev_mtx);
++}
++
++static void
++swapfile_finish(struct buf *bp, struct swapfile *sf, int error,
++    off_t completed)
++{
++	struct g_consumer *cp;
++
++	cp = sf->sf_cp;
++	bp->b_ioflags = 0;
++	if (error != 0)
++		bp->b_ioflags |= BIO_ERROR;
++	bp->b_error = error;
++	bp->b_resid = bp->b_bcount - completed;
++	bp->b_caller1 = NULL;
++	bufdone(bp);
++	g_vfs_io_done(cp);
++	swapfile_release(sf);
++}
++
++/*
++ * Completion of one bio.  A buf that crossed extents was split; its
++ * pieces share a parent bio that only counts them.
++ */
++static void
++swapfile_done(struct bio *bio)
++{
++	struct bio *pbio;
++	struct buf *bp;
++	struct swapfile *sf;
++	off_t completed;
++	int error;
++
++	sf = bio->bio_caller1;
++	pbio = bio->bio_parent;
++	if (pbio == NULL) {
++		bp = bio->bio_caller2;
++		error = bio->bio_error;
++		completed = bio->bio_completed;
++		g_destroy_bio(bio);
++		swapfile_finish(bp, sf, error, completed);
++		return;
++	}
++	mtx_lock(&sw_dev_mtx);
++	if (bio->bio_error != 0 && pbio->bio_error == 0)
++		pbio->bio_error = bio->bio_error;
++	pbio->bio_completed += bio->bio_completed;
++	pbio->bio_inbed++;
++	if (pbio->bio_inbed < pbio->bio_children) {
++		mtx_unlock(&sw_dev_mtx);
++		g_destroy_bio(bio);
++		return;
++	}
++	mtx_unlock(&sw_dev_mtx);
++	g_destroy_bio(bio);
++	bp = pbio->bio_caller2;
++	error = pbio->bio_error;
++	completed = pbio->bio_completed;
++	g_destroy_bio(pbio);
++	swapfile_finish(bp, sf, error, completed);
++}
++
++static struct bio *
++swapfile_new_bio(struct buf *bp)
++{
++
++	/* Writes come from the pagedaemon: never sleep for a bio. */
++	return (bp->b_iocmd == BIO_WRITE ? g_new_bio() : g_alloc_bio());
++}
++
++static void
++swapfile_strategy(struct buf *bp, struct swdevt *sp)
++{
++	TAILQ_HEAD(, bio) queue;
++	struct bio *bio, *pbio;
++	struct swapfile *sf;
++	struct swapfile_extent *se;
++	vm_pindex_t lpage, n, npages, done;
++	int error, pieces;
++
++	mtx_lock(&sw_dev_mtx);
++	sf = sp->sw_id;
++	if (sf == NULL) {
++		mtx_unlock(&sw_dev_mtx);
++		bp->b_error = ENXIO;
++		bp->b_ioflags |= BIO_ERROR;
++		bufdone(bp);
++		return;
++	}
++	sf->sf_inflight++;
++	mtx_unlock(&sw_dev_mtx);
++
++	error = g_vfs_io_start(sf->sf_cp);
++	if (error != 0) {
++		swapfile_release(sf);
++		bp->b_error = error;
++		bp->b_ioflags |= BIO_ERROR;
++		bufdone(bp);
++		return;
++	}
++
++	KASSERT(bp->b_bcount % PAGE_SIZE == 0 && bp->b_bcount > 0,
++	    ("swapfile: bcount %ld", bp->b_bcount));
++	lpage = bp->b_blkno - sp->sw_first;
++	npages = atop(bp->b_bcount);
++
++	/* Build every piece before issuing any, so ENOMEM fails cleanly. */
++	TAILQ_INIT(&queue);
++	pieces = 0;
++	for (done = 0; done < npages; done += n) {
++		se = swapfile_lookup(sf, lpage + done);
++		n = MIN(npages - done,
++		    se->se_lpage + se->se_npages - (lpage + done));
++		bio = swapfile_new_bio(bp);
++		if (bio == NULL)
++			goto nomem;
++		bio->bio_caller1 = sf;
++		bio->bio_caller2 = bp;
++		bio->bio_cmd = bp->b_iocmd;
++		bio->bio_offset = se->se_poff +
++		    (off_t)ptoa(lpage + done - se->se_lpage);
++		bio->bio_length = ptoa(n);
++		bio->bio_done = swapfile_done;
++		bio->bio_flags |= BIO_SWAP;
++		if (!buf_mapped(bp)) {
++			bio->bio_ma = bp->b_pages + done;
++			bio->bio_data = unmapped_buf;
++			bio->bio_ma_offset = 0;
++			bio->bio_ma_n = n;
++			bio->bio_flags |= BIO_UNMAPPED;
++		} else {
++			bio->bio_data = bp->b_data + ptoa(done);
++			bio->bio_ma = NULL;
++		}
++		TAILQ_INSERT_TAIL(&queue, bio, bio_queue);
++		pieces++;
++	}
++
++	pbio = NULL;
++	if (pieces > 1) {
++		pbio = swapfile_new_bio(bp);
++		if (pbio == NULL)
++			goto nomem;
++		pbio->bio_caller1 = sf;
++		pbio->bio_caller2 = bp;
++		pbio->bio_children = pieces;
++		pbio->bio_inbed = 0;
++		pbio->bio_completed = 0;
++		pbio->bio_error = 0;
++	}
++	bp->b_caller1 = pbio != NULL ? pbio : TAILQ_FIRST(&queue);
++	while ((bio = TAILQ_FIRST(&queue)) != NULL) {
++		TAILQ_REMOVE(&queue, bio, bio_queue);
++		bio->bio_parent = pbio;
++		g_io_request(bio, sf->sf_cp);
++	}
++	return;
++
++nomem:
++	while ((bio = TAILQ_FIRST(&queue)) != NULL) {
++		TAILQ_REMOVE(&queue, bio, bio_queue);
++		g_destroy_bio(bio);
++	}
++	printf("swap_pager: cannot allocate bio\n");
++	g_vfs_io_done(sf->sf_cp);
++	swapfile_release(sf);
++	bp->b_error = ENOMEM;
++	bp->b_ioflags |= BIO_ERROR;
++	bufdone(bp);
++}
++
++/*
++ * swapoff: wait for the last swap I/O, then unpin the file.  It becomes
++ * writable again; its cached buffers and pages are dropped, as at pin
++ * time, since the swap pager wrote the blocks underneath them.
++ */
++static void
++swapfile_close(struct thread *td, struct swdevt *sp)
++{
++	struct swapfile *sf;
++	struct vnode *vp;
++
++	mtx_lock(&sw_dev_mtx);
++	sf = sp->sw_id;
++	sp->sw_id = NULL;
++	while (sf->sf_inflight > 0)
++		msleep(&sf->sf_inflight, &sw_dev_mtx, PVM, "swfcls", 0);
++	mtx_unlock(&sw_dev_mtx);
++
++	vp = sf->sf_vp;
++	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
++	vn_irflag_unset(vp, VIRF_SWAP);
++	(void)vinvalbuf(vp, 0, 0, 0);
++	VOP_CLOSE(vp, FREAD | FWRITE, td->td_ucred, td);
++	vput(vp);
++	free(sf->sf_ext, M_VMPGDATA);
++	free(sf, M_VMPGDATA);
++}
++
+ static int
+ sysctl_swap_async_max(SYSCTL_HANDLER_ARGS)
+ {
+diff --git a/sys/vm/swap_pager.h b/sys/vm/swap_pager.h
+index da1457762..b61a441fd 100644
+--- a/sys/vm/swap_pager.h
++++ b/sys/vm/swap_pager.h
+@@ -40,6 +40,7 @@
+ #include <sys/_types.h>
+ 
+ struct buf;
++struct mount;
+ struct swdevt;
+ struct thread;
+ typedef void sw_strategy_t(struct buf *, struct swdevt *);
+@@ -82,6 +83,7 @@ void swap_pager_freespace(vm_object_t object, vm_pindex_t start,
+     vm_size_t size, vm_size_t *freed);
+ void swap_pager_swap_init(void);
+ int swap_pager_nswapdev(void);
++bool swap_pager_mount_busy(struct mount *mp);
+ int swap_pager_reserve(vm_object_t, vm_pindex_t, vm_pindex_t);
+ void swap_pager_status(int *total, int *used);
+ u_long swap_pager_swapped_pages(vm_object_t object);
+-- 
+2.54.0 (Apple Git-157)
+
