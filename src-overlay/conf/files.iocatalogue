@@ -5,3 +5,7 @@
 # ci/prepare-src.sh, NOT in patches/series: a patch can't depend on an overlay
 # file, and every build that lays in this fragment lays in the overlay too.
 dev/iokit/iokit_catalogue.c	standard
+# IOMedia matching (#364): a GEOM class that never attaches; its taste offers
+# each provider's content (GEOM metadata magic, GPT type GUID) to the matcher
+# above, so the GEOM layer kexts load as CoreStorage and AppleRAID do.
+dev/iokit/iokit_media.c		standard
