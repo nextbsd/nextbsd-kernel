@@ -72,3 +72,4 @@
 0080-NextBSD-add-a-swap_lowspace-eventhandler-and-vm.nswa.patch
 0081-NextBSD-VIRF_SWAP-refuses-write-truncate-unlink-and-.patch
 0082-NextBSD-extent-map-swap-pager-swapon-2-on-a-local-UF.patch
+0083-NextBSD-TDP2_VMPRIV-gives-a-thread-the-page-daemon-s.patch
