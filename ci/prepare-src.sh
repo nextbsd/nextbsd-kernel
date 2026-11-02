@@ -218,10 +218,13 @@ echo "==> iocatalogue wired: $(grep -c 'dev/iokit/iokit_catalogue.c' "$SRC/sys/c
 # In-kernel IORegistry (K1, nextbsd#214). `standard`; hangs hw.iokit.registry
 # off the shared hw.iokit node defined (now non-static) by iokit_catalogue.c.
 # The same fragment lists dev/iokit/iokit_hid.c (`optional evdev`, #335), which
-# publishes evdev input nodes as IOHIDDevice entries.
+# publishes evdev input nodes as IOHIDDevice entries, and
+# dev/iokit/iokit_usb.c (`optional usb`, #391), which publishes every USB
+# device as an IOUSBHostDevice entry.
 cat "$REPO/src-overlay/conf/files.ioregistry" >> "$SRC/sys/conf/files"
 test -f "$SRC/sys/dev/iokit/iokit_registry.c"
 test -f "$SRC/sys/dev/iokit/iokit_hid.c"
+test -f "$SRC/sys/dev/iokit/iokit_usb.c"
 test -f "$SRC/sys/dev/iokit/iokit_drm.c"
 test -f "$SRC/sys/sys/ioregistry.h"
 echo "==> ioregistry wired: $(grep -c 'dev/iokit/iokit_registry.c' "$SRC/sys/conf/files") entry; source + header present"

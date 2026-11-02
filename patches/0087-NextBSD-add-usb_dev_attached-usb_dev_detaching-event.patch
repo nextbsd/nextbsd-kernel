@@ -1,0 +1,74 @@
+From fbf1dd418fdfaefb37b350c69e817ad981530937 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sun, 1 Nov 2026 21:01:40 -0600
+Subject: [PATCH] NextBSD: add usb_dev_attached/usb_dev_detaching eventhandlers
+
+A USB device that no driver claims never becomes a newbus device, so the
+only kernel signal of its arrival is the devctl ATTACH/DETACH event, which
+NextBSD has no consumer for (no devd). Invoke two new eventhandlers at the
+same two places: usb_dev_attached once usb_alloc_device() has enumerated
+and configured the device, next to the ATTACH event and before the
+interfaces are probed, and usb_dev_detaching at the start of
+usb_free_device(), next to the DETACH event, while the device descriptor,
+the configuration and the ugen name are still valid.
+
+NextBSD's IORegistry uses this to publish every USB device as an
+IOUSBHostDevice entry, claimed or not, with match and terminate
+notifications (nextbsd/nextbsd-kernel#391), so a firmware loader can find
+a Bluetooth controller in bootloader mode. The eventhandlers are looked
+up by name, so with nothing subscribed the invokes are no-ops.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/dev/usb/usb_device.c |  4 ++++
+ sys/dev/usb/usbdi.h      | 12 ++++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/sys/dev/usb/usb_device.c b/sys/dev/usb/usb_device.c
+index f0989972f..50b4b3c60 100644
+--- a/sys/dev/usb/usb_device.c
++++ b/sys/dev/usb/usb_device.c
+@@ -2104,6 +2104,8 @@ config_done:
+ #if USB_HAVE_DEVCTL
+ 	usb_notify_addq("ATTACH", udev);
+ #endif
++	/* Tell subscribers, whether or not a driver will claim the device */
++	EVENTHANDLER_INVOKE(usb_dev_attached, udev);
+ done:
+ 	if (err) {
+ 		/*
+@@ -2303,6 +2305,8 @@ usb_free_device(struct usb_device *udev, uint8_t flag)
+ #if USB_HAVE_DEVCTL
+ 	usb_notify_addq("DETACH", udev);
+ #endif
++	/* Tell subscribers while the descriptors and ugen name are valid */
++	EVENTHANDLER_INVOKE(usb_dev_detaching, udev);
+ 
+ #if USB_HAVE_UGEN
+ 	if (!rebooting) {
+diff --git a/sys/dev/usb/usbdi.h b/sys/dev/usb/usbdi.h
+index 0826d9f07..627976b44 100644
+--- a/sys/dev/usb/usbdi.h
++++ b/sys/dev/usb/usbdi.h
+@@ -109,6 +109,18 @@ typedef void (*usb_dev_configured_t)(void *, struct usb_device *,
+     struct usb_attach_arg *);
+ EVENTHANDLER_DECLARE(usb_dev_configured, usb_dev_configured_t);
+ 
++/*
++ * Device arrival and departure, whether or not a driver claims the device.
++ * usb_dev_attached is invoked once a device is enumerated and configured,
++ * right after its devctl ATTACH and before its interfaces are probed;
++ * usb_dev_detaching when it is freed, before it is unconfigured.  Both run
++ * in the USB explore (or bus attach/detach) thread, which may sleep.
++ * Handlers must not configure, re-enumerate or free a USB device.
++ */
++typedef void (*usb_dev_event_t)(void *, struct usb_device *);
++EVENTHANDLER_DECLARE(usb_dev_attached, usb_dev_event_t);
++EVENTHANDLER_DECLARE(usb_dev_detaching, usb_dev_event_t);
++
+ /*
+  * The following macros are used used to convert milliseconds into
+  * HZ. We use 1024 instead of 1000 milliseconds per second to save a
+-- 
+2.54.0 (Apple Git-157)
+
