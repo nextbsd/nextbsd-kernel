@@ -77,3 +77,4 @@
 0085-NextBSD-g_part-allow-GEOM-kerneldump-on-a-UFS-partit.patch
 0079-NextBSD-dwmmc-poll-the-controller-while-dumping.patch
 0086-NextBSD-pager-level-swap-encryption-with-an-ephemera.patch
+0087-NextBSD-add-usb_dev_attached-usb_dev_detaching-event.patch

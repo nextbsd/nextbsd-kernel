@@ -10,6 +10,11 @@ dev/iokit/iokit_registry.c	standard
 # because it subscribes to evdev's evdev_registered / evdev_unregistering
 # eventhandlers (patches/0068) and calls evdev_foreach().
 dev/iokit/iokit_hid.c		optional evdev
+# USB -> IORegistry bridge (#391): publishes every USB device, claimed or
+# not, as an IOUSBHostDevice entry. `optional usb` because it subscribes to
+# the USB stack's usb_dev_attached / usb_dev_detaching eventhandlers
+# (patches/0087) and reads struct usb_device.
+dev/iokit/iokit_usb.c		optional usb
 # DRM -> IORegistry bridge (#338): turns drm-kmod's drm_connector_hotplug
 # eventhandler (graphics/drm-kmod-patches in nextbsd-kernel-extensions-graphics) into
 # kIOMessageServicePropertyChange interest messages on the GPU's entry.
