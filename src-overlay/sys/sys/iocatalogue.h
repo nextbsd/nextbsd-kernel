@@ -74,6 +74,27 @@
 #define	IOCAT_VMBUS_PREFIX		"vmbus:"
 
 /*
+ * nextbsd-kernel#393: an IOUSBHostInterface personality that also names
+ * idVendor (but not idProduct), e.g. a vendor-specific class triple such as
+ * 0xFF/01/01, which only one vendor's Bluetooth dongles use. Its own provider
+ * class so IOUSBHostInterface (4) keeps its meaning and a kextd that predates
+ * it keeps working: such a kextd pushes these personalities as plain
+ * IOUSBHostInterface, as before.
+ *
+ * IOUSBInterfaceVendor: match[] holds (vendor, value, mask) TRIPLES. vendor is
+ *   idVendor in the low 16 bits (high 16 zero); value and mask are as for
+ *   IOUSBHostInterface, over 0x00<class><subclass><protocol>. An interface
+ *   matches when its device's idVendor equals vendor and
+ *   (triple & mask) == (value & mask). nmatch is a multiple of 3.
+ *
+ * Precedence for a USB interface, as in Darwin's USB matching (more specific
+ * keys win): an IOUSBHostDevice idVendor+idProduct personality, then an
+ * IOUSBInterfaceVendor one, then a plain IOUSBHostInterface one. IOProbeScore
+ * breaks ties only within a tier.
+ */
+#define	IOCAT_PROVIDER_IOUSBINTERFACEVENDOR 9
+
+/*
  * nextbsd-kernel#364: disk content, as Darwin loads CoreStorage and AppleRAID.
  * IOMedia (IOProviderClass IOMedia + "Content Mask") personalities go through
  * the device-tree string path like ACPI ids, prefixed "media:". A GEOM
@@ -222,6 +243,14 @@ int	iocat_lookup_compat(const char *compat, char *buf, size_t buflen,
 int	iocat_lookup_word(uint32_t provider, uint32_t word, char *buf,
 	    size_t buflen, int32_t *score_out);
 int	iocat_lookup_masked(uint32_t provider, uint32_t word, char *buf,
+	    size_t buflen, int32_t *score_out);
+
+/*
+ * nextbsd-kernel#393: (vendor, value, mask) triple lookup over the
+ * IOUSBInterfaceVendor records: `vendor` is the device's idVendor, `word` the
+ * interface triple. Same contract as above.
+ */
+int	iocat_lookup_usb_vendor(uint32_t vendor, uint32_t word, char *buf,
 	    size_t buflen, int32_t *score_out);
 
 /*

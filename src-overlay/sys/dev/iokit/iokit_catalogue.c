@@ -146,6 +146,10 @@ iocat_add(struct iocat_add *ua)
 	    ua->provider_class == IOCAT_PROVIDER_IOPCICLASS) &&
 	    (ua->nmatch % 2) != 0)
 		return (EINVAL);
+	/* Vendor-qualified interface records carry triples (#393). */
+	if (ua->provider_class == IOCAT_PROVIDER_IOUSBINTERFACEVENDOR &&
+	    (ua->nmatch % 3) != 0)
+		return (EINVAL);
 	/* Force a NUL terminator, then reject an empty bundle id. */
 	ua->bundle_id[IOCAT_BUNDLE_ID_MAX - 1] = '\0';
 	if (ua->bundle_id[0] == '\0')
@@ -237,6 +241,43 @@ iocat_lookup_masked(uint32_t provider, uint32_t word, char *buf, size_t buflen,
 			v = r->match[i];
 			m = r->match[i + 1];
 			if (m == 0 || (word & m) != (v & m))
+				continue;
+			if (best == NULL || r->probe_score > best->probe_score)
+				best = r;
+			break;
+		}
+	}
+	if (best != NULL) {
+		strlcpy(buf, best->bundle_id, buflen);
+		if (score_out != NULL)
+			*score_out = best->probe_score;
+	}
+	sx_sunlock(&iocat_lock);
+	return (best != NULL ? 0 : ENOENT);
+}
+
+/*
+ * (vendor, value, mask) triple match for IOUSBInterfaceVendor (#393): the
+ * IOUSBHostInterface pair match, restricted to one idVendor. As there, an
+ * all-zero mask is skipped rather than treated as a wildcard.
+ */
+int
+iocat_lookup_usb_vendor(uint32_t vendor, uint32_t word, char *buf,
+    size_t buflen, int32_t *score_out)
+{
+	struct iocat_record *r, *best;
+	uint32_t i, v, m;
+
+	best = NULL;
+	sx_slock(&iocat_lock);
+	TAILQ_FOREACH(r, &iocat_list, link) {
+		if (r->provider_class != IOCAT_PROVIDER_IOUSBINTERFACEVENDOR)
+			continue;
+		for (i = 0; i + 2 < r->nmatch; i += 3) {
+			v = r->match[i + 1];
+			m = r->match[i + 2];
+			if (r->match[i] != vendor || m == 0 ||
+			    (word & m) != (v & m))
 				continue;
 			if (best == NULL || r->probe_score > best->probe_score)
 				best = r;
@@ -576,9 +617,15 @@ iocat_lookup_work(const struct iocat_match_work *w, char *buf, size_t buflen,
 		return (iocat_lookup_word(IOCAT_PROVIDER_IOVIRTIODEVICE,
 		    w->match_word, buf, buflen, score_out));
 	case IOCAT_KIND_USB:
-		/* Darwin precedence: a vendor/product personality, then class. */
+		/*
+		 * Darwin precedence, most specific keys first: a vendor/product
+		 * personality, then a vendor + class one (#393), then class.
+		 */
 		if (iocat_lookup_word(IOCAT_PROVIDER_IOUSBHOSTDEVICE,
 		    w->match_word, buf, buflen, score_out) == 0)
+			return (0);
+		if (iocat_lookup_usb_vendor(w->match_word & 0xffff,
+		    w->class_word, buf, buflen, score_out) == 0)
 			return (0);
 		return (iocat_lookup_masked(IOCAT_PROVIDER_IOUSBHOSTINTERFACE,
 		    w->class_word, buf, buflen, score_out));
