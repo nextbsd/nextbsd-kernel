@@ -78,3 +78,5 @@
 0079-NextBSD-dwmmc-poll-the-controller-while-dumping.patch
 0086-NextBSD-pager-level-swap-encryption-with-an-ephemera.patch
 0087-NextBSD-add-usb_dev_attached-usb_dev_detaching-event.patch
+0088-NextBSD-add-acpi_lid_event-acpi_button_event-acpi_cm.patch
+0089-NextBSD-fixed-feature-buttons-fire-acpi_button_event.patch

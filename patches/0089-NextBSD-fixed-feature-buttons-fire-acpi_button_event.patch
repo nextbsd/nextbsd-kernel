@@ -1,0 +1,187 @@
+From d8ab653405f9a0a148199015d70ccf8a9e2150f5 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Mon, 2 Nov 2026 21:07:10 -0600
+Subject: [PATCH 89/89] NextBSD: fixed-feature buttons fire acpi_button_event;
+ record a power button wake
+
+The fixed-feature power and sleep buttons only invoke acpi_sleep_event,
+so a listener on acpi_button_event never sees them.  QEMU's
+system_powerdown and many laptops use the fixed power button.  Install
+small wrappers as the fixed event handlers that queue acpi_button_event
+on the ACPI task thread and then do what acpi_event_*_button_sleep
+always did.  A control-method button already invokes acpi_button_event
+in acpi_button.c before it calls acpi_event_*_button_sleep, so each
+press is reported once.  No devctl event is added.
+
+On resume from S3, acpi_EnterSleepState clears a latched fixed power
+button status so the wake is not taken for a poweroff request, which
+also erases the only evidence that the button woke the system.  Record
+it first, and record a control-method power button's wake notify too
+(acpi_event_power_button_wake).  The flag is cleared on entry to each
+sleep and is read with acpi_woke_by_power_button() (and the read-only
+sysctl hw.acpi.wake_power_button), so NextBSD's IOPMrootDomain can
+report a "Wake Reason" of power button.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/dev/acpica/acpi.c    | 69 ++++++++++++++++++++++++++++++++++++++--
+ sys/dev/acpica/acpivar.h |  1 +
+ 2 files changed, 68 insertions(+), 2 deletions(-)
+
+diff --git a/sys/dev/acpica/acpi.c b/sys/dev/acpica/acpi.c
+index 3951d817..0310c604 100644
+--- a/sys/dev/acpica/acpi.c
++++ b/sys/dev/acpica/acpi.c
+@@ -168,6 +168,8 @@ static ACPI_STATUS acpi_sleep_disable(struct acpi_softc *sc);
+ static ACPI_STATUS acpi_EnterSleepState(struct acpi_softc *sc, int state);
+ static void	acpi_shutdown_final(void *arg, int howto);
+ static void	acpi_enable_fixed_events(struct acpi_softc *sc);
++static UINT32	acpi_event_power_button_fixed(void *context);
++static UINT32	acpi_event_sleep_button_fixed(void *context);
+ static void	acpi_resync_clock(struct acpi_softc *sc);
+ static int	acpi_wake_sleep_prep(ACPI_HANDLE handle, int sstate);
+ static int	acpi_wake_run_prep(ACPI_HANDLE handle, int sstate);
+@@ -307,6 +309,17 @@ SYSCTL_INT(_debug_acpi, OID_AUTO, default_register_width, CTLFLAG_RDTUN,
+ /* Allow users to override quirks. */
+ TUNABLE_INT("debug.acpi.quirks", &acpi_quirks);
+ 
++/* Button types passed to acpi_button_event from the fixed-feature buttons. */
++static int acpi_fixed_power_button = ACPI_POWER_BUTTON;
++static int acpi_fixed_sleep_button = ACPI_SLEEP_BUTTON;
++
++/*
++ * Set when the power button woke the system from the last sleep, as seen
++ * by the latched fixed-feature status or a control-method button's wake
++ * notify.  Cleared on entry to each sleep.
++ */
++static int acpi_wake_power_button;
++
+ int acpi_susp_bounce;
+ SYSCTL_INT(_debug_acpi, OID_AUTO, suspend_bounce, CTLFLAG_RW,
+     &acpi_susp_bounce, 0, "Don't actually suspend, just test devices.");
+@@ -627,6 +640,9 @@ acpi_attach(device_t dev)
+     SYSCTL_ADD_INT(&sc->acpi_sysctl_ctx, SYSCTL_CHILDREN(sc->acpi_sysctl_tree),
+ 	OID_AUTO, "handle_reboot", CTLFLAG_RW,
+ 	&sc->acpi_handle_reboot, 0, "Use ACPI Reset Register to reboot");
++    SYSCTL_ADD_INT(&sc->acpi_sysctl_ctx, SYSCTL_CHILDREN(sc->acpi_sysctl_tree),
++	OID_AUTO, "wake_power_button", CTLFLAG_RD, &acpi_wake_power_button, 0,
++	"The power button woke the system from the last sleep");
+ 
+ #if defined(__amd64__) || defined(__i386__)
+     /*
+@@ -2541,14 +2557,14 @@ acpi_enable_fixed_events(struct acpi_softc *sc)
+     if ((AcpiGbl_FADT.Flags & ACPI_FADT_POWER_BUTTON) == 0) {
+ 	AcpiClearEvent(ACPI_EVENT_POWER_BUTTON);
+ 	AcpiInstallFixedEventHandler(ACPI_EVENT_POWER_BUTTON,
+-				     acpi_event_power_button_sleep, sc);
++				     acpi_event_power_button_fixed, sc);
+ 	if (first_time)
+ 	    device_printf(sc->acpi_dev, "Power Button (fixed)\n");
+     }
+     if ((AcpiGbl_FADT.Flags & ACPI_FADT_SLEEP_BUTTON) == 0) {
+ 	AcpiClearEvent(ACPI_EVENT_SLEEP_BUTTON);
+ 	AcpiInstallFixedEventHandler(ACPI_EVENT_SLEEP_BUTTON,
+-				     acpi_event_sleep_button_sleep, sc);
++				     acpi_event_sleep_button_fixed, sc);
+ 	if (first_time)
+ 	    device_printf(sc->acpi_dev, "Sleep Button (fixed)\n");
+     }
+@@ -3414,6 +3430,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, int state)
+     bus_topo_lock();
+ 
+     slp_state = ACPI_SS_NONE;
++    acpi_wake_power_button = 0;
+ 
+     sc->acpi_sstate = state;
+ 
+@@ -3481,6 +3498,8 @@ acpi_EnterSleepState(struct acpi_softc *sc, int state)
+ 	     */
+ 	    if (ACPI_SUCCESS(AcpiGetEventStatus(ACPI_EVENT_POWER_BUTTON,
+ 		&power_button_status)) && power_button_status != 0) {
++		/* Keep the only evidence that the power button woke us. */
++		acpi_wake_power_button = 1;
+ 		AcpiClearEvent(ACPI_EVENT_POWER_BUTTON);
+ 		device_printf(sc->acpi_dev,
+ 		    "cleared fixed power button status\n");
+@@ -3910,6 +3929,40 @@ acpi_invoke_wake_eventhandler(void *context)
+     EVENTHANDLER_INVOKE(acpi_wakeup_event, *(int *)context);
+ }
+ 
++static void
++acpi_invoke_button_eventhandler(void *context)
++{
++
++    EVENTHANDLER_INVOKE(acpi_button_event, *(int *)context);
++}
++
++/*
++ * Fixed-feature buttons.  A control-method button (acpi_button.c) invokes
++ * acpi_button_event itself before calling acpi_event_*_button_sleep, so
++ * only the fixed handlers queue it here; each press is reported once.
++ */
++static UINT32
++acpi_event_power_button_fixed(void *context)
++{
++
++    ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
++
++    AcpiOsExecute(OSL_NOTIFY_HANDLER, acpi_invoke_button_eventhandler,
++	&acpi_fixed_power_button);
++    return_VALUE (acpi_event_power_button_sleep(context));
++}
++
++static UINT32
++acpi_event_sleep_button_fixed(void *context)
++{
++
++    ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
++
++    AcpiOsExecute(OSL_NOTIFY_HANDLER, acpi_invoke_button_eventhandler,
++	&acpi_fixed_sleep_button);
++    return_VALUE (acpi_event_sleep_button_sleep(context));
++}
++
+ UINT32
+ acpi_event_power_button_sleep(void *context)
+ {
+@@ -3939,6 +3992,7 @@ acpi_event_power_button_wake(void *context)
+ 
+     ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
+ 
++    acpi_wake_power_button = 1;
+     if (ACPI_FAILURE(AcpiOsExecute(OSL_NOTIFY_HANDLER,
+ 	acpi_invoke_wake_eventhandler, &sc->acpi_power_button_sx)))
+ 	return_VALUE (ACPI_INTERRUPT_NOT_HANDLED);
+@@ -3971,6 +4025,17 @@ acpi_event_sleep_button_wake(void *context)
+     return_VALUE (ACPI_INTERRUPT_HANDLED);
+ }
+ 
++/*
++ * True if the power button woke the system from the last sleep, for the
++ * IOPMrootDomain "Wake Reason".  Valid once the system has resumed.
++ */
++int
++acpi_woke_by_power_button(void)
++{
++
++    return (acpi_wake_power_button);
++}
++
+ /*
+  * XXX This static buffer is suboptimal.  There is no locking so only
+  * use this for single-threaded callers.
+diff --git a/sys/dev/acpica/acpivar.h b/sys/dev/acpica/acpivar.h
+index 973f874b..2d130c5e 100644
+--- a/sys/dev/acpica/acpivar.h
++++ b/sys/dev/acpica/acpivar.h
+@@ -476,6 +476,7 @@ UINT32		acpi_event_power_button_sleep(void *context);
+ UINT32		acpi_event_power_button_wake(void *context);
+ UINT32		acpi_event_sleep_button_sleep(void *context);
+ UINT32		acpi_event_sleep_button_wake(void *context);
++int		acpi_woke_by_power_button(void);
+ 
+ #define ACPI_EVENT_PRI_FIRST      0
+ #define ACPI_EVENT_PRI_DEFAULT    10000
+-- 
+2.54.0 (Apple Git-157)
+
