@@ -55,8 +55,11 @@
  * makes the root domain send kIOPMMessageRequestUserActive (xnu's
  * requestUserActive() without a display wrangler), so pmconfigd wakes the
  * display it put to sleep at once. pmconfigd's shortest display sleep is a
- * minute, so the display cannot sleep without such a gap first. The message
- * is sent from taskqueue_thread, since evdev calls in with its lock held.
+ * minute, so the display cannot sleep without such a gap first, except when
+ * it is put to sleep on request (pmset displaysleepnow): while pmconfigd has
+ * reported the display off (IOPMROOT_SETDISPLAY), the first input asks at
+ * once (iopmroot_display_wake_take()). The message is sent from
+ * taskqueue_thread, since evdev calls in with its lock held.
  *
  * Nothing here prints: a normal boot stays silent on the console.
  */
@@ -387,7 +390,8 @@ iokit_hidsys_input(struct evdev_dev *evdev __unused, uint16_t type __unused)
 	now = sbinuptime();
 	last = (sbintime_t)atomic_load_acq_64(&iokit_hidsys_last);
 	atomic_store_rel_64(&iokit_hidsys_last, (uint64_t)now);
-	if (last == 0 || now - last >= IOKIT_HIDSYS_TICKLE_GAP)
+	if (last == 0 || now - last >= IOKIT_HIDSYS_TICKLE_GAP ||
+	    iopmroot_display_wake_take())
 		taskqueue_enqueue(taskqueue_thread, &iokit_hidsys_task);
 }
 

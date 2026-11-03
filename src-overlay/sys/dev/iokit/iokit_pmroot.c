@@ -116,6 +116,8 @@
 #include <sys/ioregistry.h>
 #include <sys/iopmroot.h>
 
+#include <machine/atomic.h>
+
 #ifdef DEV_ACPI
 #include <contrib/dev/acpica/include/acpi.h>
 #include <dev/acpica/acpivar.h>
@@ -268,6 +270,7 @@ static struct {
 	uint32_t	aggr[IOPMROOT_AGGR_MAX];
 	uint64_t	assertion_levels;
 	int64_t		tickle;
+	struct iopm_fd	*display_fd;	/* reported the display off */
 
 	uint32_t	last_reason;
 	pid_t		last_pid;
@@ -1101,6 +1104,30 @@ iopmroot_request_user_active(uint64_t regid)
 	    regid, 0, NULL);
 }
 
+/*
+ * kPMSetDisplayState. xnu's display wrangler hears every HID event and wakes
+ * the display on the first one after it went off. pmconfigd runs the
+ * wrangler here, and the HID side asks for user activity only after a quiet
+ * spell (iokit_hid.c), which a display put to sleep on request has not had.
+ * While the display is off, the first input asks at once: the flag is armed
+ * when pmconfigd reports the display off and taken by that input.
+ */
+static volatile u_int iopm_display_wake_armed;
+
+bool
+iopmroot_display_wake_take(void)
+{
+	return (atomic_cmpset_int(&iopm_display_wake_armed, 1, 0) != 0);
+}
+
+static void
+iopm_set_display_locked(struct iopm_fd *fd, bool on)
+{
+	mtx_assert(&iopm_mtx, MA_OWNED);
+	iopm.display_fd = on ? NULL : fd;
+	atomic_store_rel_int(&iopm_display_wake_armed, on ? 0 : 1);
+}
+
 /* xnu: with the lid closed and clamshell sleep allowed, sleep. Only the
  * policy owner's rules act here; without one the kernel's lid action has
  * already requested the sleep. */
@@ -1401,6 +1428,8 @@ iopm_fd_dtor(void *data)
 
 	mtx_lock(&iopm_mtx);
 	iopm_release_policy_locked(fd);
+	if (iopm.display_fd == fd)
+		iopm_set_display_locked(NULL, true);
 	/* Its process may have exited: recheck the clients still awaited. */
 	iopm.reap = true;
 	cv_broadcast(&iopm_cv);
@@ -1608,6 +1637,8 @@ iopm_getstate(struct iopmroot_state *st)
 		st->flags |= IOPMROOT_F_SYSTEM_SHUTDOWN;
 	if (iopm.owner != NULL)
 		st->flags |= IOPMROOT_F_POLICY_OWNED;
+	if (iopm.display_fd != NULL)
+		st->flags |= IOPMROOT_F_DISPLAY_OFF;
 	mtx_unlock(&iopm_mtx);
 	if (iopm_alarm_supported())
 		st->flags |= IOPMROOT_F_WAKE_ALARM;
@@ -1673,6 +1704,7 @@ iopm_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 	case IOPMROOT_SETCLAMSHELL:
 	case IOPMROOT_IDLEREVERT:
 	case IOPMROOT_SETMAINTWAKE:
+	case IOPMROOT_SETDISPLAY:
 		break;
 	default:
 		return (ENOTTY);
@@ -1722,6 +1754,11 @@ iopm_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		return (0);
 	case IOPMROOT_SETMAINTWAKE:
 		return (iopm_ioctl_maintwake((struct iopmroot_calendar *)data));
+	case IOPMROOT_SETDISPLAY:
+		mtx_lock(&iopm_mtx);
+		iopm_set_display_locked(fd, *(uint32_t *)data != 0);
+		mtx_unlock(&iopm_mtx);
+		return (0);
 	}
 	return (ENOTTY);
 }
