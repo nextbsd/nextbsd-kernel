@@ -116,6 +116,8 @@ struct ioreg_virt {
 					   driver (newbus), path, pci_* */
 	nvlist_t	*props;		/* extra keys, owned; may be NULL */
 	bool		permanent;	/* IOResources: never retired */
+	ioreg_serializer_t *ser;	/* computed keys while live (#239) */
+	void		*ser_arg;
 };
 
 struct ioreg_ent {
@@ -716,7 +718,9 @@ ioreg_props(struct ioreg_props *p)
 	device_t dev;
 	uint64_t id, parent_id;
 	int state, error;
-	nvlist_t *nvl, *extra;
+	nvlist_t *nvl, *extra, *computed;
+	ioreg_serializer_t *ser;
+	void *ser_arg;
 	void *packed;
 	size_t plen;
 	uint32_t outlen;
@@ -724,6 +728,8 @@ ioreg_props(struct ioreg_props *p)
 
 	id = p->id;
 	extra = NULL;
+	ser = NULL;
+	ser_arg = NULL;
 	sx_xlock(&ioreg_lock);
 	{
 		struct ioreg_ent *e = ioreg_find_id_locked(id);
@@ -737,8 +743,24 @@ ioreg_props(struct ioreg_props *p)
 			ioreg_virt_fill_node_locked(e, &vn);
 			if (e->virt->props != NULL)
 				extra = nvlist_clone(e->virt->props);
+			if (e->state == IOREG_STATE_LIVE) {
+				ser = e->virt->ser;
+				ser_arg = e->virt->ser_arg;
+			}
 			sx_xunlock(&ioreg_lock);
 			nvl = ioreg_build_bag_node(&vn, NULL);
+			/* Computed keys are made now, as Darwin's
+			 * OSSerializer does on each read; they win over
+			 * stored keys of the same name. */
+			if (nvl != NULL && ser != NULL) {
+				computed = nvlist_create(0);
+				if (computed != NULL) {
+					ser(ser_arg, computed);
+					if (nvlist_error(computed) == 0)
+						ioreg_bag_merge(nvl, computed);
+					nvlist_destroy(computed);
+				}
+			}
 			if (nvl != NULL && extra != NULL)
 				ioreg_bag_merge(nvl, extra);
 			if (extra != NULL)
@@ -1849,6 +1871,28 @@ ioreg_update_virtual(uint64_t id, nvlist_t *props)
 		nvlist_destroy(old);
 	nvlist_destroy(props);
 	ioreg_message_entry(id, IOREG_MSG_SERVICE_PROPERTY_CHANGE, 0, 0, NULL);
+	return (0);
+}
+
+/*
+ * ioreg_set_serializer: see sys/ioregistry.h. Only a live virtual entry
+ * takes one; it stops being called once the entry is retired.
+ */
+int
+ioreg_set_serializer(uint64_t id, ioreg_serializer_t *fn, void *arg)
+{
+	struct ioreg_ent *e;
+
+	sx_xlock(&ioreg_lock);
+	e = ioreg_find_id_locked(id);
+	if (e == NULL || e->kind != IOREG_KIND_VIRTUAL ||
+	    e->state != IOREG_STATE_LIVE) {
+		sx_xunlock(&ioreg_lock);
+		return (ENOENT);
+	}
+	e->virt->ser = fn;
+	e->virt->ser_arg = (fn != NULL) ? arg : NULL;
+	sx_xunlock(&ioreg_lock);
 	return (0);
 }
 

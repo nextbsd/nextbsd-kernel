@@ -1088,6 +1088,19 @@ iopm_clamshell_publish(bool message)
 		    (sleeps ? IOPMROOT_CLAMSHELL_SLEEP_BIT : 0), 0, NULL);
 }
 
+/*
+ * xnu's requestUserActive() without a display wrangler: tell pmconfigd
+ * (a general-interest client here; xnu's capability notifier) that a HID
+ * driver saw the user. pmconfigd declares the user active, which wakes the
+ * display it runs. Before the entry exists this matches nothing.
+ */
+void
+iopmroot_request_user_active(uint64_t regid)
+{
+	ioreg_message_entry(iopm_regid, IOPMROOT_MSG_REQUEST_USER_ACTIVE,
+	    regid, 0, NULL);
+}
+
 /* xnu: with the lid closed and clamshell sleep allowed, sleep. Only the
  * policy owner's rules act here; without one the kernel's lid action has
  * already requested the sleep. */

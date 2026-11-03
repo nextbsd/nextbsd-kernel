@@ -6,9 +6,11 @@
 # files.iocatalogue.
 dev/iokit/iokit_registry.c	standard
 # evdev -> IORegistry bridge (#335, part of #331): publishes each
-# /dev/input/eventN (uinput included) as an IOHIDDevice entry. `optional evdev`
+# /dev/input/eventN (uinput included) as an IOHIDDevice entry, plus the one
+# IOHIDSystem entry with HIDIdleTime (nextbsd-userland#239). `optional evdev`
 # because it subscribes to evdev's evdev_registered / evdev_unregistering
-# eventhandlers (patches/0068) and calls evdev_foreach().
+# eventhandlers (patches/0068), calls evdev_foreach() and sets
+# evdev_user_input_hook (patches/0093).
 dev/iokit/iokit_hid.c		optional evdev
 # USB -> IORegistry bridge (#391): publishes every USB device, claimed or
 # not, as an IOUSBHostDevice entry. `optional usb` because it subscribes to

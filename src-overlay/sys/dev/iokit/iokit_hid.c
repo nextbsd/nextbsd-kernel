@@ -41,6 +41,23 @@
  * uinput client, whose phys is not a newbus nameunit anyway) the entry goes
  * under IOResources.
  *
+ * IOHIDSystem (nextbsd-userland#239). As on Darwin, one IOHIDSystem entry
+ * sits under IOResources with HIDIdleTime, the nanoseconds since the user
+ * last touched any input device, which pmconfigd reads to run display and
+ * idle sleep. evdev calls iokit_hidsys_input() for every key, relative and
+ * absolute event (patch 0093), which only records the time; HIDIdleTime is
+ * computed from it when the property is read (ioreg_set_serializer(), as
+ * IOHIDSystem uses an OSSerializer), so nothing is written per event. As
+ * Darwin reports 0 until the WindowServer has opened the event system, the
+ * idle time is 0 while no evdev node has an open client (no window server):
+ * nothing then idles the display or the system, as on a Mac without a
+ * WindowServer. The first input after IOKIT_HIDSYS_TICKLE_GAP without any
+ * makes the root domain send kIOPMMessageRequestUserActive (xnu's
+ * requestUserActive() without a display wrangler), so pmconfigd wakes the
+ * display it put to sleep at once. pmconfigd's shortest display sleep is a
+ * minute, so the display cannot sleep without such a gap first. The message
+ * is sent from taskqueue_thread, since evdev calls in with its lock held.
+ *
  * Nothing here prints: a normal boot stays silent on the console.
  */
 
@@ -56,8 +73,13 @@
 #include <sys/bus.h>
 #include <sys/bitstring.h>
 #include <sys/eventhandler.h>
+#include <sys/taskqueue.h>
+#include <sys/time.h>
 #include <sys/nv.h>
 #include <sys/ioregistry.h>
+#include <sys/iopmroot.h>
+
+#include <machine/atomic.h>
 
 #include <dev/evdev/input.h>
 #include <dev/evdev/evdev.h>
@@ -66,6 +88,9 @@
 #include <dev/hid/hidbus.h>
 
 #define	IOKIT_HID_CLASS		"IOHIDDevice"
+#define	IOKIT_HIDSYS_CLASS	"IOHIDSystem"
+#define	IOKIT_HIDSYS_IDLE_KEY	"HIDIdleTime"	/* kIOHIDIdleTimeKey */
+#define	IOKIT_HIDSYS_TICKLE_GAP	(30 * SBT_1S)	/* quiet before a request */
 
 static MALLOC_DEFINE(M_IOKITHID, "iokit_hid", "IORegistry evdev bridge");
 
@@ -84,6 +109,12 @@ SX_SYSINIT(iokit_hid_lock, &iokit_hid_lock, "iokit hid");
 
 static eventhandler_tag iokit_hid_reg_tag;
 static eventhandler_tag iokit_hid_unreg_tag;
+
+/* IOHIDSystem: the entry, the last input (sbinuptime(), 0 before any), and
+ * the task that asks the root domain to make the user active. */
+static uint64_t iokit_hidsys_id;
+static volatile uint64_t iokit_hidsys_last;
+static struct task iokit_hidsys_task;
 
 static struct iokit_hid_ent *
 iokit_hid_find_locked(struct evdev_dev *evdev)
@@ -343,6 +374,77 @@ iokit_hid_unregistering(void *arg __unused, struct evdev_dev *evdev)
 	free(he, M_IOKITHID);
 }
 
+/*
+ * evdev_user_input_hook (patch 0093): user input on any evdev node. Runs
+ * with the device's evdev lock held or in the input epoch; it only stores
+ * the time and, after a quiet spell, queues the request.
+ */
+static void
+iokit_hidsys_input(struct evdev_dev *evdev __unused, uint16_t type __unused)
+{
+	sbintime_t now, last;
+
+	now = sbinuptime();
+	last = (sbintime_t)atomic_load_acq_64(&iokit_hidsys_last);
+	atomic_store_rel_64(&iokit_hidsys_last, (uint64_t)now);
+	if (last == 0 || now - last >= IOKIT_HIDSYS_TICKLE_GAP)
+		taskqueue_enqueue(taskqueue_thread, &iokit_hidsys_task);
+}
+
+static void
+iokit_hidsys_request_active(void *arg __unused, int pending __unused)
+{
+	iopmroot_request_user_active(iokit_hidsys_id);
+}
+
+/*
+ * HIDIdleTime, made on each read: nanoseconds since the last input (since
+ * boot if there has been none), or 0 while no evdev node has a client,
+ * Darwin's "event system not open". The client lists are only looked at;
+ * a node being opened or closed meanwhile just tips the answer.
+ */
+static void
+iokit_hidsys_serialize(void *arg __unused, nvlist_t *bag)
+{
+	struct iokit_hid_ent *he;
+	sbintime_t now, last;
+	uint64_t idle;
+	bool open;
+
+	open = false;
+	sx_slock(&iokit_hid_lock);
+	LIST_FOREACH(he, &iokit_hid_list, link) {
+		if (!CK_SLIST_EMPTY(&he->evdev->ev_clients)) {
+			open = true;
+			break;
+		}
+	}
+	sx_sunlock(&iokit_hid_lock);
+
+	idle = 0;
+	if (open) {
+		now = sbinuptime();
+		last = (sbintime_t)atomic_load_acq_64(&iokit_hidsys_last);
+		if (now > last)
+			idle = (uint64_t)sbttons(now - last);
+	}
+	nvlist_add_number(bag, IOKIT_HIDSYS_IDLE_KEY, idle);
+}
+
+/* Publish IOHIDSystem under IOResources and start following input. */
+static void
+iokit_hidsys_init(void)
+{
+	TASK_INIT(&iokit_hidsys_task, 0, iokit_hidsys_request_active, NULL);
+	iokit_hidsys_id = ioreg_publish_virtual(NULL, IOKIT_HIDSYS_CLASS,
+	    IOKIT_HIDSYS_CLASS, NULL);
+	if (iokit_hidsys_id == 0)
+		return;
+	(void)ioreg_set_serializer(iokit_hidsys_id, iokit_hidsys_serialize,
+	    NULL);
+	evdev_user_input_hook = iokit_hidsys_input;
+}
+
 static void
 iokit_hid_catchup(struct evdev_dev *evdev, void *arg __unused)
 {
@@ -360,6 +462,7 @@ iokit_hid_catchup(struct evdev_dev *evdev, void *arg __unused)
 static void
 iokit_hid_init(void *arg __unused)
 {
+	iokit_hidsys_init();
 	iokit_hid_reg_tag = EVENTHANDLER_REGISTER(evdev_registered,
 	    iokit_hid_registered, NULL, EVENTHANDLER_PRI_ANY);
 	iokit_hid_unreg_tag = EVENTHANDLER_REGISTER(evdev_unregistering,
