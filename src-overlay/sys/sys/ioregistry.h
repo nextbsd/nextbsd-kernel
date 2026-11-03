@@ -270,6 +270,28 @@ int	ioreg_retire_virtual(uint64_t id);
  */
 void	ioreg_message_device(struct _device *dev, uint32_t message,
 	    uint64_t arg0, uint64_t arg1, const char *devnode);
+
+/*
+ * Live property updates (#241), IORegistryEntry::setProperty() on Darwin.
+ * ioreg_update_virtual() merges `props` (strings, numbers, bools; other
+ * types are dropped) into the bag of the live virtual entry `id`: a key in
+ * `props` replaces the entry's earlier value for that key, keys it does not
+ * name are kept, and the registry's own keys (id, name, class, ...) still
+ * win. The new bag is swapped in whole, so IOREGIOCPROPS never sees a partial
+ * update. Ownership of `props` passes to the registry in every case. On
+ * success kIOMessageServicePropertyChange (arguments 0, 0) then goes to every
+ * IOREGIOCINTEREST watch on the entry. Returns 0, EINVAL for a NULL or
+ * errored `props`, ENOENT if `id` is not a live virtual entry, ENOMEM.
+ *
+ * ioreg_message_entry() is ioreg_message_device() by registry id, for any
+ * live entry (virtual ones included); a stale or retired id matches nothing.
+ *
+ * Both may sleep (sx + M_WAITOK); call them from a sleepable context with no
+ * non-sleepable lock held.
+ */
+int	ioreg_update_virtual(uint64_t id, struct nvlist *props);
+void	ioreg_message_entry(uint64_t id, uint32_t message, uint64_t arg0,
+	    uint64_t arg1, const char *devnode);
 #endif /* _KERNEL */
 
 #endif /* _SYS_IOREGISTRY_H_ */

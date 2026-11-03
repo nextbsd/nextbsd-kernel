@@ -72,6 +72,10 @@ extern int iokit_notify_send_interest(void *port_ref, uint32_t message,
 #define	IOREG_MSG_SERVICE_IS_TERMINATED	0xe0000010
 #endif
 
+/* Darwin's kIOMessageServicePropertyChange, sent by ioreg_update_virtual();
+ * == IOKIT_NOTIFY_MSG_SERVICE_PROPERTY_CHANGE in <sys/mach/iokit_notify.h>. */
+#define	IOREG_MSG_SERVICE_PROPERTY_CHANGE	0xe0000130
+
 static MALLOC_DEFINE(M_IOREG, "ioregistry", "in-kernel IOKit registry id map");
 
 /* Bound recursion depth so a pathological tree can't blow the kernel stack.
@@ -1303,6 +1307,31 @@ ioreg_message_device(device_t dev, uint32_t message, uint64_t arg0,
 }
 
 /*
+ * ioreg_message_entry: see sys/ioregistry.h. The id-based sibling of
+ * ioreg_message_device, for entries with no device_t (virtual ones).
+ */
+void
+ioreg_message_entry(uint64_t id, uint32_t message, uint64_t arg0,
+    uint64_t arg1, const char *devnode)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_ent *e;
+	bool live;
+
+	if (id == 0 || ioreg_interest_count == 0)
+		return;
+	sx_slock(&ioreg_lock);
+	e = ioreg_find_id_locked(id);
+	live = (e != NULL && e->state == IOREG_STATE_LIVE);
+	sx_sunlock(&ioreg_lock);
+	if (live)
+		ioreg_message_id(id, message, arg0, arg1, devnode);
+#else
+	(void)id; (void)message; (void)arg0; (void)arg1; (void)devnode;
+#endif
+}
+
+/*
  * Drop every registered watch (releasing its send right + criteria). Called at
  * MOD_UNLOAD so the module can be unloaded without leaking ipc_port_t refs.
  */
@@ -1631,6 +1660,60 @@ ioreg_retire_virtual(uint64_t id)
 	sx_xunlock(&ioreg_lock);
 
 	ioreg_emit_event_node(&n, NULL, IOREG_EVENT_DEPART);
+	return (0);
+}
+
+/*
+ * ioreg_update_virtual: see sys/ioregistry.h. The merged bag is built in
+ * full and swapped in under the lock, so a reader (IOREGIOCPROPS clones the
+ * bag under the same lock) sees either the old bag or the new one, never a
+ * half-applied update. Only the types ioreg_bag_merge serves are kept.
+ */
+int
+ioreg_update_virtual(uint64_t id, nvlist_t *props)
+{
+	struct ioreg_ent *e;
+	nvlist_t *bag, *old;
+
+	if (props == NULL)
+		return (EINVAL);
+	if (nvlist_error(props) != 0) {
+		nvlist_destroy(props);
+		return (EINVAL);
+	}
+
+	bag = nvlist_create(0);
+	if (bag == NULL) {
+		nvlist_destroy(props);
+		return (ENOMEM);
+	}
+	sx_xlock(&ioreg_lock);
+	e = ioreg_find_id_locked(id);
+	if (e == NULL || e->kind != IOREG_KIND_VIRTUAL ||
+	    e->state != IOREG_STATE_LIVE) {
+		sx_xunlock(&ioreg_lock);
+		nvlist_destroy(bag);
+		nvlist_destroy(props);
+		return (ENOENT);
+	}
+	/* The new keys first, then the earlier keys they do not replace. */
+	ioreg_bag_merge(bag, props);
+	if (e->virt->props != NULL)
+		ioreg_bag_merge(bag, e->virt->props);
+	if (nvlist_error(bag) != 0) {
+		sx_xunlock(&ioreg_lock);
+		nvlist_destroy(bag);
+		nvlist_destroy(props);
+		return (ENOMEM);
+	}
+	old = e->virt->props;
+	e->virt->props = bag;
+	sx_xunlock(&ioreg_lock);
+
+	if (old != NULL)
+		nvlist_destroy(old);
+	nvlist_destroy(props);
+	ioreg_message_entry(id, IOREG_MSG_SERVICE_PROPERTY_CHANGE, 0, 0, NULL);
 	return (0);
 }
 
