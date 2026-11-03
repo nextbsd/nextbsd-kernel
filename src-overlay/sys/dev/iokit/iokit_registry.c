@@ -36,6 +36,7 @@
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/malloc.h>
+#include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/sx.h>
 #include <sys/lock.h>
@@ -156,13 +157,25 @@ static uint64_t ioreg_next_id = 1;	/* 0 is reserved as "invalid" */
  * selects it. It receives ioreg_message_device() messages for `target`, and
  * kIOMessageServiceIsTerminated when `target` departs, after which it is
  * dropped. Match watches have target == 0.
+ *
+ * `interest` is the IOREG_INTEREST_* type. ioreg_message_device() and
+ * ioreg_message_entry() reach only IOREG_INTEREST_GENERAL watches. An
+ * IOREG_INTEREST_APP_POWER watch (kIOAppPowerStateInterest) is messaged one
+ * by one through its `client` handle (ioreg_interest_clients(),
+ * ioreg_message_client()), because the root domain sends each app its own
+ * acknowledgement id. `pid` and `comm` name the registering process for the
+ * root domain's tardy-client log.
  */
 struct ioreg_watch {
 	TAILQ_ENTRY(ioreg_watch) link;
 	struct ioreg_criteria criteria;	/* flat match criteria (by value) */
 	uint32_t	mask;		/* OR of IOREG_EVENT_* to deliver */
+	uint32_t	interest;	/* interest watch: IOREG_INTEREST_* */
 	void		*port;		/* opaque retained send right */
 	uint64_t	target;		/* interest watch: entry id; else 0 */
+	uint64_t	client;		/* interest watch: stable handle */
+	pid_t		pid;		/* interest watch: registering pid */
+	char		comm[MAXCOMLEN + 1]; /* and its p_comm */
 };
 static TAILQ_HEAD(, ioreg_watch) ioreg_watches =
     TAILQ_HEAD_INITIALIZER(ioreg_watches);
@@ -170,6 +183,9 @@ static struct sx ioreg_watch_lock;
 SX_SYSINIT(ioreg_watch_lock, &ioreg_watch_lock, "ioregwatch");
 static u_int ioreg_watch_count;		/* # registered watches (debug) */
 static u_int ioreg_interest_count;	/* # of those that are interest */
+#ifdef COMPAT_MACH
+static uint64_t ioreg_next_client = 1;	/* interest handles; never reused */
+#endif
 
 /* ---- id map helpers (all callers hold ioreg_lock) ---- */
 
@@ -1198,7 +1214,8 @@ ioreg_interest_register(struct ioreg_interest_reg *ir)
 	bool live;
 	int error;
 
-	if (ir->notify_port == 0 || ir->interest != IOREG_INTEREST_GENERAL)
+	if (ir->notify_port == 0 || (ir->interest != IOREG_INTEREST_GENERAL &&
+	    ir->interest != IOREG_INTEREST_APP_POWER))
 		return (EINVAL);
 	if (ir->id == 0)
 		return (ENOENT);
@@ -1210,6 +1227,9 @@ ioreg_interest_register(struct ioreg_interest_reg *ir)
 	w = malloc(sizeof(*w), M_IOREG, M_WAITOK | M_ZERO);
 	w->port = port;
 	w->target = ir->id;
+	w->interest = ir->interest;
+	w->pid = curproc->p_pid;
+	strlcpy(w->comm, curproc->p_comm, sizeof(w->comm));
 
 	sx_xlock(&ioreg_watch_lock);
 	sx_slock(&ioreg_lock);
@@ -1217,6 +1237,7 @@ ioreg_interest_register(struct ioreg_interest_reg *ir)
 	live = (e != NULL && e->state == IOREG_STATE_LIVE);
 	sx_sunlock(&ioreg_lock);
 	if (live) {
+		w->client = ioreg_next_client++;
 		TAILQ_INSERT_TAIL(&ioreg_watches, w, link);
 		ioreg_watch_count++;
 		ioreg_interest_count++;
@@ -1236,9 +1257,9 @@ ioreg_interest_register(struct ioreg_interest_reg *ir)
 
 #ifdef COMPAT_MACH
 /*
- * Send `message` to every interest watch on entry `id`, pruning dead ones on
- * the way. Same two-pass discipline as ioreg_emit_event_node: snapshot send
- * refs under the watch lock, send with no lock held.
+ * Send `message` to every general interest watch on entry `id`, pruning dead
+ * ones on the way. Same two-pass discipline as ioreg_emit_event_node:
+ * snapshot send refs under the watch lock, send with no lock held.
  */
 static void
 ioreg_message_id(uint64_t id, uint32_t message, uint64_t arg0, uint64_t arg1,
@@ -1266,7 +1287,8 @@ ioreg_message_id(uint64_t id, uint32_t message, uint64_t arg0, uint64_t arg1,
 			ioreg_watch_free(w);
 			continue;
 		}
-		if (w->target != id || nsnap >= cap)
+		if (w->target != id || w->interest != IOREG_INTEREST_GENERAL ||
+		    nsnap >= cap)
 			continue;
 		snap[nsnap] = iokit_notify_copy_port(w->port);
 		if (snap[nsnap] != NULL)
@@ -1328,6 +1350,119 @@ ioreg_message_entry(uint64_t id, uint32_t message, uint64_t arg0,
 		ioreg_message_id(id, message, arg0, arg1, devnode);
 #else
 	(void)id; (void)message; (void)arg0; (void)arg1; (void)devnode;
+#endif
+}
+
+/*
+ * ioreg_interest_clients: see sys/ioregistry.h. Dead watches are pruned on
+ * the way, so a client whose receive right is gone is never counted.
+ */
+u_int
+ioreg_interest_clients(uint64_t id, uint32_t interest,
+    struct ioreg_interest_client *out, u_int max)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_watch *w, *tw;
+	u_int n;
+
+	if (id == 0 || ioreg_interest_count == 0)
+		return (0);
+	n = 0;
+	sx_xlock(&ioreg_watch_lock);
+	TAILQ_FOREACH_SAFE(w, &ioreg_watches, link, tw) {
+		if (w->target == 0)
+			continue;
+		if (iokit_notify_port_dead(w->port)) {
+			TAILQ_REMOVE(&ioreg_watches, w, link);
+			ioreg_watch_count--;
+			ioreg_interest_count--;
+			ioreg_watch_free(w);
+			continue;
+		}
+		if (w->target != id || w->interest != interest)
+			continue;
+		if (n < max) {
+			out[n].client = w->client;
+			out[n].pid = w->pid;
+			strlcpy(out[n].comm, w->comm, sizeof(out[n].comm));
+		}
+		n++;
+	}
+	sx_xunlock(&ioreg_watch_lock);
+	return (n);
+#else
+	(void)id; (void)interest; (void)out; (void)max;
+	return (0);
+#endif
+}
+
+/*
+ * ioreg_message_client: see sys/ioregistry.h. The send right is copied under
+ * the watch lock and the message sent with no lock held.
+ */
+int
+ioreg_message_client(uint64_t client, uint32_t message, uint64_t arg0,
+    uint64_t arg1)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_watch *w;
+	void *ref;
+	uint64_t id;
+
+	if (client == 0)
+		return (ENOENT);
+	ref = NULL;
+	id = 0;
+	sx_xlock(&ioreg_watch_lock);
+	TAILQ_FOREACH(w, &ioreg_watches, link) {
+		if (w->target == 0 || w->client != client)
+			continue;
+		if (iokit_notify_port_dead(w->port)) {
+			TAILQ_REMOVE(&ioreg_watches, w, link);
+			ioreg_watch_count--;
+			ioreg_interest_count--;
+			ioreg_watch_free(w);
+		} else {
+			ref = iokit_notify_copy_port(w->port);
+			id = w->target;
+		}
+		break;
+	}
+	sx_xunlock(&ioreg_watch_lock);
+	if (ref == NULL)
+		return (ENOENT);
+	return (iokit_notify_send_interest(ref, message, id, arg0, arg1, NULL));
+#else
+	(void)client; (void)message; (void)arg0; (void)arg1;
+	return (ENOENT);
+#endif
+}
+
+/*
+ * ioreg_interest_client_live: see sys/ioregistry.h.
+ */
+bool
+ioreg_interest_client_live(uint64_t client)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_watch *w;
+	bool live;
+
+	if (client == 0)
+		return (false);
+	live = false;
+	sx_slock(&ioreg_watch_lock);
+	TAILQ_FOREACH(w, &ioreg_watches, link) {
+		if (w->target != 0 && w->client == client) {
+			live = !iokit_notify_port_dead(w->port);
+			break;
+		}
+	}
+	sx_sunlock(&ioreg_watch_lock);
+	return (live);
+#else
+	(void)client;
+	return (false);
 #endif
 }
 
