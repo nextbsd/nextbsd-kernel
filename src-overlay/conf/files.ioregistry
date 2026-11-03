@@ -21,3 +21,9 @@ dev/iokit/iokit_usb.c		optional usb
 # `standard`: drm.ko is a kext that invokes the eventhandler by name, so
 # nothing here links against it.
 dev/iokit/iokit_drm.c		standard
+# ACPI battery -> IORegistry bridge (nextbsd-kernel#244): publishes each ACPI
+# battery as an IOPMPowerSource entry with Apple's power-source keys, refreshed
+# from the acpi_cmbat_event (patches/0088) and acpi_acad_event eventhandlers.
+# `optional acpi` because it calls the ACPI battery and AC adapter drivers
+# (ACPI_BATT_GET_STATUS/INFO, acpi_acad_get_acline); NEXTBSD-RPI5 has no acpi.
+dev/iokit/iokit_powersource.c	optional acpi
