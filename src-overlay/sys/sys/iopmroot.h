@@ -39,8 +39,18 @@
  * unknown id is ignored and still returns 0.
  *
  * General interest (IOREG_INTEREST_GENERAL) on the same entry hears
- * kIOMessageServicePropertyChange whenever a property below changes, and
- * IOPMROOT_MSG_CLAMSHELL_STATE_CHANGE when the lid opens or closes.
+ * kIOMessageServicePropertyChange whenever a property below changes,
+ * IOPMROOT_MSG_CLAMSHELL_STATE_CHANGE when the lid opens or closes, and
+ * IOPMROOT_MSG_REQUEST_USER_ACTIVE when input follows a quiet spell.
+ *
+ * User activity (nextbsd-userland#239). xnu's root domain on a Mac without
+ * a display wrangler, the case NextBSD is in since pmconfigd runs the
+ * display idle timer, turns a HID driver's requestUserActive() into
+ * kIOPMMessageRequestUserActive for pmconfigd, which declares the user
+ * active (a UserIsActive assertion and kPMActivityTickle) and so wakes the
+ * display. NextBSD's IOHIDSystem entry asks for it on the first input after
+ * 30 seconds without any; argument[0] is the IOHIDSystem entry's registry id
+ * (xnu sends the "name:reason" of the asking driver as message data).
  *
  * Properties (IORegistryEntryCreateCFProperty / ioreg -l), Apple's keys:
  *   "IOSleepSupported"          bool    S3 can be requested on this machine
@@ -91,6 +101,7 @@
 #define	IOPMROOT_MSG_SYSTEM_HAS_POWERED_ON	0xe0000300 /* kIOMessageSystemHasPoweredOn */
 #define	IOPMROOT_MSG_SYSTEM_WILL_POWER_ON	0xe0000320 /* kIOMessageSystemWillPowerOn */
 #define	IOPMROOT_MSG_CLAMSHELL_STATE_CHANGE	0xe0034100 /* kIOPMMessageClamshellStateChange */
+#define	IOPMROOT_MSG_REQUEST_USER_ACTIVE	0xe0034460 /* kIOPMMessageRequestUserActive */
 
 /* IOPMROOT_MSG_CLAMSHELL_STATE_CHANGE argument[0] (kClamshellStateBit,
  * kClamshellSleepBit). */
@@ -307,5 +318,15 @@ struct iopmroot_state {
 #define	IOPMROOT_IDLEREVERT	_IO('O', 10)
 #define	IOPMROOT_GETSTATE	_IOR('O', 11, struct iopmroot_state)
 #define	IOPMROOT_SETMAINTWAKE	_IOW('O', 12, struct iopmroot_calendar)
+
+#ifdef _KERNEL
+/*
+ * IOPMrootDomain::requestUserActive(): send IOPMROOT_MSG_REQUEST_USER_ACTIVE
+ * to the root domain's general-interest clients, with `regid` (the asking
+ * entry) in argument[0]. May sleep; call it from a sleepable context with
+ * no non-sleepable lock held.
+ */
+void	iopmroot_request_user_active(uint64_t regid);
+#endif
 
 #endif /* !_SYS_IOPMROOT_H_ */

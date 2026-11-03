@@ -302,6 +302,23 @@ void	ioreg_message_entry(uint64_t id, uint32_t message, uint64_t arg0,
 	    uint64_t arg1, const char *devnode);
 
 /*
+ * Computed properties (nextbsd-userland#239), OSSerializer::forTarget() on
+ * Darwin: a key whose value is made when it is read. IOHIDSystem's
+ * HIDIdleTime is one. ioreg_set_serializer() gives the live virtual entry
+ * `id` a function that IOREGIOCPROPS calls on every read, with `arg` and an
+ * empty bag to fill (strings, numbers, bools; other types are dropped). Its
+ * keys win over the entry's stored keys of the same name; the registry's
+ * own keys still win over both. It is called with no registry lock held,
+ * in the reader's thread, so it may sleep but must not call back into the
+ * registry. It is not called once the entry is retired, but a read already
+ * under way may still be in it, so `arg` must outlive the entry. A NULL
+ * `fn` removes it. Returns 0, or ENOENT if `id` is not a live virtual
+ * entry. May sleep (sx).
+ */
+typedef void	ioreg_serializer_t(void *arg, struct nvlist *bag);
+int	ioreg_set_serializer(uint64_t id, ioreg_serializer_t *fn, void *arg);
+
+/*
  * Per-client interest messages (#243), for a sender that messages each
  * client on its own, as the root domain does with kIOAppPowerStateInterest.
  * ioreg_message_entry() reaches only IOREG_INTEREST_GENERAL watches.

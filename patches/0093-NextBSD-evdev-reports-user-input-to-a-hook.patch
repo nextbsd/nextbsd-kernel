@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Tue, 3 Nov 2026 04:11:23 -0600
+Subject: [PATCH] NextBSD: evdev reports user input to a hook
+
+NextBSD's IOHIDSystem registry entry publishes HIDIdleTime, the time
+since the user last touched an input device, as Darwin's IOHIDSystem
+does, and asks the IOPMrootDomain to treat the user as active again
+when input follows a quiet spell.  Both need to know when input
+happens, on every device: keyboards, mice and touchpads, kbdmux and
+sysmouse, and uinput devices.  evdev sees all of it.
+
+Add evdev_user_input_hook, a function pointer that evdev_send_event()
+calls for every EV_KEY, EV_REL and EV_ABS event it reports to clients,
+after its own filtering of repeated and unchanged values.  It runs
+whether or not a client has the device open.  Switches (the lid),
+LEDs, sounds, MSC and SYN events are not user input and do not call
+it.  The hook runs in the reporting context, with the evdev lock held
+or in the input epoch, so it must not sleep.  With nothing set the cost
+is one test of a NULL pointer per reported event.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/dev/evdev/evdev.c |  6 ++++++
+ sys/dev/evdev/evdev.h | 11 +++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/sys/dev/evdev/evdev.c b/sys/dev/evdev/evdev.c
+index 7a725a4f87c3a15e7e55c374bdd895a432ed4f4f..bfdb89df509b3acf2df5ed3c87ecf3d5da3ac19a 100644
+--- a/sys/dev/evdev/evdev.c
++++ b/sys/dev/evdev/evdev.c
+@@ -101,6 +101,9 @@ static LIST_HEAD(, evdev_dev) evdev_list = LIST_HEAD_INITIALIZER(evdev_list);
+ static struct sx evdev_list_lock;
+ SX_SYSINIT(evdev_list, &evdev_list_lock, "evdev list");
+ 
++/* See evdev.h; NULL until a subscriber sets it. */
++evdev_user_input_t *evdev_user_input_hook;
++
+ static void evdev_start_repeat(struct evdev_dev *, uint16_t);
+ static void evdev_stop_repeat(struct evdev_dev *);
+ static int evdev_check_event(struct evdev_dev *, uint16_t, uint16_t, int32_t);
+@@ -945,6 +948,9 @@ evdev_send_event(struct evdev_dev *evdev, uint16_t type, uint16_t code,
+ 		/* FALLTHROUGH */
+ 	case EV_REPORT_EVENT:
+ 		evdev_propagate_event(evdev, type, code, value);
++		if ((type == EV_KEY || type == EV_REL || type == EV_ABS) &&
++		    evdev_user_input_hook != NULL)
++			evdev_user_input_hook(evdev, type);
+ 		/* FALLTHROUGH */
+ 	case EV_SKIP_EVENT:
+ 		break;
+diff --git a/sys/dev/evdev/evdev.h b/sys/dev/evdev/evdev.h
+index 7bfcd4bf68c1d4de3176086a1abbd5bb881fd77e..c01f9ea2c382446acef252f793dd3b7dc3024812 100644
+--- a/sys/dev/evdev/evdev.h
++++ b/sys/dev/evdev/evdev.h
+@@ -170,6 +170,17 @@ EVENTHANDLER_DECLARE(evdev_registered, evdev_event_fn);
+ EVENTHANDLER_DECLARE(evdev_unregistering, evdev_event_fn);
+ void evdev_foreach(void (*)(struct evdev_dev *, void *), void *);
+ 
++/*
++ * User input.  When set, evdev_user_input_hook is called for every key,
++ * relative or absolute event a device reports to its clients (after evdev's
++ * own filtering of repeats and unchanged values), whether or not any client
++ * is open.  It runs in the reporting context, with the device's evdev lock
++ * held or in the input epoch, so it must not sleep or take a sleepable
++ * lock.  Set it once, before input can arrive; it is never cleared.
++ */
++typedef void evdev_user_input_t(struct evdev_dev *, uint16_t);
++extern evdev_user_input_t *evdev_user_input_hook;
++
+ /* Multitouch related functions: */
+ int evdev_mt_id_to_slot(struct evdev_dev *, int32_t);
+ int evdev_mt_push_slot(struct evdev_dev *, int, union evdev_mt_slot *);
+-- 
+2.54.0 (Apple Git-157)
+
