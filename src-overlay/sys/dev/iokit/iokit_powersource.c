@@ -24,10 +24,16 @@
  * mWh/mW is converted with its design voltage (present voltage for the rate),
  * so CurrentCapacity / Amperage gives hours as pmconfigd expects.
  *
- * Push signals, no polling. acpi_cmbat_event (patches/0088: 0x80 status,
- * 0x81 information, 0x00/0x01 insert/remove), acpi_acad_event and
- * power_resume schedule a refresh. A refresh that finds new values merges
- * them with ioreg_update_virtual(), which sends
+ * Refresh. acpi_cmbat_event (patches/0088: 0x80 status, 0x81 information,
+ * 0x00/0x01 insert/remove), acpi_acad_event and power_resume schedule a
+ * refresh at once. Firmware does not notify every capacity change, so, as on
+ * a Mac, the batteries are also read on a slow timer: every 60 s, the
+ * cadence powerd asks AppleSmartBattery for in PowerManagement-1846
+ * (BatteryTimeRemaining.m kPollIntervalNS; AppleSmartBattery itself has no
+ * interval of its own any more), the same while charging. The timer runs
+ * only while at least one entry is published and the system is awake: it
+ * stops at power_suspend_early and restarts at power_resume. A refresh that
+ * finds new values merges them with ioreg_update_virtual(), which sends
  * kIOMessageServicePropertyChange, then sends
  * kIOPMMessageBatteryStatusHasChanged on the entry; one that finds nothing
  * changed sends nothing. While the driver has no valid data yet (the
@@ -81,6 +87,9 @@
 #define	IOKIT_PS_INFO_DELAY	(hz)
 #define	IOKIT_PS_RESUME_DELAY	(2 * hz)
 
+/* The periodic read: powerd's AppleSmartBattery poll interval. */
+#define	IOKIT_PS_POLL_INTERVAL	(60 * hz)
+
 static MALLOC_DEFINE(M_IOKITPS, "iokit_ps", "IORegistry power-source bridge");
 
 /* The published values; compared whole to skip a refresh that changed nothing. */
@@ -125,11 +134,17 @@ static LIST_HEAD(, iokit_ps_ent) iokit_ps_list =
 static struct mtx iokit_ps_mtx;
 MTX_SYSINIT(iokit_ps_mtx, &iokit_ps_mtx, "iokit power source", MTX_DEF);
 
+/* The periodic read; armed while iokit_ps_npublished > 0 and not asleep. */
+static struct timeout_task iokit_ps_poll_task;
+static int iokit_ps_npublished;		/* entries with id != 0 */
+static bool iokit_ps_asleep;
+
 static eventhandler_tag iokit_ps_attach_tag;
 static eventhandler_tag iokit_ps_detach_tag;
 static eventhandler_tag iokit_ps_cmbat_tag;
 static eventhandler_tag iokit_ps_acad_tag;
 static eventhandler_tag iokit_ps_resume_tag;
+static eventhandler_tag iokit_ps_suspend_tag;
 
 static void	iokit_ps_task(void *arg, int pending);
 
@@ -177,6 +192,44 @@ iokit_ps_kick_all(int delay)
 	mtx_lock(&iokit_ps_mtx);
 	LIST_FOREACH(pe, &iokit_ps_list, link)
 		iokit_ps_kick_locked(pe, delay);
+	mtx_unlock(&iokit_ps_mtx);
+}
+
+/* (Re)arm the periodic read, if a battery is published and we are awake. */
+static void
+iokit_ps_poll_arm_locked(void)
+{
+
+	mtx_assert(&iokit_ps_mtx, MA_OWNED);
+	if (iokit_ps_npublished > 0 && !iokit_ps_asleep)
+		taskqueue_enqueue_timeout(taskqueue_thread,
+		    &iokit_ps_poll_task, IOKIT_PS_POLL_INTERVAL);
+}
+
+/* The periodic read: refresh every battery, then wait for the next one. */
+static void
+iokit_ps_poll(void *arg __unused, int pending __unused)
+{
+	struct iokit_ps_ent *pe;
+
+	mtx_lock(&iokit_ps_mtx);
+	if (!iokit_ps_asleep) {
+		LIST_FOREACH(pe, &iokit_ps_list, link)
+			iokit_ps_kick_locked(pe, 0);
+	}
+	iokit_ps_poll_arm_locked();
+	mtx_unlock(&iokit_ps_mtx);
+}
+
+/* Count an entry published (+1) or retired (-1); start the timer on the first. */
+static void
+iokit_ps_count(int delta)
+{
+
+	mtx_lock(&iokit_ps_mtx);
+	iokit_ps_npublished += delta;
+	if (delta > 0 && iokit_ps_npublished == 1)
+		iokit_ps_poll_arm_locked();
 	mtx_unlock(&iokit_ps_mtx);
 }
 
@@ -339,6 +392,7 @@ iokit_ps_unpublish(struct iokit_ps_ent *pe)
 	(void)ioreg_retire_virtual(pe->id);
 	pe->id = 0;
 	memset(&pe->last, 0, sizeof(pe->last));
+	iokit_ps_count(-1);
 }
 
 /* Publish the battery as a new entry under its device. */
@@ -372,8 +426,10 @@ iokit_ps_publish(struct iokit_ps_ent *pe, const struct iokit_ps_state *s)
 		nvlist_add_string(props, "org.nextbsd.ACPIPath", path);
 	/* The registry takes ownership of props, even on failure. */
 	pe->id = ioreg_publish_virtual(pe->dev, name, IOKIT_PS_CLASS, props);
-	if (pe->id != 0)
+	if (pe->id != 0) {
 		memcpy(&pe->last, s, sizeof(pe->last));
+		iokit_ps_count(1);
+	}
 }
 
 /* Read the battery and bring its entry up to date. */
@@ -417,6 +473,7 @@ iokit_ps_task(void *arg, int pending __unused)
 		/* Not live any more: publish afresh on the next refresh. */
 		pe->id = 0;
 		memset(&pe->last, 0, sizeof(pe->last));
+		iokit_ps_count(-1);
 	}
 	if (error != 0)
 		return;
@@ -498,18 +555,40 @@ iokit_ps_acad(void *arg __unused, int online __unused)
 	iokit_ps_kick_all(0);
 }
 
-/* power_resume: the batteries were re-initialised; their state moved on. */
+/* power_suspend_early: no periodic reads while asleep. */
+static void
+iokit_ps_suspend(void *arg __unused)
+{
+
+	mtx_lock(&iokit_ps_mtx);
+	iokit_ps_asleep = true;
+	mtx_unlock(&iokit_ps_mtx);
+	taskqueue_cancel_timeout(taskqueue_thread, &iokit_ps_poll_task, NULL);
+}
+
+/*
+ * power_resume: the batteries were re-initialised and their state moved on.
+ * Read them shortly, and restart the periodic read from now.
+ */
 static void
 iokit_ps_resume(void *arg __unused)
 {
+	struct iokit_ps_ent *pe;
 
-	iokit_ps_kick_all(IOKIT_PS_RESUME_DELAY);
+	mtx_lock(&iokit_ps_mtx);
+	iokit_ps_asleep = false;
+	LIST_FOREACH(pe, &iokit_ps_list, link)
+		iokit_ps_kick_locked(pe, IOKIT_PS_RESUME_DELAY);
+	iokit_ps_poll_arm_locked();
+	mtx_unlock(&iokit_ps_mtx);
 }
 
 static void
 iokit_ps_init(void *arg __unused)
 {
 
+	TIMEOUT_TASK_INIT(taskqueue_thread, &iokit_ps_poll_task, 0,
+	    iokit_ps_poll, NULL);
 	iokit_ps_attach_tag = EVENTHANDLER_REGISTER(device_attach,
 	    iokit_ps_attached, NULL, EVENTHANDLER_PRI_ANY);
 	iokit_ps_detach_tag = EVENTHANDLER_REGISTER(device_detach,
@@ -520,6 +599,8 @@ iokit_ps_init(void *arg __unused)
 	    iokit_ps_acad, NULL, EVENTHANDLER_PRI_ANY);
 	iokit_ps_resume_tag = EVENTHANDLER_REGISTER(power_resume,
 	    iokit_ps_resume, NULL, EVENTHANDLER_PRI_ANY);
+	iokit_ps_suspend_tag = EVENTHANDLER_REGISTER(power_suspend_early,
+	    iokit_ps_suspend, NULL, EVENTHANDLER_PRI_ANY);
 }
 /* Before acpi0 attaches its batteries (SI_SUB_CONFIGURE): no catch-up walk. */
 SYSINIT(iokit_ps, SI_SUB_DRIVERS, SI_ORDER_FIRST, iokit_ps_init, NULL);
