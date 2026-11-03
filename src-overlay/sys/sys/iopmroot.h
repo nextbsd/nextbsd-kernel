@@ -210,10 +210,13 @@ struct iopmroot_state {
  * and the root domain itself requests "Clamshell Sleep" when the lid closes
  * and clamshell sleep is not disabled, "Power Button Sleep" on the power
  * button unless "DisablePowerButtonSleep", and "Software Sleep" on the sleep
- * button. A power-button press that does not sleep (disabled, or sleep
- * impossible) keeps the kernel's earlier action if that was soft-off, so an
- * ACPI shutdown still powers the machine off; a press within 3 s of a wake
- * is ignored. When the owner closes its descriptor (or exits) the sysctls get
+ * button. As on xnu, a power-button press that does not sleep (disabled, or
+ * sleep impossible) is not acted on by the root domain at all, and no
+ * root-domain message carries it: userland sees the press as a HID power
+ * key (evdev KEY_POWER on the ACPI button's IOHIDDevice entry), which is
+ * what loginwindow uses on Darwin. A press within 3 s of a wake is ignored.
+ * Without an owner the kernel's own action (soft-off by default) applies.
+ * When the owner closes its descriptor (or exits) the sysctls get
  * their earlier values back, if still NONE. Another descriptor that tries to
  * set that policy meanwhile gets EBUSY.
  */

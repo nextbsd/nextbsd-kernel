@@ -90,7 +90,6 @@
 #include <sys/conf.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
-#include <sys/reboot.h>
 #include <sys/kthread.h>
 #include <sys/eventhandler.h>
 #include <sys/sysctl.h>
@@ -940,18 +939,21 @@ iopm_lid_changed(void)
 }
 
 /*
- * xnu: the power button sleeps unless "DisablePowerButtonSleep"; the sleep
- * key sleeps ("Software Sleep"). Only with a policy owner. NextBSD has no
- * loginwindow to offer shutdown on a press that does not sleep, so such a
- * press keeps the kernel's own power-button action when that was soft-off
- * (the default): a hypervisor's ACPI shutdown still powers a guest off. A
- * press within IOPM_WAKE_GRACE of a wake is the one that woke the machine.
+ * xnu's handlePowerNotification(kIOPMPowerButton): the power button sleeps
+ * unless "DisablePowerButtonSleep" (or sleep is impossible), and otherwise
+ * the root domain does nothing with it; the sleep key sleeps ("Software
+ * Sleep"). Only with a policy owner; without one the kernel's own
+ * hw.acpi.power_button_state action (soft-off by default) applies. As on
+ * Darwin, a press reaches userland as a HID power key, not as a root-domain
+ * message: acpi_button's evdev KEY_POWER, an IOHIDDevice entry (#335), for
+ * loginwindow to offer restart/sleep/shut down. A press within
+ * IOPM_WAKE_GRACE of a wake is the one that woke the machine.
  */
 static void
 iopm_buttons(void)
 {
 	u_int b;
-	bool owner, pb, poweroff, woke;
+	bool owner, pb, woke;
 
 	mtx_lock(&iopm_mtx);
 	b = iopm.buttons;
@@ -961,18 +963,12 @@ iopm_buttons(void)
 	    iopm.pb_time - iopm.wake_time < IOPM_WAKE_GRACE;
 	pb = !iopm.pb_disabled && !suspend_blocked && !iopm.sleep_disabled &&
 	    iopm_sleep_supported();
-	poweroff = false;
-#ifdef DEV_ACPI
-	poweroff = iopm.saved_pb_sx == ACPI_STATE_S5;
-#endif
 	mtx_unlock(&iopm_mtx);
 	if (!owner)
 		return;
-	if ((b & IOPM_BUTTON_POWER) != 0 && !woke) {
-		if (pb)
+	if ((b & IOPM_BUTTON_POWER) != 0) {
+		if (pb && !woke)
 			iopm_sleep_request(IOPMROOT_REASON_POWER_BUTTON, 0);
-		else if (poweroff)
-			shutdown_nice(RB_POWEROFF);
 	} else if ((b & IOPM_BUTTON_SLEEP) != 0)
 		iopm_sleep_request(IOPMROOT_REASON_SOFTWARE_SLEEP, 0);
 }
