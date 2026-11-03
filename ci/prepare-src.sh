@@ -220,16 +220,19 @@ echo "==> iocatalogue wired: $(grep -c 'dev/iokit/iokit_catalogue.c' "$SRC/sys/c
 # The same fragment lists dev/iokit/iokit_hid.c (`optional evdev`, #335), which
 # publishes evdev input nodes as IOHIDDevice entries, and
 # dev/iokit/iokit_usb.c (`optional usb`, #391), which publishes every USB
-# device as an IOUSBHostDevice entry, and dev/iokit/iokit_powersource.c
+# device as an IOUSBHostDevice entry, dev/iokit/iokit_powersource.c
 # (`optional acpi`, #244), which publishes each ACPI battery as an
-# IOPMPowerSource entry.
+# IOPMPowerSource entry, and dev/iokit/iokit_pmroot.c (`standard`, #243),
+# the in-kernel IOPMrootDomain and /dev/iopmroot.
 cat "$REPO/src-overlay/conf/files.ioregistry" >> "$SRC/sys/conf/files"
 test -f "$SRC/sys/dev/iokit/iokit_registry.c"
 test -f "$SRC/sys/dev/iokit/iokit_hid.c"
 test -f "$SRC/sys/dev/iokit/iokit_usb.c"
 test -f "$SRC/sys/dev/iokit/iokit_drm.c"
 test -f "$SRC/sys/dev/iokit/iokit_powersource.c"
+test -f "$SRC/sys/dev/iokit/iokit_pmroot.c"
 test -f "$SRC/sys/sys/ioregistry.h"
+test -f "$SRC/sys/sys/iopmroot.h"
 echo "==> ioregistry wired: $(grep -c 'dev/iokit/iokit_registry.c' "$SRC/sys/conf/files") entry; source + header present"
 
 # linuxkpi_video compiled into the kernel (graphics autoload, #64). drm.ko

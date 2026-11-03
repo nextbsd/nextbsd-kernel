@@ -204,12 +204,20 @@ struct ioreg_test_event {
  * kernel keeps a send right, and the watch also ends when the client's
  * receive right dies.
  *
- * `interest` is the interest type; only IOREG_INTEREST_GENERAL
- * (kIOGeneralInterest) exists. Returns 0, EINVAL for a bad port or interest
+ * `interest` is the interest type. IOREG_INTEREST_GENERAL
+ * (kIOGeneralInterest) hears what the entry's provider sends all its
+ * clients. IOREG_INTEREST_APP_POWER (kIOAppPowerStateInterest, #243) is what
+ * IORegisterForSystemPower registers on the IOPMrootDomain entry: the root
+ * domain sends each such client the system sleep/wake messages itself, with
+ * that client's acknowledgement id in argument[0] (see <sys/iopmroot.h>).
+ * The two are separate watches: a general watch hears no sleep/wake
+ * messages and an app power watch no property changes; both hear
+ * kIOMessageServiceIsTerminated. Returns 0, EINVAL for a bad port or interest
  * type, ENOENT if `id` is not a live entry, ENOSYS on a kernel built without
  * COMPAT_MACH. Self-contained / fixed-size for 32- and 64-bit ABI parity.
  */
 #define	IOREG_INTEREST_GENERAL	1	/* kIOGeneralInterest */
+#define	IOREG_INTEREST_APP_POWER 2	/* kIOAppPowerStateInterest */
 
 struct ioreg_interest_reg {
 	uint64_t	id;		/* in: registry id of the entry */
@@ -292,6 +300,37 @@ void	ioreg_message_device(struct _device *dev, uint32_t message,
 int	ioreg_update_virtual(uint64_t id, struct nvlist *props);
 void	ioreg_message_entry(uint64_t id, uint32_t message, uint64_t arg0,
 	    uint64_t arg1, const char *devnode);
+
+/*
+ * Per-client interest messages (#243), for a sender that messages each
+ * client on its own, as the root domain does with kIOAppPowerStateInterest.
+ * ioreg_message_entry() reaches only IOREG_INTEREST_GENERAL watches.
+ *
+ * ioreg_interest_clients() fills `out` with up to `max` of the live
+ * `interest` watches on entry `id` and returns how many there are (more than
+ * `max` means `out` was too small). `client` is a stable handle for the
+ * watch, never reused; `pid` and `comm` name the process that registered it.
+ *
+ * ioreg_message_client() sends `message` with its two arguments to the one
+ * watch `client` (devnode ""): 0, ENOENT if the watch is gone (its port died
+ * or its entry departed), or the send's ENXIO / ENOMEM.
+ *
+ * ioreg_interest_client_live() is true while the watch `client` exists and
+ * its receive right is alive.
+ *
+ * All may sleep (sx + M_WAITOK); call them with no non-sleepable lock held.
+ * Without COMPAT_MACH there are no clients.
+ */
+struct ioreg_interest_client {
+	uint64_t	client;		/* watch handle */
+	pid_t		pid;		/* registering process */
+	char		comm[MAXCOMLEN + 1]; /* its p_comm */
+};
+u_int	ioreg_interest_clients(uint64_t id, uint32_t interest,
+	    struct ioreg_interest_client *out, u_int max);
+int	ioreg_message_client(uint64_t client, uint32_t message, uint64_t arg0,
+	    uint64_t arg1);
+bool	ioreg_interest_client_live(uint64_t client);
 #endif /* _KERNEL */
 
 #endif /* _SYS_IOREGISTRY_H_ */

@@ -27,3 +27,9 @@ dev/iokit/iokit_drm.c		standard
 # `optional acpi` because it calls the ACPI battery and AC adapter drivers
 # (ACPI_BATT_GET_STATUS/INFO, acpi_acad_get_acline); NEXTBSD-RPI5 has no acpi.
 dev/iokit/iokit_powersource.c	optional acpi
+# In-kernel IOPMrootDomain (#243): the IOPMrootDomain entry, the
+# kIOAppPowerStateInterest sleep/wake fan-out with acknowledgements, and
+# /dev/iopmroot. `standard`: ACPI's lid and button eventhandlers and its
+# sleep listener are guarded by DEV_ACPI inside, so configs without acpi
+# still publish the entry (IOSleepSupported false).
+dev/iokit/iokit_pmroot.c	standard
