@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Tue, 3 Nov 2026 00:15:09 -0600
+Subject: [PATCH] NextBSD: fixed-feature buttons report KEY_POWER / KEY_SLEEP
+ through evdev
+
+A control-method power or sleep button (acpi_button.c) reports each
+press to evdev as KEY_POWER or KEY_SLEEP, but the fixed-feature buttons
+handled in acpi.c report nothing there.  QEMU's system_powerdown and
+some laptops use the fixed power button, so on those machines a press
+never reached userland as a key.  On Darwin the power button always
+reaches userland as a HID key, which is what loginwindow uses to offer
+restart, sleep or shut down, and NextBSD's IOPMrootDomain relies on that
+when it does not act on a press itself.
+
+When acpi_enable_fixed_events() first installs a fixed button's handler,
+register an evdev device for it the way acpi_button.c does ("Power
+Button (fixed)" / "Sleep Button (fixed)", phys acpi0, BUS_HOST), and push
+a press and release of its key from acpi_invoke_button_eventhandler(),
+which runs once per fixed press on the ACPI task thread.  Under
+EVDEV_SUPPORT only.  devctl and acpi_sleep_event are unchanged.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/dev/acpica/acpi.c | 69 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/sys/dev/acpica/acpi.c b/sys/dev/acpica/acpi.c
+index 7485fe3..bbcdc08 100644
+--- a/sys/dev/acpica/acpi.c
++++ b/sys/dev/acpica/acpi.c
+@@ -29,6 +29,7 @@
+ 
+ #include <sys/cdefs.h>
+ #include "opt_acpi.h"
++#include "opt_evdev.h"
+ 
+ #include <sys/param.h>
+ #include <sys/eventhandler.h>
+@@ -75,6 +76,11 @@
+ 
+ #include <vm/vm_param.h>
+ 
++#ifdef EVDEV_SUPPORT
++#include <dev/evdev/input.h>
++#include <dev/evdev/evdev.h>
++#endif
++
+ static MALLOC_DEFINE(M_ACPIDEV, "acpidev", "ACPI devices");
+ 
+ /* Hooks for the ACPI CA debugging infrastructure */
+@@ -327,6 +333,15 @@ TUNABLE_INT("debug.acpi.quirks", &acpi_quirks);
+ static int acpi_fixed_power_button = ACPI_POWER_BUTTON;
+ static int acpi_fixed_sleep_button = ACPI_SLEEP_BUTTON;
+ 
++#ifdef EVDEV_SUPPORT
++/*
++ * NextBSD: the fixed-feature buttons report KEY_POWER / KEY_SLEEP through
++ * evdev, as the control-method button driver (acpi_button.c) does, so a
++ * press always reaches userland as a HID key (an IOHIDDevice entry).
++ */
++static struct evdev_dev *acpi_fixed_button_evdev[2];
++#endif
++
+ /*
+  * Set when the power button woke the system from the last sleep, as seen
+  * by the latched fixed-feature status or a control-method button's wake
+@@ -2566,6 +2581,29 @@ acpi_shutdown_final(void *arg, int howto)
+     }
+ }
+ 
++#ifdef EVDEV_SUPPORT
++/* Register the evdev device of a fixed-feature button, as acpi_button.c. */
++static void
++acpi_fixed_button_evdev_init(struct acpi_softc *sc, int type)
++{
++    struct evdev_dev *evdev;
++
++    evdev = evdev_alloc();
++    evdev_set_name(evdev, type == ACPI_SLEEP_BUTTON ?
++	"Sleep Button (fixed)" : "Power Button (fixed)");
++    evdev_set_phys(evdev, device_get_nameunit(sc->acpi_dev));
++    evdev_set_id(evdev, BUS_HOST, 0, 0, 1);
++    evdev_support_event(evdev, EV_SYN);
++    evdev_support_event(evdev, EV_KEY);
++    evdev_support_key(evdev, type == ACPI_SLEEP_BUTTON ? KEY_SLEEP : KEY_POWER);
++    if (evdev_register(evdev) != 0) {
++	evdev_free(evdev);
++	return;
++    }
++    acpi_fixed_button_evdev[type] = evdev;
++}
++#endif
++
+ static void
+ acpi_enable_fixed_events(struct acpi_softc *sc)
+ {
+@@ -2576,15 +2614,23 @@ acpi_enable_fixed_events(struct acpi_softc *sc)
+ 	AcpiClearEvent(ACPI_EVENT_POWER_BUTTON);
+ 	AcpiInstallFixedEventHandler(ACPI_EVENT_POWER_BUTTON,
+ 				     acpi_event_power_button_fixed, sc);
+-	if (first_time)
++	if (first_time) {
+ 	    device_printf(sc->acpi_dev, "Power Button (fixed)\n");
++#ifdef EVDEV_SUPPORT
++	    acpi_fixed_button_evdev_init(sc, ACPI_POWER_BUTTON);
++#endif
++	}
+     }
+     if ((AcpiGbl_FADT.Flags & ACPI_FADT_SLEEP_BUTTON) == 0) {
+ 	AcpiClearEvent(ACPI_EVENT_SLEEP_BUTTON);
+ 	AcpiInstallFixedEventHandler(ACPI_EVENT_SLEEP_BUTTON,
+ 				     acpi_event_sleep_button_fixed, sc);
+-	if (first_time)
++	if (first_time) {
+ 	    device_printf(sc->acpi_dev, "Sleep Button (fixed)\n");
++#ifdef EVDEV_SUPPORT
++	    acpi_fixed_button_evdev_init(sc, ACPI_SLEEP_BUTTON);
++#endif
++	}
+     }
+ 
+     first_time = 0;
+@@ -4084,8 +4130,25 @@ acpi_invoke_wake_eventhandler(void *context)
+ static void
+ acpi_invoke_button_eventhandler(void *context)
+ {
++    int type = *(int *)context;
++#ifdef EVDEV_SUPPORT
++    struct evdev_dev *evdev;
++    uint16_t key;
++#endif
+ 
+-    EVENTHANDLER_INVOKE(acpi_button_event, *(int *)context);
++    EVENTHANDLER_INVOKE(acpi_button_event, type);
++
++#ifdef EVDEV_SUPPORT
++    /* The press as a key, as acpi_button.c reports a control-method one. */
++    evdev = acpi_fixed_button_evdev[type == ACPI_SLEEP_BUTTON ? 1 : 0];
++    if (evdev != NULL) {
++	key = (type == ACPI_SLEEP_BUTTON) ? KEY_SLEEP : KEY_POWER;
++	evdev_push_key(evdev, key, 1);
++	evdev_sync(evdev);
++	evdev_push_key(evdev, key, 0);
++	evdev_sync(evdev);
++    }
++#endif
+ }
+ 
+ /*
+-- 
+2.54.0 (Apple Git-157)
+
