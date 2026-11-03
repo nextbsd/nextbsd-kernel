@@ -51,6 +51,11 @@
  * display. NextBSD's IOHIDSystem entry asks for it on the first input after
  * 30 seconds without any; argument[0] is the IOHIDSystem entry's registry id
  * (xnu sends the "name:reason" of the asking driver as message data).
+ * While pmconfigd has told the root domain the display is off
+ * (IOPMROOT_SETDISPLAY 0, xnu's kPMSetDisplayState), the first input asks
+ * at once, without the quiet spell, so input wakes a display that was put
+ * to sleep on request (pmset displaysleepnow), as on a Mac
+ * (nextbsd-kernel#405).
  *
  * Properties (IORegistryEntryCreateCFProperty / ioreg -l), Apple's keys:
  *   "IOSleepSupported"          bool    S3 can be requested on this machine
@@ -245,6 +250,7 @@ struct iopmroot_aggr {
 #define	IOPMROOT_F_SYSTEM_SHUTDOWN	0x00000080 /* kern.suspend_blocked */
 #define	IOPMROOT_F_POLICY_OWNED		0x00000100 /* see policy owner */
 #define	IOPMROOT_F_WAKE_ALARM		0x00000200 /* see wake alarms */
+#define	IOPMROOT_F_DISPLAY_OFF		0x00000400 /* IOPMROOT_SETDISPLAY 0 */
 
 struct iopmroot_state {
 	uint64_t	registry_id;	/* the IOPMrootDomain entry */
@@ -305,6 +311,11 @@ struct iopmroot_state {
  *   IOPMROOT_SETMAINTWAKE  kPMSetMaintenanceWakeCalendar: a maintenance
  *                       (selector 1) or SleepService (2) wake time, see wake
  *                       alarms; EINVAL for another selector or a bad date
+ *   IOPMROOT_SETDISPLAY kPMSetDisplayState: pmconfigd's display wrangler
+ *                       reports the display on (non-zero) or off (0). While
+ *                       it is off, the first input sends
+ *                       IOPMROOT_MSG_REQUEST_USER_ACTIVE at once (see user
+ *                       activity). Reset to on when that descriptor closes.
  */
 #define	IOPMROOT_ALLOW		_IOW('O', 1, int64_t)
 #define	IOPMROOT_CANCEL		_IOW('O', 2, int64_t)
@@ -318,6 +329,7 @@ struct iopmroot_state {
 #define	IOPMROOT_IDLEREVERT	_IO('O', 10)
 #define	IOPMROOT_GETSTATE	_IOR('O', 11, struct iopmroot_state)
 #define	IOPMROOT_SETMAINTWAKE	_IOW('O', 12, struct iopmroot_calendar)
+#define	IOPMROOT_SETDISPLAY	_IOW('O', 13, uint32_t)
 
 #ifdef _KERNEL
 /*
@@ -327,6 +339,13 @@ struct iopmroot_state {
  * no non-sleepable lock held.
  */
 void	iopmroot_request_user_active(uint64_t regid);
+
+/*
+ * True, once, for the first call after the display was reported off
+ * (IOPMROOT_SETDISPLAY 0): the caller should request user activity now.
+ * Atomic only, so it may be called with a mutex held or in an epoch.
+ */
+bool	iopmroot_display_wake_take(void);
 #endif
 
 #endif /* !_SYS_IOPMROOT_H_ */
