@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Mon, 2 Nov 2026 21:08:03 -0600
+Subject: [PATCH] NextBSD: acpi_ReqSleepState waits for a registered sleep
+ listener
+
+acpi_ReqSleepState() opened the acknowledgement window only when a
+process held /dev/devctl open, i.e. when devd(8) was running. NextBSD has
+no devd and nothing opens /dev/devctl, so every sleep request (acpiconf
+-s 3, hw.acpi.sleep_state, a sleep button, a lid close) entered the state
+at once and no process was told.
+
+Gate the window on an in-kernel sleep listener instead, which takes
+devd(8)'s place: acpi_register_sleep_listener() and
+acpi_deregister_sleep_listener() install it (at most one, EBUSY
+otherwise). While one is registered, a request arms the force timeout and
+calls the listener with ACPI_SLEEP_REQUEST; the listener answers with
+acpi_sleep_listener_ack(), whose zero acknowledgement is the /dev/acpi
+one (ACPIIO_ACKSLPSTATE) and whose non-zero value cancels quietly. The
+listener also hears ACPI_SLEEP_CANCEL when a /dev/acpi or /dev/apm client
+aborts the request, and ACPI_SLEEP_RESUME once acpi_EnterSleepState() is
+back in S0. Deregistering with a request pending enters the state from
+the acpi_task thread rather than leaving it to the timeout. With no
+listener registered, sleep proceeds at once, as before.
+
+The 10 s force timeout becomes hw.acpi.suspend_ack_timeout (sysctl and
+loader tunable, seconds, minimum 1), defaulting to 45 s so it sits above
+the 30 s per-client budget of the in-kernel IOPMrootDomain, the listener.
+/dev/acpi, /dev/apm and acpiconf(8) behave as before.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/dev/acpica/acpi.c    | 170 ++++++++++++++++++++++++++++++++++++---
+ sys/dev/acpica/acpivar.h |  17 ++++
+ 2 files changed, 178 insertions(+), 9 deletions(-)
+
+diff --git a/sys/dev/acpica/acpi.c b/sys/dev/acpica/acpi.c
+index 3951d81..7e122aa 100644
+--- a/sys/dev/acpica/acpi.c
++++ b/sys/dev/acpica/acpi.c
+@@ -110,6 +110,20 @@ int		acpi_quirks;
+ /* Supported sleep states. */
+ static BOOLEAN	acpi_sleep_states[ACPI_S_STATE_COUNT];
+ 
++/*
++ * NextBSD: the in-kernel sleep listener (the IOPMrootDomain), which takes
++ * devd(8)'s place in the suspend handshake, and how long a sleep request
++ * waits for its acknowledgement.  The listener has a lock of its own since it
++ * may register before acpi0 attaches and initialises acpi_mutex.  Lock order:
++ * acpi_mutex, then acpi_sleep_listener_mtx.
++ */
++static struct mtx		acpi_sleep_listener_mtx;
++MTX_SYSINIT(acpi_sleep_listener, &acpi_sleep_listener_mtx,
++    "ACPI sleep listener", MTX_DEF);
++static acpi_sleep_listener_t	*acpi_sleep_listener;
++static void			*acpi_sleep_listener_arg;
++static int			acpi_suspend_ack_timeout = 45;
++
+ static void	acpi_lookup(void *arg, const char *name, device_t *dev);
+ static int	acpi_modevent(struct module *mod, int event, void *junk);
+ 
+@@ -617,6 +631,10 @@ acpi_attach(device_t dev)
+     SYSCTL_ADD_INT(&sc->acpi_sysctl_ctx, SYSCTL_CHILDREN(sc->acpi_sysctl_tree),
+ 	OID_AUTO, "sleep_delay", CTLFLAG_RW, &sc->acpi_sleep_delay, 0,
+ 	"sleep delay in seconds");
++    SYSCTL_ADD_INT(&sc->acpi_sysctl_ctx, SYSCTL_CHILDREN(sc->acpi_sysctl_tree),
++	OID_AUTO, "suspend_ack_timeout", CTLFLAG_RWTUN,
++	&acpi_suspend_ack_timeout, 0,
++	"Seconds a sleep request waits for the sleep listener to acknowledge");
+     SYSCTL_ADD_INT(&sc->acpi_sysctl_ctx, SYSCTL_CHILDREN(sc->acpi_sysctl_tree),
+ 	OID_AUTO, "s4bios", CTLFLAG_RW, &sc->acpi_s4bios, 0, "S4BIOS mode");
+     SYSCTL_ADD_INT(&sc->acpi_sysctl_ctx, SYSCTL_CHILDREN(sc->acpi_sysctl_tree),
+@@ -3138,6 +3156,19 @@ acpi_SetSleepState(struct acpi_softc *sc, int state)
+     return (acpi_EnterSleepState(sc, state));
+ }
+ 
++/* Snapshot the registered sleep listener, or NULL if there is none. */
++static acpi_sleep_listener_t *
++acpi_sleep_listener_get(void **argp)
++{
++    acpi_sleep_listener_t *fn;
++
++    mtx_lock(&acpi_sleep_listener_mtx);
++    fn = acpi_sleep_listener;
++    *argp = acpi_sleep_listener_arg;
++    mtx_unlock(&acpi_sleep_listener_mtx);
++    return (fn);
++}
++
+ #if defined(__amd64__) || defined(__i386__)
+ static void
+ acpi_sleep_force_task(void *context)
+@@ -3168,16 +3199,19 @@ acpi_sleep_force(void *arg)
+ 
+ /*
+  * Request that the system enter the given suspend state.  All /dev/apm
+- * devices and devd(8) will be notified.  Userland then has a chance to
+- * save state and acknowledge the request.  The system sleeps once all
+- * acks are in.
++ * devices and the sleep listener will be notified.  They then have a chance
++ * to save state and acknowledge the request.  The system sleeps once all
++ * acks are in, or hw.acpi.suspend_ack_timeout seconds later.
+  */
+ int
+ acpi_ReqSleepState(struct acpi_softc *sc, int state)
+ {
+ #if defined(__amd64__) || defined(__i386__)
+     struct apm_clone_data *clone;
++    acpi_sleep_listener_t *listener;
++    void *listener_arg;
+     ACPI_STATUS status;
++    int timeout;
+ 
+     if (state < ACPI_STATE_S1 || state > ACPI_S_STATES_MAX)
+ 	return (EINVAL);
+@@ -3217,26 +3251,36 @@ acpi_ReqSleepState(struct acpi_softc *sc, int state)
+ 	}
+     }
+ 
+-    /* If devd(8) is not running, immediately enter the sleep state. */
+-    if (!devctl_process_running()) {
++    /*
++     * If no sleep listener is registered, immediately enter the sleep state.
++     * NextBSD has no devd(8), so a /dev/devctl reader no longer gates this.
++     */
++    listener = acpi_sleep_listener_get(&listener_arg);
++    if (listener == NULL) {
+ 	ACPI_UNLOCK(acpi);
+ 	status = acpi_EnterSleepState(sc, state);
+ 	return (ACPI_SUCCESS(status) ? 0 : ENXIO);
+     }
+ 
+     /*
+-     * Set a timeout to fire if userland doesn't ack the suspend request
++     * Set a timeout to fire if the listener doesn't ack the suspend request
+      * in time.  This way we still eventually go to sleep if we were
+      * overheating or running low on battery, even if userland is hung.
+-     * We cancel this timeout once all userland acks are in or the
+-     * suspend request is aborted.
++     * We cancel this timeout once all acks are in or the suspend request
++     * is aborted.  The default sits above the listener's own 30 s budget
++     * for applications.
+      */
+-    callout_reset(&sc->susp_force_to, 10 * hz, acpi_sleep_force, sc);
++    timeout = imax(acpi_suspend_ack_timeout, 1);
++    callout_reset_sbt(&sc->susp_force_to, SBT_1S * timeout, 0,
++	acpi_sleep_force, sc, 0);
+     ACPI_UNLOCK(acpi);
+ 
+     /* Now notify devd(8) also. */
+     acpi_UserNotify("Suspend", ACPI_ROOT_OBJECT, state);
+ 
++    /* And the listener, which answers with acpi_sleep_listener_ack(). */
++    listener(listener_arg, ACPI_SLEEP_REQUEST, state);
++
+     return (0);
+ #else
+     /* This platform does not support acpi suspend/resume. */
+@@ -3256,6 +3300,8 @@ acpi_AckSleepState(struct apm_clone_data *clone, int error)
+ {
+ #if defined(__amd64__) || defined(__i386__)
+     struct acpi_softc *sc;
++    acpi_sleep_listener_t *listener;
++    void *listener_arg;
+     int ret, sleeping;
+ 
+     /* If no pending sleep state, return an error. */
+@@ -3274,6 +3320,9 @@ acpi_AckSleepState(struct apm_clone_data *clone, int error)
+ 	    "listener on %s cancelled the pending suspend\n",
+ 	    devtoname(clone->cdev));
+     	ACPI_UNLOCK(acpi);
++	listener = acpi_sleep_listener_get(&listener_arg);
++	if (listener != NULL)
++	    listener(listener_arg, ACPI_SLEEP_CANCEL, 0);
+ 	return (0);
+     }
+ 
+@@ -3308,6 +3357,102 @@ acpi_AckSleepState(struct apm_clone_data *clone, int error)
+ #endif
+ }
+ 
++/*
++ * Register the sleep listener.  There is at most one, the in-kernel
++ * IOPMrootDomain.  While it is registered, acpi_ReqSleepState() calls it
++ * with ACPI_SLEEP_REQUEST and waits for acpi_sleep_listener_ack() before
++ * entering the state; ACPI_SLEEP_CANCEL and ACPI_SLEEP_RESUME follow as
++ * the request is aborted from /dev/acpi or /dev/apm, or the system wakes.
++ */
++int
++acpi_register_sleep_listener(acpi_sleep_listener_t *fn, void *arg)
++{
++    int error;
++
++    if (fn == NULL)
++	return (EINVAL);
++    error = 0;
++    mtx_lock(&acpi_sleep_listener_mtx);
++    if (acpi_sleep_listener != NULL)
++	error = EBUSY;
++    else {
++	acpi_sleep_listener = fn;
++	acpi_sleep_listener_arg = arg;
++    }
++    mtx_unlock(&acpi_sleep_listener_mtx);
++    return (error);
++}
++
++void
++acpi_deregister_sleep_listener(acpi_sleep_listener_t *fn)
++{
++#if defined(__amd64__) || defined(__i386__)
++    struct acpi_softc *sc;
++    int pending;
++#endif
++
++    mtx_lock(&acpi_sleep_listener_mtx);
++    if (acpi_sleep_listener != fn) {
++	mtx_unlock(&acpi_sleep_listener_mtx);
++	return;
++    }
++    acpi_sleep_listener = NULL;
++    acpi_sleep_listener_arg = NULL;
++    mtx_unlock(&acpi_sleep_listener_mtx);
++
++#if defined(__amd64__) || defined(__i386__)
++    /*
++     * A request still waiting on the force timeout would otherwise sit it
++     * out with nobody left to answer.  Enter the sleep state now instead,
++     * as an unlistened request does, from the acpi_task thread.
++     */
++    sc = devclass_get_softc(devclass_find("acpi"), 0);
++    if (sc == NULL)
++	return;
++    ACPI_LOCK(acpi);
++    pending = sc->acpi_next_sstate != 0 &&
++	callout_stop(&sc->susp_force_to) > 0;
++    ACPI_UNLOCK(acpi);
++    if (pending && ACPI_FAILURE(AcpiOsExecute(OSL_NOTIFY_HANDLER,
++	acpi_sleep_force_task, sc)))
++	device_printf(sc->acpi_dev, "AcpiOsExecute() for sleeping failed\n");
++#endif
++}
++
++/*
++ * The listener's answer to ACPI_SLEEP_REQUEST.  Zero acknowledges: the
++ * listener stands in for devd(8), so this is the /dev/acpi acknowledgement
++ * (ACPIIO_ACKSLPSTATE), and once every writable /dev/apm client has also
++ * acknowledged, the state is entered in the caller's thread before this
++ * returns.  Non-zero cancels the request quietly.  ENXIO if none is pending.
++ */
++int
++acpi_sleep_listener_ack(int error)
++{
++#if defined(__amd64__) || defined(__i386__)
++    struct acpi_softc *sc;
++
++    sc = devclass_get_softc(devclass_find("acpi"), 0);
++    if (sc == NULL || sc->acpi_clone == NULL)
++	return (ENXIO);
++    if (error == 0)
++	return (acpi_AckSleepState(sc->acpi_clone, 0));
++
++    ACPI_LOCK(acpi);
++    if (sc->acpi_next_sstate == 0) {
++	ACPI_UNLOCK(acpi);
++	return (ENXIO);
++    }
++    sc->acpi_next_sstate = 0;
++    callout_stop(&sc->susp_force_to);
++    ACPI_UNLOCK(acpi);
++    return (0);
++#else
++    /* This platform does not support acpi suspend/resume. */
++    return (EOPNOTSUPP);
++#endif
++}
++
+ static void
+ acpi_sleep_enable(void *arg)
+ {
+@@ -3361,6 +3506,8 @@ acpi_EnterSleepState(struct acpi_softc *sc, int state)
+     ACPI_STATUS status;
+     ACPI_EVENT_STATUS power_button_status;
+     enum acpi_sleep_state slp_state;
++    acpi_sleep_listener_t *listener;
++    void *listener_arg;
+     int sleep_result;
+ 
+     ACPI_FUNCTION_TRACE_U32((char *)(uintptr_t)__func__, state);
+@@ -3563,6 +3710,11 @@ acpi_EnterSleepState(struct acpi_softc *sc, int state)
+     if (devctl_process_running())
+ 	acpi_UserNotify("Resume", ACPI_ROOT_OBJECT, state);
+ 
++    /* Tell the sleep listener too. */
++    listener = acpi_sleep_listener_get(&listener_arg);
++    if (listener != NULL)
++	listener(listener_arg, ACPI_SLEEP_RESUME, state);
++
+     return_ACPI_STATUS (status);
+ }
+ 
+diff --git a/sys/dev/acpica/acpivar.h b/sys/dev/acpica/acpivar.h
+index ea41640..518c184 100644
+--- a/sys/dev/acpica/acpivar.h
++++ b/sys/dev/acpica/acpivar.h
+@@ -413,6 +413,23 @@ ACPI_STATUS	acpi_OverrideInterruptLevel(UINT32 InterruptNumber);
+ ACPI_STATUS	acpi_SetIntrModel(int model);
+ int		acpi_ReqSleepState(struct acpi_softc *sc, int state);
+ int		acpi_AckSleepState(struct apm_clone_data *clone, int error);
++
++/*
++ * NextBSD: the sleep listener, the in-kernel IOPMrootDomain.  While one is
++ * registered, acpi_ReqSleepState() calls it with ACPI_SLEEP_REQUEST and waits
++ * for acpi_sleep_listener_ack(), or hw.acpi.suspend_ack_timeout seconds,
++ * before entering the state.  With none registered, sleep proceeds at once.
++ * The function is called with no locks held and must not wait for the ack.
++ */
++#define	ACPI_SLEEP_REQUEST	1	/* state requested; ack or cancel it */
++#define	ACPI_SLEEP_CANCEL	2	/* a /dev/acpi or /dev/apm client aborted */
++#define	ACPI_SLEEP_RESUME	3	/* back in S0, slept or backed out */
++typedef void	acpi_sleep_listener_t(void *arg, int event, int state);
++int		acpi_register_sleep_listener(acpi_sleep_listener_t *fn,
++		    void *arg);
++void		acpi_deregister_sleep_listener(acpi_sleep_listener_t *fn);
++int		acpi_sleep_listener_ack(int error);
++
+ ACPI_STATUS	acpi_SetSleepState(struct acpi_softc *sc, int state);
+ int		acpi_wake_set_enable(device_t dev, int enable);
+ int		acpi_parse_prw(ACPI_HANDLE h, struct acpi_prw_data *prw);
+-- 
+2.54.0 (Apple Git-157)
+
