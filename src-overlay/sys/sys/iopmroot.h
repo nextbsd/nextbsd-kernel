@@ -51,8 +51,12 @@
  *                                       Sleep", "Low Power Sleep", "Thermal
  *                                       Emergency Sleep", ... (first sleep on)
  *   "Wake Reason"               string  "EC.LidOpen (User)", "PWRB (User)",
- *                                       "" if unknown (first wake on)
- *   "Wake Type"                 string  "User", "" if unknown
+ *                                       "RTC (Alarm)", "" if unknown (first
+ *                                       wake on)
+ *   "Wake Type"                 string  "User"; for "RTC (Alarm)" "Alarm",
+ *                                       "Maintenance" or "SleepService" (the
+ *                                       wake alarm that went off); "" if
+ *                                       unknown
  *   "SleepWakeUUID"             string  set for each sleep (first sleep on)
  *   "AppleClamshellState"       bool    lid closed (only with a lid)
  *   "AppleClamshellCausesSleep" bool    closing the lid sleeps (with a lid)
@@ -132,12 +136,22 @@ struct iopmroot_sleep {
  *   "SleepWakeUUID"            string  the UUID for the next sleep; bool
  *                                      false clears it (the kernel then
  *                                      makes one per sleep)
+ *   "WakeByCalendarDate"       data    struct iopmroot_calendar: wake from
+ *                                      sleep then (see wake alarms)
+ *   "wake"                     number  the same, in seconds from now
+ *   "PowerByCalendarDate"      data    struct iopmroot_calendar: power on
+ *                                      then, after a power-off
+ *   "poweron"                  number  the same, in seconds from now
  * Other keys are accepted and ignored, as on xnu. Returns 0, EPERM, EINVAL
- * for a bad type or a key with the wrong type, EBUSY (see policy owner).
+ * for a bad type or a key with the wrong type, EBUSY (see policy owner),
+ * EOPNOTSUPP for a wake-alarm key on a machine without a wake alarm.
+ * A data value (CFData) is `number` bytes, at most IOPMROOT_STRING_MAX, in
+ * `string`; kernels older than nextbsd-kernel#245 reject the type (EINVAL).
  */
 #define	IOPMROOT_PROP_BOOL	1	/* value in `number`, 0 or 1 */
 #define	IOPMROOT_PROP_NUMBER	2	/* value in `number` */
 #define	IOPMROOT_PROP_STRING	3	/* value in `string` */
+#define	IOPMROOT_PROP_DATA	4	/* `number` bytes in `string` */
 
 #define	IOPMROOT_KEY_MAX	64
 #define	IOPMROOT_STRING_MAX	64
@@ -148,6 +162,43 @@ struct iopmroot_prop {
 	uint32_t	_pad;
 	int64_t		number;				/* in: bool / number */
 	char		string[IOPMROOT_STRING_MAX];	/* in: string */
+};
+
+/*
+ * Wake alarms (nextbsd-kernel#245). As on xnu, pmconfigd tells the root
+ * domain when to wake: IOKitUser's IOPMSchedulePowerEvent() with
+ * kIOPMAutoWakeScheduleImmediate / kIOPMAutoPowerScheduleImmediate sets
+ * "WakeByCalendarDate" + "wake" / "PowerByCalendarDate" + "poweron", and the
+ * maintenance and SleepService types call IOPMROOT_SETMAINTWAKE
+ * (kPMSetMaintenanceWakeCalendar). A calendar is IOPMCalendarStruct (IOPM.h),
+ * in UTC; a zero year clears it, as does 0 seconds.
+ *
+ * The root domain arms the platform RTC alarm (atrtc's CMOS alarm with the
+ * ACPI RTC_EN wake event; xnu's AppleRTC) with the earliest wake time still
+ * ahead as the system goes to sleep, and disarms it on wake. Wake times are
+ * for one sleep: they are dropped on every wake, and pmconfigd sets the next
+ * one at each kIOMessageSystemWillSleep before it answers. The earliest
+ * power-on time is armed as the system powers off (shutdown -p) and is kept
+ * until it is cleared. A wake by the alarm is published as "Wake Reason"
+ * "RTC (Alarm)". The CMOS alarm reaches 24 hours ahead, or 28 days when the
+ * FADT names a day-of-month alarm register (most Intel machines), or a year
+ * with a month register too; a time further ahead is not armed (logged).
+ * IOPMROOT_F_WAKE_ALARM in IOPMROOT_GETSTATE says the machine has one; without
+ * it (arm64, no CMOS RTC, FADT FIX_RTC or hardware-reduced ACPI) the keys and
+ * IOPMROOT_SETMAINTWAKE return EOPNOTSUPP.
+ */
+#define	IOPMROOT_CALENDAR_MAINTENANCE	1	/* kPMCalendarTypeMaintenance */
+#define	IOPMROOT_CALENDAR_SLEEP_SERVICE	2	/* kPMCalendarTypeSleepService */
+
+struct iopmroot_calendar {		/* == IOPMCalendarStruct, 12 bytes */
+	uint32_t	year;		/* 0 = clear */
+	uint8_t		month;		/* 1-12 */
+	uint8_t		day;		/* 1-31 */
+	uint8_t		hour;
+	uint8_t		minute;
+	uint8_t		second;
+	uint8_t		selector;	/* IOPMROOT_CALENDAR_* (SETMAINTWAKE) */
+	uint8_t		_pad[2];
 };
 
 /*
@@ -182,6 +233,7 @@ struct iopmroot_aggr {
 #define	IOPMROOT_F_PB_SLEEP_DISABLED	0x00000040 /* "DisablePowerButtonSleep" */
 #define	IOPMROOT_F_SYSTEM_SHUTDOWN	0x00000080 /* kern.suspend_blocked */
 #define	IOPMROOT_F_POLICY_OWNED		0x00000100 /* see policy owner */
+#define	IOPMROOT_F_WAKE_ALARM		0x00000200 /* see wake alarms */
 
 struct iopmroot_state {
 	uint64_t	registry_id;	/* the IOPMrootDomain entry */
@@ -239,6 +291,9 @@ struct iopmroot_state {
  *   IOPMROOT_IDLEREVERT kPMRequestIdleSleepRevert: abandons an idle sleep
  *                       still in CAN_SYSTEM_SLEEP (-> WILL_NOT_SLEEP)
  *   IOPMROOT_GETSTATE   struct iopmroot_state
+ *   IOPMROOT_SETMAINTWAKE  kPMSetMaintenanceWakeCalendar: a maintenance
+ *                       (selector 1) or SleepService (2) wake time, see wake
+ *                       alarms; EINVAL for another selector or a bad date
  */
 #define	IOPMROOT_ALLOW		_IOW('O', 1, int64_t)
 #define	IOPMROOT_CANCEL		_IOW('O', 2, int64_t)
@@ -251,5 +306,6 @@ struct iopmroot_state {
 #define	IOPMROOT_SETCLAMSHELL	_IOW('O', 9, uint32_t)
 #define	IOPMROOT_IDLEREVERT	_IO('O', 10)
 #define	IOPMROOT_GETSTATE	_IOR('O', 11, struct iopmroot_state)
+#define	IOPMROOT_SETMAINTWAKE	_IOW('O', 12, struct iopmroot_calendar)
 
 #endif /* !_SYS_IOPMROOT_H_ */

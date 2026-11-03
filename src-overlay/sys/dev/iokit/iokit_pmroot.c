@@ -58,11 +58,25 @@
  * until that descriptor is closed and the sysctls come back. acpi_acad_event
  * keeps the AC state for IOPMROOT_GETSTATE; power sources are K7's.
  *
- * Wake. "Wake Reason" is "PWRB (User)" if acpi_woke_by_power_button(), or
+ * Wake. "Wake Reason" is "PWRB (User)" if acpi_woke_by_power_button(),
+ * "RTC (Alarm)" if the wake alarm armed for this sleep went off, or
  * "EC.LidOpen (User)" if the lid opened during the sleep, else "" (looked at
  * once more two seconds later, since a control-method button's wake notify
  * may arrive late). kern.sleeptime / kern.waketime are set from the
  * power_suspend_early / power_resume eventhandlers, xnu's semantics.
+ *
+ * Wake alarms (nextbsd-kernel#245). As on xnu, pmconfigd hands scheduled
+ * wake and power-on times to the root domain as PM settings:
+ * "WakeByCalendarDate" / "wake" and "PowerByCalendarDate" / "poweron"
+ * through IOPMROOT_SETPROP (what IOKitUser's tellClockController() writes),
+ * and the maintenance and SleepService wakes through IOPMROOT_SETMAINTWAKE
+ * (kPMSetMaintenanceWakeCalendar). On xnu they go on to the platform RTC
+ * driver (AppleRTC); here that is atrtc's CMOS alarm. The earliest wake
+ * time still ahead is armed from power_suspend_early, as the system goes to
+ * sleep, and disarmed again from power_resume; the wake times are good for
+ * one sleep, since pmconfigd sets the next one at each WillSleep. The
+ * earliest power-on time is armed from shutdown_final on a power-off and
+ * stays until it is cleared.
  *
  * Context. The ACPI listener and the eventhandlers run in ACPI's task
  * thread, in the thread that requested sleep, or during DEVICE_RESUME with
@@ -95,6 +109,7 @@
 #include <sys/sysctl.h>
 #include <sys/syslog.h>
 #include <sys/time.h>
+#include <sys/clock.h>
 #include <sys/uuid.h>
 #include <sys/bus.h>
 #include <sys/nv.h>
@@ -108,6 +123,8 @@
 
 #if defined(DEV_ACPI) && (defined(__amd64__) || defined(__i386__))
 #define	IOPM_CAN_SLEEP	1	/* acpi_ReqSleepState() can suspend */
+#include <sys/reboot.h>
+#include <isa/rtc.h>		/* atrtc_wake_alarm_*() */
 #endif
 
 static MALLOC_DEFINE(M_IOPMROOT, "iopmroot", "IOPMrootDomain");
@@ -130,7 +147,35 @@ static MALLOC_DEFINE(M_IOPMROOT, "iopmroot", "IOPMrootDomain");
 					   Audio|Network */
 #define	IOPM_WAKE_REASON_PWRB	"PWRB (User)"
 #define	IOPM_WAKE_REASON_LID	"EC.LidOpen (User)"
+#define	IOPM_WAKE_REASON_RTC	"RTC (Alarm)"
 #define	IOPM_WAKE_TYPE_USER	"User"
+
+/*
+ * Wake alarms: the PM settings xnu's root domain passes to the platform RTC
+ * driver (IOPM.h / IOPMPrivate.h kIOPMSetting*Key), one slot each. A
+ * calendar key carries an IOPMCalendarStruct (struct iopmroot_calendar,
+ * UTC), a seconds key the seconds from now; a zero year or 0 seconds clears.
+ */
+#define	IOPM_ALARM_WAKE		0	/* "WakeByCalendarDate" */
+#define	IOPM_ALARM_WAKE_SECS	1	/* "wake" */
+#define	IOPM_ALARM_MAINT	2	/* kPMSetMaintenanceWakeCalendar, 1 */
+#define	IOPM_ALARM_SLEEPSVC	3	/* kPMSetMaintenanceWakeCalendar, 2 */
+#define	IOPM_ALARM_POWERON	4	/* "PowerByCalendarDate" */
+#define	IOPM_ALARM_POWERON_SECS	5	/* "poweron" */
+#define	IOPM_ALARM_COUNT	6
+
+static const struct {
+	const char	*key;		/* IOPMROOT_SETPROP key, NULL if none */
+	bool		calendar;	/* else seconds from now */
+	const char	*wake_type;	/* "Wake Type" when it wakes us */
+} iopm_alarms[IOPM_ALARM_COUNT] = {
+	[IOPM_ALARM_WAKE] =	{ "WakeByCalendarDate", true, "Alarm" },
+	[IOPM_ALARM_WAKE_SECS] = { "wake", false, "Alarm" },
+	[IOPM_ALARM_MAINT] =	{ NULL, true, "Maintenance" },
+	[IOPM_ALARM_SLEEPSVC] =	{ NULL, true, "SleepService" },
+	[IOPM_ALARM_POWERON] =	{ "PowerByCalendarDate", true, NULL },
+	[IOPM_ALARM_POWERON_SECS] = { "poweron", false, NULL },
+};
 
 /* Worker work bits (iopm.work). */
 #define	IOPM_W_SLEEP		0x0001	/* IOPMROOT_SLEEP: request sleep */
@@ -194,6 +239,9 @@ static struct {
 	uint64_t	handled;	/* resumes the wake messages went out for */
 	sbintime_t	wake_time;	/* sbinuptime() of the last wake */
 	bool		wake_lid;	/* the lid opened during the sleep */
+	time_t		alarm[IOPM_ALARM_COUNT]; /* UTC s, 0 = none */
+	int		alarm_armed;	/* IOPM_ALARM_* armed, -1 = none */
+	int		alarm_woke;	/* IOPM_ALARM_* that woke us, -1 = none */
 
 	/* Lid, buttons, AC. */
 	bool		lid_present;
@@ -376,6 +424,131 @@ iopm_acpi_ack(int error)
 	(void)error;
 	return (EOPNOTSUPP);
 #endif
+}
+
+/* ---- wake alarms ---- */
+
+/* True if this machine has a wake alarm (atrtc's, with RTC_EN). */
+static bool
+iopm_alarm_supported(void)
+{
+#ifdef IOPM_CAN_SLEEP
+	return (atrtc_wake_alarm_reach() != 0);
+#else
+	return (false);
+#endif
+}
+
+/* The earliest alarm in [first, last] still ahead, or -1; its time in
+ * *when. */
+static int
+iopm_alarm_next(int first, int last, time_t *when)
+{
+	time_t now;
+	int i, k;
+
+	now = time_second;
+	k = -1;
+	mtx_lock(&iopm_mtx);
+	for (i = first; i <= last; i++)
+		if (iopm.alarm[i] > now &&
+		    (k < 0 || iopm.alarm[i] < iopm.alarm[k]))
+			k = i;
+	if (k >= 0)
+		*when = iopm.alarm[k];
+	mtx_unlock(&iopm_mtx);
+	return (k);
+}
+
+/* Arm alarm `k` in the RTC. */
+static int
+iopm_alarm_arm(int k, time_t when)
+{
+#ifdef IOPM_CAN_SLEEP
+	int error;
+
+	error = atrtc_wake_alarm_arm(when);
+	if (error != 0)
+		log(LOG_WARNING, "IOPMrootDomain: RTC alarm for %jd not set "
+		    "(error %d)\n", (intmax_t)when, error);
+	else if (bootverbose)
+		printf("IOPMrootDomain: RTC alarm set for %jd (%s)\n",
+		    (intmax_t)when, iopm_alarms[k].key != NULL ?
+		    iopm_alarms[k].key : iopm_alarms[k].wake_type);
+	return (error);
+#else
+	(void)k;
+	(void)when;
+	return (EOPNOTSUPP);
+#endif
+}
+
+static void
+iopm_alarm_disarm(void)
+{
+#ifdef IOPM_CAN_SLEEP
+	atrtc_wake_alarm_disarm();
+#endif
+}
+
+/* An IOPMCalendarStruct as UTC seconds; a zero year is 0 (clear). */
+static int
+iopm_calendar_time(const struct iopmroot_calendar *cal, time_t *out)
+{
+	struct clocktime ct;
+	struct timespec ts;
+
+	if (cal->year == 0) {
+		*out = 0;
+		return (0);
+	}
+	bzero(&ct, sizeof(ct));
+	ct.year = cal->year;
+	ct.mon = cal->month;
+	ct.day = cal->day;
+	ct.hour = cal->hour;
+	ct.min = cal->minute;
+	ct.sec = cal->second;
+	ct.dow = -1;
+	if (clock_ct_to_ts(&ct, &ts) != 0)
+		return (EINVAL);
+	*out = ts.tv_sec;
+	return (0);
+}
+
+/* Set or clear (when == 0) alarm `k`. EOPNOTSUPP without a wake alarm. */
+static int
+iopm_alarm_set(int k, time_t when)
+{
+	if (!iopm_alarm_supported())
+		return (EOPNOTSUPP);
+	mtx_lock(&iopm_mtx);
+	iopm.alarm[k] = when;
+	mtx_unlock(&iopm_mtx);
+	return (0);
+}
+
+/* IOPMROOT_SETPROP for alarm `k`'s key. */
+static int
+iopm_alarm_setprop(int k, const struct iopmroot_prop *pr)
+{
+	struct iopmroot_calendar cal;
+	time_t when;
+	int error;
+
+	if (iopm_alarms[k].calendar) {
+		if (pr->type != IOPMROOT_PROP_DATA ||
+		    pr->number != sizeof(cal))
+			return (EINVAL);
+		memcpy(&cal, pr->string, sizeof(cal));
+		if ((error = iopm_calendar_time(&cal, &when)) != 0)
+			return (error);
+	} else {
+		if (pr->type != IOPMROOT_PROP_NUMBER || pr->number < 0)
+			return (EINVAL);
+		when = pr->number == 0 ? 0 : time_second + pr->number;
+	}
+	return (iopm_alarm_set(k, when));
 }
 
 /* Merge `nvl` into the entry's properties; consumes it. */
@@ -616,19 +789,26 @@ iopm_wait_answers(uint64_t suspends)
 static void
 iopm_wake_reason_update(bool first)
 {
-	const char *reason;
+	const char *reason, *type;
 	nvlist_t *nvl;
 	bool lid;
+	int alarm;
 
 	mtx_lock(&iopm_mtx);
 	lid = iopm.wake_lid;
+	alarm = iopm.alarm_woke;
 	mtx_unlock(&iopm_mtx);
 
 	reason = NULL;
+	type = IOPM_WAKE_TYPE_USER;
 #ifdef DEV_ACPI
 	if (acpi_woke_by_power_button())
 		reason = IOPM_WAKE_REASON_PWRB;
 #endif
+	if (reason == NULL && alarm >= 0) {
+		reason = IOPM_WAKE_REASON_RTC;
+		type = iopm_alarms[alarm].wake_type;
+	}
 	if (reason == NULL && lid)
 		reason = IOPM_WAKE_REASON_LID;
 	if (reason != NULL || first) {
@@ -636,7 +816,7 @@ iopm_wake_reason_update(bool first)
 		nvlist_add_string(nvl, "Wake Reason",
 		    reason != NULL ? reason : "");
 		nvlist_add_string(nvl, "Wake Type",
-		    reason != NULL ? IOPM_WAKE_TYPE_USER : "");
+		    reason != NULL ? type : "");
 		iopm_set_props(nvl);
 	}
 
@@ -1113,21 +1293,55 @@ iopm_acad_event(void *arg __unused, int online)
 }
 #endif /* DEV_ACPI */
 
+/*
+ * The system is about to sleep: arm the earliest wake alarm still ahead.
+ * This runs in the thread that suspends, before processes are stopped.
+ */
 static void
 iopm_suspend_early(void *arg __unused)
 {
+	time_t when;
+	int k;
+
+	k = iopm_alarm_next(IOPM_ALARM_WAKE, IOPM_ALARM_SLEEPSVC, &when);
+	if (k >= 0 && iopm_alarm_arm(k, when) != 0)
+		k = -1;
+
 	mtx_lock(&iopm_mtx);
 	iopm.suspends++;
 	iopm.wake_lid = false;
 	iopm.recheck = 0;
+	iopm.alarm_armed = k;
+	iopm.alarm_woke = -1;
 	microtime(&iopm_sleeptime);
 	cv_broadcast(&iopm_cv);
 	mtx_unlock(&iopm_mtx);
 }
 
+/*
+ * Back in S0 (or the suspend backed out): disarm the wake alarm, note
+ * whether it woke us, and drop the wake times, which were for this sleep.
+ */
 static void
 iopm_resume(void *arg __unused)
 {
+	int i, k;
+	bool rtc;
+
+	rtc = false;
+#ifdef IOPM_CAN_SLEEP
+	rtc = acpi_woke_by_rtc_alarm() != 0;
+#endif
+	mtx_lock(&iopm_mtx);
+	k = iopm.alarm_armed;
+	iopm.alarm_armed = -1;
+	iopm.alarm_woke = rtc ? k : -1;
+	for (i = IOPM_ALARM_WAKE; i <= IOPM_ALARM_SLEEPSVC; i++)
+		iopm.alarm[i] = 0;
+	mtx_unlock(&iopm_mtx);
+	if (k >= 0)
+		iopm_alarm_disarm();
+
 	mtx_lock(&iopm_mtx);
 	iopm.resumes++;
 	microtime(&iopm_waketime);
@@ -1135,6 +1349,26 @@ iopm_resume(void *arg __unused)
 	cv_broadcast(&iopm_cv);
 	mtx_unlock(&iopm_mtx);
 }
+
+#ifdef IOPM_CAN_SLEEP
+/*
+ * Powering off: arm the earliest power-on alarm still ahead, before ACPI
+ * enters S5 (acpi_shutdown_final runs at SHUTDOWN_PRI_LAST + 150).
+ */
+static void
+iopm_shutdown_final(void *arg __unused, int howto)
+{
+	time_t when;
+	int k;
+
+	if ((howto & RB_POWEROFF) == 0)
+		return;
+	k = iopm_alarm_next(IOPM_ALARM_POWERON, IOPM_ALARM_POWERON_SECS,
+	    &when);
+	if (k >= 0)
+		(void)iopm_alarm_arm(k, when);
+}
+#endif
 
 /* ---- /dev/iopmroot ---- */
 
@@ -1252,12 +1486,21 @@ iopm_ioctl_setprop(struct iopmroot_prop *pr, struct iopm_fd *fd)
 {
 	nvlist_t *nvl;
 	bool v;
-	int error;
+	int error, k;
 
 	pr->key[sizeof(pr->key) - 1] = '\0';
-	pr->string[sizeof(pr->string) - 1] = '\0';
-	if (pr->type < IOPMROOT_PROP_BOOL || pr->type > IOPMROOT_PROP_STRING)
+	if (pr->type < IOPMROOT_PROP_BOOL || pr->type > IOPMROOT_PROP_DATA)
 		return (EINVAL);
+	if (pr->type == IOPMROOT_PROP_STRING)
+		pr->string[sizeof(pr->string) - 1] = '\0';
+	if (pr->type == IOPMROOT_PROP_DATA &&
+	    (pr->number < 0 || pr->number > IOPMROOT_STRING_MAX))
+		return (EINVAL);
+
+	for (k = 0; k < IOPM_ALARM_COUNT; k++)
+		if (iopm_alarms[k].key != NULL &&
+		    strcmp(pr->key, iopm_alarms[k].key) == 0)
+			return (iopm_alarm_setprop(k, pr));
 
 	if (strcmp(pr->key, "System Shutdown") == 0) {
 		if ((error = iopm_prop_bool(pr, &v)) != 0)
@@ -1353,6 +1596,30 @@ iopm_getstate(struct iopmroot_state *st)
 	if (iopm.owner != NULL)
 		st->flags |= IOPMROOT_F_POLICY_OWNED;
 	mtx_unlock(&iopm_mtx);
+	if (iopm_alarm_supported())
+		st->flags |= IOPMROOT_F_WAKE_ALARM;
+}
+
+/* IOPMROOT_SETMAINTWAKE: kPMSetMaintenanceWakeCalendar. */
+static int
+iopm_ioctl_maintwake(struct iopmroot_calendar *cal)
+{
+	time_t when;
+	int error, k;
+
+	switch (cal->selector) {
+	case IOPMROOT_CALENDAR_MAINTENANCE:
+		k = IOPM_ALARM_MAINT;
+		break;
+	case IOPMROOT_CALENDAR_SLEEP_SERVICE:
+		k = IOPM_ALARM_SLEEPSVC;
+		break;
+	default:
+		return (EINVAL);
+	}
+	if ((error = iopm_calendar_time(cal, &when)) != 0)
+		return (error);
+	return (iopm_alarm_set(k, when));
 }
 
 static int
@@ -1392,6 +1659,7 @@ iopm_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 	case IOPMROOT_TICKLE:
 	case IOPMROOT_SETCLAMSHELL:
 	case IOPMROOT_IDLEREVERT:
+	case IOPMROOT_SETMAINTWAKE:
 		break;
 	default:
 		return (ENOTTY);
@@ -1439,6 +1707,8 @@ iopm_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		}
 		mtx_unlock(&iopm_mtx);
 		return (0);
+	case IOPMROOT_SETMAINTWAKE:
+		return (iopm_ioctl_maintwake((struct iopmroot_calendar *)data));
 	}
 	return (ENOTTY);
 }
@@ -1453,6 +1723,8 @@ static void
 iopm_hooks(void *arg __unused)
 {
 	cv_init(&iopm_cv, "iopmroot");
+	iopm.alarm_armed = -1;
+	iopm.alarm_woke = -1;
 #ifdef DEV_ACPI
 	EVENTHANDLER_REGISTER(acpi_lid_event, iopm_lid_event, NULL,
 	    EVENTHANDLER_PRI_ANY);
@@ -1465,6 +1737,10 @@ iopm_hooks(void *arg __unused)
 	    EVENTHANDLER_PRI_ANY);
 	EVENTHANDLER_REGISTER(power_resume, iopm_resume, NULL,
 	    EVENTHANDLER_PRI_ANY);
+#ifdef IOPM_CAN_SLEEP
+	EVENTHANDLER_REGISTER(shutdown_final, iopm_shutdown_final, NULL,
+	    SHUTDOWN_PRI_LAST + 100);
+#endif
 }
 SYSINIT(iopmroot_hooks, SI_SUB_DRIVERS, SI_ORDER_ANY, iopm_hooks, NULL);
 
