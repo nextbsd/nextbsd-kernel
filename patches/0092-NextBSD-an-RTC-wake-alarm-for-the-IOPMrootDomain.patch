@@ -1,0 +1,371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Tue, 3 Nov 2026 00:58:04 -0600
+Subject: [PATCH] NextBSD: an RTC wake alarm for the IOPMrootDomain
+
+FreeBSD has no way to arm a wake alarm before S3 or S5.  NextBSD's
+IOPMrootDomain needs one for scheduled wake and power-on (pmset schedule
+wake / poweron), as xnu's root domain has the platform RTC driver
+(AppleRTC) program its alarm.
+
+atrtc now provides atrtc_wake_alarm_reach(), atrtc_wake_alarm_arm() and
+atrtc_wake_alarm_disarm().  Arming writes the MC146818 seconds, minutes
+and hours alarm registers, plus the day-of-month and month alarm
+registers the FADT names (DayAlarm, MonthAlarm), sets AIE in register B,
+and enables the ACPI RTC fixed event (RTC_EN), so the alarm wakes the
+system from S3, and from S5 where the firmware allows it.  The time is
+written as local time when the CMOS clock keeps it (utc_offset()), as
+atrtc_settime() does.  The alarm reaches a day ahead with the time
+registers alone, 28 days with a day register, a year with a month
+register too.  atrtc installs a handler for the RTC fixed event that
+disables it again, so an alarm that goes off while awake, or the SCI
+after an alarm wake, is never reported by ACPICA as unhandled.  The event
+stays disabled until armed.  Machines whose RTC wake status is not in the
+fixed register space (FADT FIX_RTC) or that are hardware-reduced get no
+alarm.  The read-modify-write of rtc_statusb in atrtc_enable_intr() and
+atrtc_disable_intr() now happens under atrtc_lock, so the eventtimer
+cannot drop the alarm's AIE bit.
+
+On resume from S3, acpi_EnterSleepState() records a latched RTC_STS
+before the SCI can clear it, read with acpi_woke_by_rtc_alarm(), so the
+root domain can report "Wake Reason" "RTC (Alarm)".  The fixed power
+button check there tested the whole AcpiGetEventStatus() result, which
+has HAS_HANDLER and ENABLED set whenever the fixed button is in use, so
+every wake on such a machine was taken for a power button wake; it now
+tests ACPI_EVENT_FLAG_STATUS_SET.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/dev/acpica/acpi.c    |  42 ++++++++--
+ sys/dev/acpica/acpivar.h |   1 +
+ sys/isa/rtc.h            |   4 +
+ sys/x86/isa/atrtc.c      | 165 ++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 204 insertions(+), 8 deletions(-)
+
+diff --git a/sys/dev/acpica/acpi.c b/sys/dev/acpica/acpi.c
+index bbcdc08..8676de4 100644
+--- a/sys/dev/acpica/acpi.c
++++ b/sys/dev/acpica/acpi.c
+@@ -349,6 +349,13 @@ static struct evdev_dev *acpi_fixed_button_evdev[2];
+  */
+ static int acpi_wake_power_button;
+ 
++/*
++ * Set when the RTC alarm woke the system from the last sleep, as seen by the
++ * latched RTC_STS fixed-feature status (atrtc arms the alarm and RTC_EN for
++ * the IOPMrootDomain's wake alarm).  Cleared on entry to each sleep.
++ */
++static int acpi_wake_rtc_alarm;
++
+ int acpi_susp_bounce;
+ SYSCTL_INT(_debug_acpi, OID_AUTO, suspend_bounce, CTLFLAG_RW,
+     &acpi_susp_bounce, 0, "Don't actually suspend, just test devices.");
+@@ -3566,7 +3573,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, int state)
+ {
+     register_t intr;
+     ACPI_STATUS status;
+-    ACPI_EVENT_STATUS power_button_status;
++    ACPI_EVENT_STATUS power_button_status, rtc_status;
+     enum acpi_sleep_state slp_state;
+     acpi_sleep_listener_t *listener;
+     void *listener_arg;
+@@ -3624,6 +3631,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, int state)
+ 
+     slp_state = ACPI_SS_NONE;
+     acpi_wake_power_button = 0;
++    acpi_wake_rtc_alarm = 0;
+ 
+     sc->acpi_sstate = state;
+ 
+@@ -3684,19 +3692,30 @@ acpi_EnterSleepState(struct acpi_softc *sc, int state)
+ 	     * Clearing of power button status after wakeup is mandated
+ 	     * by ACPI specification in section "Fixed Power Button".
+ 	     *
+-	     * XXX As of ACPICA 20121114 AcpiGetEventStatus provides
+-	     * status as 0/1 corressponding to inactive/active despite
+-	     * its type being ACPI_EVENT_STATUS.  In other words,
+-	     * we should not test for ACPI_EVENT_FLAG_SET for time being.
++	     * AcpiGetEventStatus returns ACPI_EVENT_FLAG_* bits, and
++	     * HAS_HANDLER and ENABLED are set whenever the fixed button is
++	     * in use, so only STATUS_SET says the button was pressed.
+ 	     */
+ 	    if (ACPI_SUCCESS(AcpiGetEventStatus(ACPI_EVENT_POWER_BUTTON,
+-		&power_button_status)) && power_button_status != 0) {
++		&power_button_status)) &&
++		(power_button_status & ACPI_EVENT_FLAG_STATUS_SET) != 0) {
+ 		/* Keep the only evidence that the power button woke us. */
+ 		acpi_wake_power_button = 1;
+ 		AcpiClearEvent(ACPI_EVENT_POWER_BUTTON);
+ 		device_printf(sc->acpi_dev,
+ 		    "cleared fixed power button status\n");
+ 	    }
++
++	    /*
++	     * NextBSD: RTC_STS latched means the RTC alarm went off while
++	     * we slept, so it woke us (an alarm is only set for that).
++	     * Look before the SCI runs: atrtc's RTC fixed event handler
++	     * then clears it.
++	     */
++	    if (ACPI_SUCCESS(AcpiGetEventStatus(ACPI_EVENT_RTC,
++		&rtc_status)) &&
++		(rtc_status & ACPI_EVENT_FLAG_STATUS_SET) != 0)
++		acpi_wake_rtc_alarm = 1;
+ 	}
+ 
+ 	intr_restore(intr);
+@@ -4251,6 +4270,17 @@ acpi_woke_by_power_button(void)
+     return (acpi_wake_power_button);
+ }
+ 
++/*
++ * True if the RTC alarm woke the system from the last sleep, for the
++ * IOPMrootDomain "Wake Reason".  Valid once the system has resumed.
++ */
++int
++acpi_woke_by_rtc_alarm(void)
++{
++
++    return (acpi_wake_rtc_alarm);
++}
++
+ /*
+  * XXX This static buffer is suboptimal.  There is no locking so only
+  * use this for single-threaded callers.
+diff --git a/sys/dev/acpica/acpivar.h b/sys/dev/acpica/acpivar.h
+index 4221455..c7dffa7 100644
+--- a/sys/dev/acpica/acpivar.h
++++ b/sys/dev/acpica/acpivar.h
+@@ -494,6 +494,7 @@ UINT32		acpi_event_power_button_wake(void *context);
+ UINT32		acpi_event_sleep_button_sleep(void *context);
+ UINT32		acpi_event_sleep_button_wake(void *context);
+ int		acpi_woke_by_power_button(void);
++int		acpi_woke_by_rtc_alarm(void);
+ 
+ #define ACPI_EVENT_PRI_FIRST      0
+ #define ACPI_EVENT_PRI_DEFAULT    10000
+diff --git a/sys/isa/rtc.h b/sys/isa/rtc.h
+index ff6195a..cca07c2 100644
+--- a/sys/isa/rtc.h
++++ b/sys/isa/rtc.h
+@@ -116,6 +116,10 @@ extern	int atrtcclock_disable;
+ int	rtcin(int reg);
+ void	atrtc_restore(void);
+ void	writertc(int reg, u_char val);
++/* NextBSD: the RTC wake alarm, for the IOPMrootDomain. */
++time_t	atrtc_wake_alarm_reach(void);
++int	atrtc_wake_alarm_arm(time_t utc);
++void	atrtc_wake_alarm_disarm(void);
+ #endif
+ 
+ #endif /* _I386_ISA_RTC_H_ */
+diff --git a/sys/x86/isa/atrtc.c b/sys/x86/isa/atrtc.c
+index 63f41d8..647a5aa 100644
+--- a/sys/x86/isa/atrtc.c
++++ b/sys/x86/isa/atrtc.c
+@@ -164,8 +164,8 @@ static void
+ atrtc_enable_intr(void)
+ {
+ 
+-	rtc_statusb |= RTCSB_PINTR;
+ 	mtx_lock_spin(&atrtc_lock);
++	rtc_statusb |= RTCSB_PINTR;
+ 	rtcout_locked(RTC_STATUSB, rtc_statusb);
+ 	rtcin_locked(RTC_INTR);
+ 	mtx_unlock_spin(&atrtc_lock);
+@@ -175,8 +175,8 @@ static void
+ atrtc_disable_intr(void)
+ {
+ 
+-	rtc_statusb &= ~RTCSB_PINTR;
+ 	mtx_lock_spin(&atrtc_lock);
++	rtc_statusb &= ~RTCSB_PINTR;
+ 	rtcout_locked(RTC_STATUSB, rtc_statusb);
+ 	rtcin_locked(RTC_INTR);
+ 	mtx_unlock_spin(&atrtc_lock);
+@@ -402,8 +402,166 @@ atrtc_unreg_acpi_cmos_handler(device_t dev)
+ 
+ 	return (0);
+ }
++
++/*
++ * NextBSD: the RTC wake alarm (nextbsd-kernel#245).  This is the platform
++ * half of xnu's scheduled wake, what AppleRTC is on an Intel Mac: the
++ * IOPMrootDomain keeps the times pmconfigd sets ("WakeByCalendarDate",
++ * "PowerByCalendarDate", ...) and arms the alarm here as the system
++ * suspends or powers off.
++ *
++ * The MC146818 alarm matches seconds, minutes and hours (registers 1, 3 and
++ * 5); the FADT may name CMOS registers that also match the day of the month
++ * (DayAlarm, 0x0d on Intel chipsets, bits 5:0) and the month (MonthAlarm).
++ * AIE in register B drives IRQB when it matches, which the chipset latches
++ * as the RTC_STS fixed event; with RTC_EN set that wakes the system from S3
++ * (and S4/S5 where the firmware allows it).  The fixed event handler below
++ * takes the SCI for an alarm that goes off while awake, or for the wake, so
++ * ACPICA never reports an unhandled RTC event.  Machines whose RTC wake is
++ * not in the fixed register space (FADT FIX_RTC) or that are hardware-reduced
++ * get no alarm.
++ */
++static bool	atrtc_alarm_ok;		/* RTC fixed event handler installed */
++static int	atrtc_alarm_dayreg;	/* FADT DayAlarm, 0 = none */
++static int	atrtc_alarm_monreg;	/* FADT MonthAlarm, 0 = none */
++
++static UINT32
++atrtc_acpi_rtc_event(void *context __unused)
++{
++
++	/* One shot: ACPICA has cleared RTC_STS, so drop RTC_EN as well. */
++	AcpiDisableEvent(ACPI_EVENT_RTC, 0);
++	return (ACPI_INTERRUPT_HANDLED);
++}
++
++/* A FADT alarm register index, if it is a usable CMOS register. */
++static int
++atrtc_alarm_reg(int reg)
++{
++
++	return (reg >= RTC_STATUSD && reg < 0x80 ? reg : 0);
++}
++
++static void
++atrtc_alarm_init(void)
++{
++
++	if ((AcpiGbl_FADT.Flags & (ACPI_FADT_FIXED_RTC |
++	    ACPI_FADT_HW_REDUCED)) != 0)
++		return;
++	if (ACPI_FAILURE(AcpiInstallFixedEventHandler(ACPI_EVENT_RTC,
++	    atrtc_acpi_rtc_event, NULL)))
++		return;
++	/* Installing enables the event; it stays off until armed. */
++	AcpiDisableEvent(ACPI_EVENT_RTC, 0);
++	AcpiClearEvent(ACPI_EVENT_RTC);
++	atrtc_alarm_dayreg = atrtc_alarm_reg(AcpiGbl_FADT.DayAlarm);
++	if (atrtc_alarm_dayreg != 0)
++		atrtc_alarm_monreg = atrtc_alarm_reg(AcpiGbl_FADT.MonthAlarm);
++	atrtc_alarm_ok = true;
++}
++
++static void
++atrtc_alarm_fini(void)
++{
++
++	if (!atrtc_alarm_ok)
++		return;
++	atrtc_wake_alarm_disarm();
++	AcpiRemoveFixedEventHandler(ACPI_EVENT_RTC, atrtc_acpi_rtc_event);
++	atrtc_alarm_ok = false;
++}
+ #endif	/* DEV_ACPI */
+ 
++/*
++ * How far ahead, in seconds, the wake alarm can be set without matching
++ * earlier than asked: a day with the time registers alone, 28 days with the
++ * day of the month, a year with the month too.  0: no wake alarm.
++ */
++time_t
++atrtc_wake_alarm_reach(void)
++{
++
++#ifdef DEV_ACPI
++	if (!atrtc_alarm_ok)
++		return (0);
++	if (atrtc_alarm_monreg != 0)
++		return (365 * 86400);
++	if (atrtc_alarm_dayreg != 0)
++		return (28 * 86400);
++	return (86400);
++#else
++	return (0);
++#endif
++}
++
++/*
++ * Arm the alarm for `utc` (seconds since the Epoch, UTC) and enable it as a
++ * wake event.  The CMOS clock keeps local time when machdep.wall_cmos_clock
++ * says so, as for the time itself.  EOPNOTSUPP: no wake alarm; EINVAL: not
++ * in the future; ERANGE: beyond atrtc_wake_alarm_reach().
++ */
++int
++atrtc_wake_alarm_arm(time_t utc)
++{
++#ifdef DEV_ACPI
++	struct bcd_clocktime bct;
++	struct timespec ts;
++	time_t now;
++
++	if (!atrtc_alarm_ok)
++		return (EOPNOTSUPP);
++	now = time_second;
++	if (utc <= now)
++		return (EINVAL);
++	if (utc - now >= atrtc_wake_alarm_reach())
++		return (ERANGE);
++
++	ts.tv_sec = utc - utc_offset();
++	ts.tv_nsec = 0;
++	clock_ts_to_bcd(&ts, &bct, false);
++
++	mtx_lock_spin(&atrtc_lock);
++	rtc_statusb &= ~RTCSB_AINTR;
++	rtcout_locked(RTC_STATUSB, rtc_statusb);
++	rtcout_locked(RTC_SECALRM, bct.sec);
++	rtcout_locked(RTC_MINALRM, bct.min);
++	rtcout_locked(RTC_HRSALRM, bct.hour);
++	if (atrtc_alarm_dayreg != 0)
++		rtcout_locked(atrtc_alarm_dayreg, bct.day);
++	if (atrtc_alarm_monreg != 0)
++		rtcout_locked(atrtc_alarm_monreg, bct.mon);
++	rtcin_locked(RTC_INTR);		/* drop a stale alarm flag */
++	rtc_statusb |= RTCSB_AINTR;
++	rtcout_locked(RTC_STATUSB, rtc_statusb);
++	mtx_unlock_spin(&atrtc_lock);
++
++	AcpiClearEvent(ACPI_EVENT_RTC);
++	AcpiEnableEvent(ACPI_EVENT_RTC, 0);
++	return (0);
++#else
++	(void)utc;
++	return (EOPNOTSUPP);
++#endif
++}
++
++/* Disarm the alarm and its wake event. */
++void
++atrtc_wake_alarm_disarm(void)
++{
++#ifdef DEV_ACPI
++	if (!atrtc_alarm_ok)
++		return;
++	AcpiDisableEvent(ACPI_EVENT_RTC, 0);
++	AcpiClearEvent(ACPI_EVENT_RTC);
++	mtx_lock_spin(&atrtc_lock);
++	rtc_statusb &= ~RTCSB_AINTR;
++	rtcout_locked(RTC_STATUSB, rtc_statusb);
++	rtcin_locked(RTC_INTR);
++	mtx_unlock_spin(&atrtc_lock);
++#endif
++}
++
+ /*
+  * Attach to the ISA PnP descriptors for the timer and realtime clock.
+  */
+@@ -537,6 +695,8 @@ atrtc_acpi_attach(device_t dev)
+ 		return (ret);
+ 
+ 	(void)atrtc_reg_acpi_cmos_handler(dev);
++	if (!acpi_disabled("atrtc"))
++		atrtc_alarm_init();
+ 
+ 	return (0);
+ }
+@@ -545,6 +705,7 @@ static int
+ atrtc_acpi_detach(device_t dev)
+ {
+ 
++	atrtc_alarm_fini();
+ 	(void)atrtc_unreg_acpi_cmos_handler(dev);
+ 	return (0);
+ }
+-- 
+2.54.0 (Apple Git-157)
+

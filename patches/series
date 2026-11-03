@@ -82,3 +82,4 @@
 0089-NextBSD-fixed-feature-buttons-fire-acpi_button_event.patch
 0090-NextBSD-acpi_ReqSleepState-waits-for-a-registered-sl.patch
 0091-NextBSD-fixed-feature-buttons-report-KEY_POWER-KEY_S.patch
+0092-NextBSD-an-RTC-wake-alarm-for-the-IOPMrootDomain.patch
