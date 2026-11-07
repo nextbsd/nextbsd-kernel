@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 7 Nov 2026 13:12:13 -0600
+Subject: [PATCH] NextBSD: vt(4) yields the screen to the boot splash
+
+On a NextBSD graphics boot (E19) the loader paints a splash and the
+kernel's platform expert keeps it on screen with a spinner until getty
+or the display server takes over, the way xnu turns its text console off
+with gc_enable(FALSE).  vt(4) stays the text console underneath and
+must not undo that:
+
+- vt_fb_init() offers the framebuffer to PE_boot_console_fb() instead of
+  blanking it.  For the booter's framebuffer on a graphics boot the
+  platform expert takes it, paints the whole splash (pixel-identical to
+  the loader's) and starts the spinner (kPEAcquireScreen), so the first
+  kernel paint is the splash, never a black screen.  Every other
+  framebuffer, and every text boot, is blanked as before.
+- vt_flush() draws nothing while PE_graphics_console_active().  When
+  graphics hand the screen back to text (kPETextScreen, a panic), the
+  next flush redraws the whole screen once.
+- The stock vtterm_splash (boot -m) stays off while the NextBSD splash
+  owns the screen.
+
+On a text boot (-v, -s, a serial console, no framebuffer) none of this
+changes anything, so verbose and serial boots are byte-identical.
+
+Part of nextbsd/nextbsd#542 (nextbsd-kernel#408).
+---
+ sys/dev/vt/hw/fb/vt_fb.c | 10 ++++++++--
+ sys/dev/vt/vt_core.c     | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/sys/dev/vt/hw/fb/vt_fb.c b/sys/dev/vt/hw/fb/vt_fb.c
+index 6130dc4061b4cdb04a82099ef9955a5decacbcc1..9d4cd8400e421625c1bd822be63e70c5cc720754 100644
+--- a/sys/dev/vt/hw/fb/vt_fb.c
++++ b/sys/dev/vt/hw/fb/vt_fb.c
+@@ -35,6 +35,7 @@
+ #include <sys/fbio.h>
+ #include <sys/kernel.h>
+ #include <sys/endian.h>
++#include <sys/pexpert.h>
+ #include <dev/vt/vt.h>
+ #include <dev/vt/hw/fb/vt_fb.h>
+ #include <dev/vt/colors/vt_termcolors.h>
+@@ -549,8 +550,13 @@ vt_fb_init(struct vt_device *vd)
+ 			bg |= TC_LIGHT;
+ 		c = bg;
+ 	}
+-	/* Clear the screen. */
+-	vd->vd_driver->vd_blank(vd, c);
++	/*
++	 * Clear the screen, unless this is the booter's framebuffer on a
++	 * NextBSD graphics boot: then the boot splash is painted instead
++	 * and owns the screen (E19, kPEAcquireScreen).
++	 */
++	if (!PE_boot_console_fb(info))
++		vd->vd_driver->vd_blank(vd, c);
+ 
+ 	/* Wakeup screen. KMS need this. */
+ 	vt_fb_postswitch(vd);
+diff --git a/sys/dev/vt/vt_core.c b/sys/dev/vt/vt_core.c
+index 1d0ded813c8f48ec9e414f5f7fc0513695868fe1..ba0cdbe4fd0738481423fcc3570ef82c4f2b1bf1 100644
+--- a/sys/dev/vt/vt_core.c
++++ b/sys/dev/vt/vt_core.c
+@@ -45,6 +45,7 @@
+ #include <sys/lock.h>
+ #include <sys/malloc.h>
+ #include <sys/mutex.h>
++#include <sys/pexpert.h>
+ #include <sys/splash.h>
+ #include <sys/power.h>
+ #include <sys/priv.h>
+@@ -1485,6 +1486,28 @@ vt_draw_decorations(struct vt_device *vd)
+ 		vtterm_draw_cpu_logos(vd);
+ }
+ 
++/*
++ * NextBSD (E19): while the boot splash owns the screen, vt draws nothing.
++ * When graphics hand the screen back to text, redraw all of it once so no
++ * splash pixels remain.  Always false, and no redraw, on a text boot.
++ */
++static u_int vt_pe_text_gen;
++
++static bool
++vt_pe_graphics(struct vt_device *vd)
++{
++	u_int gen;
++
++	if (PE_graphics_console_active())
++		return (true);
++	gen = PE_console_text_generation();
++	if (gen != vt_pe_text_gen) {
++		vt_pe_text_gen = gen;
++		vd->vd_flags |= VDF_INVALID;
++	}
++	return (false);
++}
++
+ static int
+ vt_flush(struct vt_device *vd)
+ {
+@@ -1513,6 +1536,9 @@ vt_flush(struct vt_device *vd)
+ 	if (vd->vd_flags & VDF_SPLASH || vw->vw_flags & VWF_BUSY)
+ 		return (0);
+ 
++	if (vt_pe_graphics(vd))
++		return (0);
++
+ 	vf = vw->vw_font;
+ 	if (((vd->vd_flags & VDF_TEXTMODE) == 0) && (vf == NULL))
+ 		return (0);
+@@ -1702,6 +1728,10 @@ vtterm_splash(struct vt_device *vd)
+ 	if (KERNEL_PANICKED())
+ 		return;
+ 
++	/* NextBSD (E19): the NextBSD boot splash owns the screen. */
++	if (PE_graphics_console_active())
++		return;
++
+ 	if ((vd->vd_flags & VDF_TEXTMODE) != 0 || (boothowto & RB_MUTE) == 0)
+ 		return;
+ 
+-- 
+2.54.0 (Apple Git-157)
+

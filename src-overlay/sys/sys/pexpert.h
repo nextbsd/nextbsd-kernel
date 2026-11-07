@@ -134,15 +134,42 @@ void	initialize_screen(PE_Video *info, unsigned int op);
 int	PE_initialize_console_fb(struct fb_info *fb, int op);
 
 /*
- * True while the console is acquired in graphics mode: the splash owns the
- * screen and vt(4) must neither clear it nor draw text (xnu's
- * gc_enable(FALSE)). False in text mode, after kPETextScreen and after
- * kPEReleaseScreen. Lock-free; safe from any context.
+ * True while graphics own the screen and vt(4) must neither clear it nor
+ * draw text (xnu's gc_enable(FALSE)): from kPEAcquireScreen on a graphics
+ * boot until kPETextScreen or a panic. It stays true after
+ * kPEReleaseScreen, as in xnu, since the display server owns the pixels.
+ * Always false in text mode. Lock-free; safe from any context.
  */
 bool	PE_graphics_console_active(void);
 
 /* The boot mode PE_init_console() chose: GRAPHICS_MODE or FB_TEXT_MODE. */
 int	PE_boot_display(void);
+
+/*
+ * vt(4) glue (NextBSD).
+ *
+ * PE_boot_console_fb(): vt_fb_init() offers each framebuffer it brings up
+ * instead of blanking it. When it is the booter's framebuffer on a graphics
+ * boot, the platform expert takes it as the console framebuffer, sends
+ * kPEAcquireScreen (paint the whole splash, start the spinner) and returns
+ * true: vt(4) must not blank it. Otherwise false, and vt(4) blanks as
+ * always.
+ *
+ * PE_console_text_generation(): bumped each time graphics hand the screen
+ * back to text (kPETextScreen, panic). vt(4) redraws the whole screen
+ * (VDF_INVALID) when it sees a new value, so no splash pixels remain.
+ *
+ * PE_set_console_flush(): a shadow-buffered framebuffer (virtio_gpu, a
+ * damage-tracked fbdev) registers how to push a rectangle to the screen;
+ * the spinner calls it after every frame and the painter after a full
+ * paint, from a callout or the op's caller, without the spinner's lock.
+ * It must not sleep. NULL unregisters.
+ */
+bool	PE_boot_console_fb(struct fb_info *fb);
+u_int	PE_console_text_generation(void);
+typedef void pe_fb_flush_t(struct fb_info *fb, u_int x, u_int y, u_int w,
+	    u_int h);
+void	PE_set_console_flush(struct fb_info *fb, pe_fb_flush_t *flush);
 
 /*
  * Leave graphics for good so a prompt can be seen: clear the console mute
