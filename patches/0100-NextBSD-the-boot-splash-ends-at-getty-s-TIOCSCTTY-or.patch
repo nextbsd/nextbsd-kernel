@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 7 Nov 2026 13:31:36 -0600
+Subject: [PATCH] NextBSD: the boot splash ends at getty's TIOCSCTTY or a
+ display server
+
+On a NextBSD graphics boot (E19) the splash must stay on screen until
+someone takes the screen, the way xnu ends it: the WindowServer opening
+IOFramebuffer sends kPEReleaseScreen (the pixels stay), a text console
+sends kPETextScreen.  Upstream vt(4) instead drops its splash on the
+first open of the tty and on console input, and both the ISO's /init
+(exec >/dev/console) and Xorg's ttyv0 probe open the console long before
+anyone wants it.
+
+On a graphics boot, and only for the splash VT (the window on screen,
+ttyv0 at boot; never a pty or a serial line):
+
+- KDSETMODE KD_GRAPHICS sends kPEReleaseScreen: the spinner stops and
+  its square is painted with the background, everything else stays for
+  the display server to inherit (Xorg -background none).  Xorg sets it
+  before it becomes DRM master; the first DRM master does the same
+  through the pe_drm_master eventhandler.  KD_TEXT on the same window
+  afterwards (the server exiting) hands the screen to text.
+- A successful TIOCSCTTY (getty's login_tty()) sends kPETextScreen after
+  a fresh start of the window: the text written behind the splash is
+  dropped, history cleared, the cursor homed and attributes reset, so
+  the login prompt appears on a clean black screen.  ttydev_ioctl()
+  reports a successful TIOCSCTTY through the new pe_tty_ctty
+  eventhandler (<sys/pexpert.h>), invoked with no tty lock held.
+- vtterm_opened() and vtterm_cngetc() no longer drop the splash.  A
+  prompt still reaches the screen through PE_enter_text_console().
+
+On a text boot (-v, -s, a serial console, no framebuffer) every new
+check returns at PE_boot_display() and the stock behaviour, including
+the boot -m splash, is unchanged, so verbose and serial boots are
+byte-identical.
+
+Part of nextbsd/nextbsd#542 (nextbsd-kernel#410).
+---
+ sys/dev/vt/vt_core.c | 98 ++++++++++++++++++++++++++++++++++++++++++--
+ sys/kern/tty.c       |  9 ++++
+ 2 files changed, 104 insertions(+), 3 deletions(-)
+
+diff --git a/sys/dev/vt/vt_core.c b/sys/dev/vt/vt_core.c
+index 12ec38ed429e707ffc844d34f52d05538a5fb78d..5d6167e635db4c2b89e0fd83a967c38df8953ce3 100644
+--- a/sys/dev/vt/vt_core.c
++++ b/sys/dev/vt/vt_core.c
+@@ -1993,8 +1993,12 @@ vtterm_cngetc(struct terminal *tm)
+ 	if (vw->vw_kbdsq && *vw->vw_kbdsq)
+ 		return (*vw->vw_kbdsq++);
+ 
+-	/* Make sure the splash screen is not there. */
+-	if (vd->vd_flags & VDF_SPLASH) {
++	/*
++	 * Make sure the splash screen is not there.  NextBSD (E19): not on a
++	 * graphics boot, where no keypress drops the splash; a prompt hands
++	 * the screen to text through PE_enter_text_console() instead.
++	 */
++	if ((vd->vd_flags & VDF_SPLASH) && PE_boot_display() != GRAPHICS_MODE) {
+ 		/* Remove splash */
+ 		vd->vd_flags &= ~VDF_SPLASH;
+ 		/* Mark screen as invalid to force update */
+@@ -2176,7 +2180,13 @@ vtterm_opened(struct terminal *tm, int opened)
+ 	struct vt_device *vd = vw->vw_device;
+ 
+ 	VT_LOCK(vd);
+-	vd->vd_flags &= ~VDF_SPLASH;
++	/*
++	 * NextBSD (E19): a plain open never drops the splash on a graphics
++	 * boot (the ISO /init's exec >/dev/console and Xorg's ttyv0 probe
++	 * both open first); getty's TIOCSCTTY does, vt_pe_tty_ctty().
++	 */
++	if (PE_boot_display() != GRAPHICS_MODE)
++		vd->vd_flags &= ~VDF_SPLASH;
+ 	if (opened)
+ 		vw->vw_flags |= VWF_OPENED;
+ 	else {
+@@ -2618,6 +2628,86 @@ vtterm_mmap(struct terminal *tm, vm_ooffset_t offset, vm_paddr_t * paddr,
+ 	return (ENXIO);
+ }
+ 
++/*
++ * NextBSD (E19): who ends the boot splash, on a graphics boot only, and
++ * only on the splash VT (the window on screen, ttyv0 at boot), never a
++ * pty or a serial line.
++ *
++ * KDSETMODE KD_GRAPHICS: a display server takes the screen.  Xorg sets it
++ * before it becomes DRM master.  kPEReleaseScreen: the spinner stops, the
++ * pixels stay for the server to inherit (Xorg -background none), as when
++ * the WindowServer opens IOFramebuffer.  The first DRM master does the same
++ * through the pe_drm_master eventhandler.  KD_TEXT on that window later
++ * (the server exiting) hands the screen to text.
++ *
++ * TIOCSCTTY: getty's login_tty() takes the splash VT as its controlling
++ * terminal: kPETextScreen, after a fresh start of the window (text written
++ * behind the splash dropped, history cleared, cursor home, default
++ * attributes), so the login prompt appears on a clean black screen.  A plain
++ * open (vtterm_opened) or a keypress (vtterm_cngetc) never ends the splash.
++ */
++static bool vt_pe_kd_released;
++
++static void
++vt_pe_kdsetmode(struct vt_window *vw, bool graphics)
++{
++	if (PE_boot_display() != GRAPHICS_MODE ||
++	    vw != vw->vw_device->vd_curwindow || !PE_graphics_console_active())
++		return;
++	if (graphics) {
++		vt_pe_kd_released = true;
++		PE_initialize_console(NULL, kPEReleaseScreen);
++	} else if (vt_pe_kd_released) {
++		vt_pe_kd_released = false;
++		PE_initialize_console(NULL, kPETextScreen);
++		vt_resume_flush_timer(vw, 0);
++	}
++}
++
++static void
++vt_pe_tty_ctty(void *arg __unused, struct tty *tp)
++{
++	struct vt_device *vd = main_vd;
++	struct vt_window *vw;
++	struct terminal *tm;
++	struct winsize wsz;
++
++	if (PE_boot_display() != GRAPHICS_MODE || vd->vd_driver == NULL)
++		return;
++	VT_LOCK(vd);
++	vw = vd->vd_curwindow;
++	VT_UNLOCK(vd);
++	if (vw == NULL || (tm = vw->vw_terminal) == NULL || tm->tm_tty != tp)
++		return;
++	if (!PE_graphics_console_active() &&
++	    (vd->vd_flags & VDF_SPLASH) == 0)
++		return;
++
++	/* A fresh window, still hidden behind the splash. */
++	wsz = tm->tm_winsize;
++	terminal_set_winsize(tm, &wsz);
++	vtbuf_clearhistory(&vw->vw_buf);
++
++	vt_pe_kd_released = false;
++	PE_initialize_console(NULL, kPETextScreen);
++
++	VT_LOCK(vd);
++	vd->vd_flags &= ~VDF_SPLASH;
++	vd->vd_flags |= VDF_INVALID;
++	VT_UNLOCK(vd);
++	vt_resume_flush_timer(vw, 0);
++}
++
++static void
++vt_pe_evh_init(void *arg __unused)
++{
++	if (!vty_enabled(VTY_VT))
++		return;
++	EVENTHANDLER_REGISTER(pe_tty_ctty, vt_pe_tty_ctty, NULL,
++	    EVENTHANDLER_PRI_ANY);
++}
++SYSINIT(vt_pe_evh, SI_SUB_CONFIGURE, SI_ORDER_ANY, vt_pe_evh_init, NULL);
++
+ static int
+ vtterm_ioctl(struct terminal *tm, u_long cmd, caddr_t data,
+     struct thread *td)
+@@ -2968,9 +3058,11 @@ vtterm_ioctl(struct terminal *tm, u_long cmd, caddr_t data,
+ 		case KD_TEXT1:
+ 		case KD_PIXEL:
+ 			vw->vw_flags &= ~VWF_GRAPHICS;
++			vt_pe_kdsetmode(vw, false);
+ 			break;
+ 		case KD_GRAPHICS:
+ 			vw->vw_flags |= VWF_GRAPHICS;
++			vt_pe_kdsetmode(vw, true);
+ 			break;
+ 		}
+ 		return (0);
+diff --git a/sys/kern/tty.c b/sys/kern/tty.c
+index 430a0e06c34e131e80ba7d2e65014d68cb9e006a..d29c1637d478907d4fb1db2de77c0b84b8e2a4bf 100644
+--- a/sys/kern/tty.c
++++ b/sys/kern/tty.c
+@@ -49,6 +49,7 @@
+ #include <sys/limits.h>
+ #include <sys/malloc.h>
+ #include <sys/mount.h>
++#include <sys/pexpert.h>
+ #include <sys/poll.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+@@ -640,6 +641,14 @@ ttydev_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
+ 	error = tty_ioctl(tp, cmd, data, fflag, td);
+ done:	tty_unlock(tp);
+ 
++	/*
++	 * NextBSD (E19): a session took this tty as its controlling
++	 * terminal.  On the splash VT that is getty taking the screen, the
++	 * one point where the boot splash gives way to a text console.
++	 */
++	if (cmd == TIOCSCTTY && error == 0)
++		EVENTHANDLER_INVOKE(pe_tty_ctty, tp);
++
+ 	return (error);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
