@@ -84,3 +84,4 @@
 0091-NextBSD-fixed-feature-buttons-report-KEY_POWER-KEY_S.patch
 0092-NextBSD-an-RTC-wake-alarm-for-the-IOPMrootDomain.patch
 0093-NextBSD-evdev-reports-user-input-to-a-hook.patch
+0094-NextBSD-cninit-decides-graphics-or-text-boot-for-the.patch
