@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 7 Nov 2026 13:32:49 -0600
+Subject: [PATCH] NextBSD: bcm2835_fbd hands the Pi's firmware framebuffer to
+ the boot splash
+
+The Raspberry Pi 5 boots with no loader and no UEFI: the firmware loads
+kernel8.img directly, so at cninit the NextBSD platform expert has no
+boot video record and no EFI framebuffer and falls back to text.  The
+firmware framebuffer appears only when bcm2835_fbd(4) attaches
+(patches 0027, 0033, 0034).
+
+Hand it to the platform expert first, with PE_late_console_fb(): when
+cninit's half of the decision was graphics (no -v, -s, -a, no serial
+console requested) and nothing has claimed the console, it becomes
+PE_state.video and the console enters kPEGraphicsMode, the way xnu's
+ARM platform expert takes the video record from the device tree.
+vt(4)'s vd_init on it then paints the compiled-in splash and starts the
+spinner instead of blanking (patch 0095), and the splash lasts until
+getty's TIOCSCTTY as on amd64.
+
+On -v, -s and serial-console boots the call is a no-op.
+
+Part of nextbsd/nextbsd#542 (nextbsd-kernel#411).
+---
+ sys/arm/broadcom/bcm2835/bcm2835_fbd.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_fbd.c b/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
+index 9ad035f604434b357931ee0d25f8e8d40b3d5409..dfcb587fcea44f3a833c73146da6e7b788fa6cf1 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
+@@ -39,6 +39,7 @@
+ #include <sys/kernel.h>
+ #include <sys/malloc.h>
+ #include <sys/module.h>
++#include <sys/pexpert.h>
+ 
+ #include <vm/vm.h>
+ #include <vm/pmap.h>
+@@ -252,6 +253,15 @@ bcm_fb_setup_fbd(struct bcmsc_softc *sc)
+ 		}
+ 	}
+ 
++	/*
++	 * NextBSD (E19): the Pi 5 boots with no loader, so this firmware
++	 * framebuffer is the first the platform expert hears of.  On a
++	 * graphics boot it becomes the boot console here, and vt(4)'s
++	 * vd_init on it paints the compiled-in splash instead of a blank.
++	 * A no-op on -v, -s and serial-console boots.
++	 */
++	PE_late_console_fb(&sc->info);
++
+ 	fbd = device_add_child(sc->dev, "fbd", device_get_unit(sc->dev));
+ 	if (fbd == NULL) {
+ 		device_printf(sc->dev, "Failed to add fbd child\n");
+-- 
+2.54.0 (Apple Git-157)
+

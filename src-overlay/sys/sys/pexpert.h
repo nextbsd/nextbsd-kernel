@@ -134,6 +134,15 @@ void	initialize_screen(PE_Video *info, unsigned int op);
 int	PE_initialize_console_fb(struct fb_info *fb, int op);
 
 /*
+ * NextBSD: a loader-less boot (Raspberry Pi 5) finds its firmware
+ * framebuffer only when the framebuffer driver attaches. The driver calls
+ * this before handing `fb' to vt(4); if cninit chose graphics but had no
+ * framebuffer, `fb' becomes PE_state.video and the console enters
+ * kPEGraphicsMode. Otherwise a no-op.
+ */
+void	PE_late_console_fb(struct fb_info *fb);
+
+/*
  * True while graphics own the screen and vt(4) must neither clear it nor
  * draw text (xnu's gc_enable(FALSE)): from kPEAcquireScreen on a graphics
  * boot until kPETextScreen or a panic. It stays true after
