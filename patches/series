@@ -88,3 +88,5 @@
 0095-NextBSD-vt-4-yields-the-screen-to-the-boot-splash.patch
 0096-NextBSD-drop-to-text-for-boot-prompts-and-fatal-trap.patch
 0097-NextBSD-drop-uprintf-output-to-the-console-tty-while.patch
+0098-NextBSD-vt-4-moves-the-boot-splash-to-a-new-backend-.patch
+0099-NextBSD-virtio_gpu-starts-as-the-boot-splash-and-flu.patch

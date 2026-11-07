@@ -26,7 +26,10 @@
  *                             place of its blank: the first kernel paint is
  *                             the splash, never a black screen.
  *   kPEDisableScreen/Enable   pause/resume the spinner around a framebuffer
- *                             change; the screen stays owned
+ *                             change; the screen stays owned. They nest.
+ *                             Disable with a framebuffer also forgets it
+ *                             (and its flush) if it is the console's, so
+ *                             its driver may free it (vt_deallocate()).
  *   kPETextScreen             stop the spinner, text on; vt(4) redraws the
  *                             whole screen (PE_console_text_generation())
  *   kPEReleaseScreen          a display server owns the screen: stop the
@@ -79,6 +82,7 @@
 #include <sys/pexpert.h>
 
 #include <machine/atomic.h>
+#include <machine/cpu.h>
 
 #include <dev/iokit/video_console.h>
 #include <dev/iokit/bootsplash_data.h>
@@ -114,6 +118,8 @@ static bool gc_graphics_boot;
 static bool gc_acquired;
 static bool gc_desire_text;
 static bool gc_paused_progress;
+static u_int gc_pause_depth;		/* nested kPEDisableScreen, under the lock */
+static volatile u_int vc_flush_busy;	/* backend flushes in flight */
 static bool vc_progress_enable;
 static bool vc_released;
 static u_int vc_progress_step;
@@ -379,6 +385,7 @@ vc_paint_boot_graphics(struct fb_info *fb)
 	struct vc_fmt f;
 	struct vc_geom g;
 	uint32_t lut[256];
+	pe_fb_flush_t *flush;
 	u_int step;
 
 	if (fb == NULL || vc_fmt_from_fb(fb, &f) != 0 ||
@@ -388,13 +395,42 @@ vc_paint_boot_graphics(struct fb_info *fb)
 	vc_build_lut(&f, lut);
 	vc_fill(fb, &f, lut[0]);
 	vc_paint_logo(fb, &f, &g, PE_state.bg_rgb);
+	flush = NULL;
 	VC_LOCK();
 	step = vc_progress_step;
 	if (!vc_panicked && (fb->fb_flags & FB_FLAG_NOWRITE) == 0)
 		vc_draw_spinner(fb, &f, &g, step, lut);
+	if (vc_flush != NULL && vc_flush_fb == fb) {
+		flush = vc_flush;
+		atomic_add_int(&vc_flush_busy, 1);
+	}
 	VC_UNLOCK();
-	if (vc_flush != NULL && vc_flush_fb == fb)
-		vc_flush(fb, 0, 0, fb->fb_width, fb->fb_height);
+	if (flush != NULL) {
+		flush(fb, 0, 0, fb->fb_width, fb->fb_height);
+		atomic_subtract_rel_int(&vc_flush_busy, 1);
+	}
+}
+
+/*
+ * kPEDisableScreen for a framebuffer that is going away (vt_deallocate(),
+ * a driver detaching): forget it, and its flush, before the op returns, and
+ * wait out a flush already in flight, so the driver may free it next. The
+ * patch 0058 race, for the spinner. Takes only the spinner's lock; never
+ * sleeps.
+ */
+static void
+vc_forget_fb(struct fb_info *fb)
+{
+	VC_LOCK();
+	if (vc_fb == fb)
+		vc_fb = NULL;
+	if (vc_flush_fb == fb) {
+		vc_flush_fb = NULL;
+		vc_flush = NULL;
+	}
+	VC_UNLOCK();
+	while (atomic_load_acq_int(&vc_flush_busy) != 0)
+		cpu_spinwait();
 }
 
 /* ---------------------------------------------------------- spinner ---- */
@@ -429,12 +465,16 @@ vc_progress_task(void *arg __unused)
 		    vc_progress_step, vc_lut);
 		fb = vc_fb;
 		g = vc_geom_cur;
-		if (vc_flush_fb == fb)
+		if (vc_flush_fb == fb && vc_flush != NULL) {
 			flush = vc_flush;
+			atomic_add_int(&vc_flush_busy, 1);
+		}
 	}
 	VC_UNLOCK();
-	if (flush != NULL)
+	if (flush != NULL) {
 		flush(fb, g.sx, g.sy, g.sd, g.sd);
+		atomic_subtract_rel_int(&vc_flush_busy, 1);
+	}
 	if (again)
 		vc_progress_arm();
 }
@@ -485,18 +525,26 @@ gc_enable(bool text)
 		vc_text_disabled = 1;
 }
 
-/* xnu's gc_pause(): the spinner around a framebuffer change. */
+/*
+ * xnu's gc_pause(): the spinner around a framebuffer change. NextBSD nests
+ * it: vt(4) brackets every backend switch and a DRM driver may bracket its
+ * own freeze around that, so only the outermost Disable saves the spinner's
+ * state and only the matching Enable restores it. An Enable with no Disable
+ * outstanding does nothing.
+ */
 static void
 gc_pause(bool pause)
 {
 	bool start;
 
+	start = false;
 	VC_LOCK();
 	if (pause) {
-		gc_paused_progress = vc_progress_enable;
-		vc_progress_enable = false;
-		start = false;
-	} else {
+		if (gc_pause_depth++ == 0) {
+			gc_paused_progress = vc_progress_enable;
+			vc_progress_enable = false;
+		}
+	} else if (gc_pause_depth > 0 && --gc_pause_depth == 0) {
 		start = gc_paused_progress && !vc_progress_enable &&
 		    vc_panicked == 0;
 		vc_progress_enable = gc_paused_progress && vc_panicked == 0;
@@ -504,6 +552,16 @@ gc_pause(bool pause)
 	VC_UNLOCK();
 	if (start)
 		vc_progress_arm();
+}
+
+/* kPETextScreen / kPEReleaseScreen end any pause: nothing to resume. */
+static void
+gc_pause_reset(void)
+{
+	VC_LOCK();
+	gc_pause_depth = 0;
+	gc_paused_progress = false;
+	VC_UNLOCK();
 }
 
 /* Make `fb' the console framebuffer (NULL if it can't be drawn on). */
@@ -538,6 +596,11 @@ vc_console_fb(struct fb_info *fb, int op)
 	case kPEEnableScreen:
 		if (fb != NULL)
 			vc_set_fb(fb);
+		break;
+	case kPEDisableScreen:
+		/* The framebuffer may be freed once this returns. */
+		if (fb != NULL)
+			vc_forget_fb(fb);
 		break;
 	case kPERefreshBootGraphics:
 		if (vc_text_disabled && gc_graphics_boot && gc_acquired)
@@ -635,6 +698,7 @@ initialize_screen(PE_Video *info, unsigned int op)
 		if (!gc_graphics_boot)
 			break;
 		vc_progress_set(false, 0);
+		gc_pause_reset();
 		gc_enable(true);
 		break;
 
@@ -648,6 +712,7 @@ initialize_screen(PE_Video *info, unsigned int op)
 		/* xnu: the display server owns the pixels; text stays off. */
 		gc_enable(false);
 		vc_progress_set(false, 0);
+		gc_pause_reset();
 		break;
 
 	case kPERefreshBootGraphics:
