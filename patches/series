@@ -86,3 +86,5 @@
 0093-NextBSD-evdev-reports-user-input-to-a-hook.patch
 0094-NextBSD-cninit-decides-graphics-or-text-boot-for-the.patch
 0095-NextBSD-vt-4-yields-the-screen-to-the-boot-splash.patch
+0096-NextBSD-drop-to-text-for-boot-prompts-and-fatal-trap.patch
+0097-NextBSD-drop-uprintf-output-to-the-console-tty-while.patch
