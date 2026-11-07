@@ -33,7 +33,10 @@
  *   kPETextScreen             stop the spinner, text on; vt(4) redraws the
  *                             whole screen (PE_console_text_generation())
  *   kPEReleaseScreen          a display server owns the screen: stop the
- *                             spinner, keep the pixels, text stays off
+ *                             spinner and paint its square with the
+ *                             background (xnu's save-under), keep the rest,
+ *                             text stays off. Ignored once text owns the
+ *                             screen.
  *   kPEBaseAddressChange      swap the framebuffer under the spinner's lock;
  *                             never clear. Unlike xnu, the geometry is taken
  *                             from the new record too: a NextBSD fbdev
@@ -479,6 +482,45 @@ vc_progress_task(void *arg __unused)
 		vc_progress_arm();
 }
 
+/*
+ * Paint the spinner square with the background, xnu restoring its
+ * save-under when the spinner stops for kPEReleaseScreen: the display
+ * server gets the background and the cube, never a frozen spinner frame.
+ */
+static void
+vc_progress_erase(void)
+{
+	struct fb_info *fb;
+	pe_fb_flush_t *flush;
+	struct vc_geom g;
+	u_int x, y;
+
+	fb = NULL;
+	flush = NULL;
+	bzero(&g, sizeof(g));
+	VC_LOCK();
+	if (vc_fb != NULL && !vc_panicked &&
+	    (vc_fb->fb_flags & FB_FLAG_NOWRITE) == 0 &&
+	    vc_geom_cur.sx + vc_geom_cur.sd <= (u_int)vc_fb->fb_width &&
+	    vc_geom_cur.sy + vc_geom_cur.sd <= (u_int)vc_fb->fb_height) {
+		fb = vc_fb;
+		g = vc_geom_cur;
+		for (y = 0; y < g.sd; y++)
+			for (x = 0; x < g.sd; x++)
+				vc_put(fb, &vc_fmt_cur, g.sx + x, g.sy + y,
+				    vc_lut[0]);
+		if (vc_flush_fb == fb && vc_flush != NULL) {
+			flush = vc_flush;
+			atomic_add_int(&vc_flush_busy, 1);
+		}
+	}
+	VC_UNLOCK();
+	if (flush != NULL) {
+		flush(fb, g.sx, g.sy, g.sd, g.sd);
+		atomic_subtract_rel_int(&vc_flush_busy, 1);
+	}
+}
+
 /* Start or stop the spinner (xnu's vc_progress_set()); no delay here. */
 static void
 vc_progress_set(bool enable, uint32_t delay __unused)
@@ -691,7 +733,13 @@ initialize_screen(PE_Video *info, unsigned int op)
 		break;
 
 	case kPETextScreen:
-		if (!gc_acquired) {
+		/*
+		 * NextBSD: after kPEReleaseScreen the screen can still come
+		 * back to text (getty after loginwindow, a display server
+		 * exiting); xnu re-acquires instead, from IOFramebuffer's
+		 * close().
+		 */
+		if (!gc_acquired && !vc_released) {
 			gc_desire_text = true;
 			break;
 		}
@@ -703,6 +751,15 @@ initialize_screen(PE_Video *info, unsigned int op)
 		break;
 
 	case kPEReleaseScreen:
+		/*
+		 * NextBSD: a text console already owns the screen (getty
+		 * took it with kPETextScreen, or graphics never did):
+		 * there is no splash to release, and turning text off now
+		 * would leave a dead console when the display server
+		 * exits.
+		 */
+		if (!vc_text_disabled)
+			break;
 		if (gc_acquired)
 			vc_released = true;
 		gc_acquired = false;
@@ -713,6 +770,8 @@ initialize_screen(PE_Video *info, unsigned int op)
 		gc_enable(false);
 		vc_progress_set(false, 0);
 		gc_pause_reset();
+		/* xnu restores the save-under: the spinner goes, the rest stays. */
+		vc_progress_erase();
 		break;
 
 	case kPERefreshBootGraphics:

@@ -236,6 +236,19 @@ EVENTHANDLER_DECLARE(pe_console_op, pe_console_op_fn);
 typedef void (*pe_drm_master_fn)(void *, device_t, int);
 EVENTHANDLER_DECLARE(pe_drm_master, pe_drm_master_fn);
 
+/*
+ * pe_tty_ctty(arg, tp)
+ *   Kernel-internal (not for kexts): a session leader made tp its
+ *   controlling terminal (TIOCSCTTY; getty's login_tty()). Invoked from
+ *   ttydev_ioctl() after a successful TIOCSCTTY, with no tty lock held.
+ *   vt(4) turns it into kPETextScreen when tp is the splash VT, the text
+ *   console taking the screen. Nothing else drops the splash for getty: a
+ *   plain open of the tty or /dev/console never does.
+ */
+struct tty;
+typedef void (*pe_tty_ctty_fn)(void *, struct tty *);
+EVENTHANDLER_DECLARE(pe_tty_ctty, pe_tty_ctty_fn);
+
 #endif /* _KERNEL */
 
 #endif /* !_SYS_PEXPERT_H_ */
