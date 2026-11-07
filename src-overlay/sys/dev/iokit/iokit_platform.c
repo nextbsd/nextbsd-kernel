@@ -52,6 +52,8 @@
 PE_state_t PE_state;
 
 static int pe_boot_display = FB_TEXT_MODE;
+/* What cninit's boothowto/kenv half asked for, before the framebuffer half. */
+static int pe_requested_display = FB_TEXT_MODE;
 
 /*
  * Serial-console requests the loader leaves in the kenv. boothowto already
@@ -169,6 +171,8 @@ PE_init_console(int mode)
 		return;
 
 	pe_read_style();
+	pe_requested_display = mode == GRAPHICS_MODE ? GRAPHICS_MODE :
+	    FB_TEXT_MODE;
 	loader = pe_video_from_loader(&PE_state.video);
 	if (loader != GRAPHICS_MODE)
 		mode = FB_TEXT_MODE;
@@ -239,6 +243,43 @@ pe_video_from_fb(PE_Video *v, const struct fb_info *fb)
 	v->v_depth = fb->fb_bpp;
 	v->v_scale = pe_scale_for(fb->fb_height,
 	    PE_state.boot_video != NULL ? PE_state.boot_video->v_flags : 0);
+}
+
+/*
+ * A boot with no loader, the Raspberry Pi 5's: the firmware loads
+ * kernel8.img directly, so at cninit there is no boot video record and no
+ * EFI framebuffer, and PE_init_console() fell back to text. The firmware
+ * framebuffer only turns up when bcm2835_fbd(4) attaches; it calls this
+ * just before handing the framebuffer to vt(4). If cninit's own half of
+ * the decision was graphics (no -v, -s, -a, no serial console requested)
+ * and nothing else has claimed the console yet, build PE_state.video from
+ * the firmware framebuffer and enter kPEGraphicsMode, as xnu's ARM
+ * PE_init_platform() does from the device tree's video record. vt(4)'s
+ * first vd_init on it then sends kPEAcquireScreen (PE_boot_console_fb()),
+ * which paints the compiled-in splash and starts the spinner. The style
+ * is the compiled-in kenv (config/rpi5.env), read at cninit.
+ */
+void
+PE_late_console_fb(struct fb_info *fb)
+{
+	PE_Video v;
+
+	if (!PE_state.initialized || fb == NULL ||
+	    pe_requested_display != GRAPHICS_MODE ||
+	    pe_boot_display == GRAPHICS_MODE ||
+	    PE_state.boot_video != NULL || PE_state.video.v_baseAddr != 0)
+		return;
+	if ((boothowto & (RB_SINGLE | RB_VERBOSE | RB_ASKNAME | RB_SERIAL |
+	    RB_MULTIPLE)) != 0 || PE_serial_console_requested())
+		return;
+	if (fb->fb_pbase == 0 || fb->fb_width <= 0 || fb->fb_height <= 0 ||
+	    fb->fb_stride <= 0 || fb->fb_bpp == 0)
+		return;
+	pe_video_from_fb(&v, fb);
+	v.v_display = GRAPHICS_MODE;
+	PE_state.video = v;
+	pe_boot_display = GRAPHICS_MODE;
+	initialize_screen(&PE_state.video, kPEGraphicsMode);
 }
 
 int

@@ -91,3 +91,4 @@
 0098-NextBSD-vt-4-moves-the-boot-splash-to-a-new-backend-.patch
 0099-NextBSD-virtio_gpu-starts-as-the-boot-splash-and-flu.patch
 0100-NextBSD-the-boot-splash-ends-at-getty-s-TIOCSCTTY-or.patch
+0101-NextBSD-bcm2835_fbd-hands-the-Pi-s-firmware-framebuf.patch
