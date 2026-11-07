@@ -173,8 +173,10 @@ void	PE_set_console_flush(struct fb_info *fb, pe_fb_flush_t *flush);
 
 /*
  * Leave graphics for good so a prompt can be seen: clear the console mute
- * (cn_mute) and send kPETextScreen. For the mountroot, geli and askname
- * prompts. Sleeping context.
+ * (cn_mute), send kPETextScreen on a graphics boot, and when the console
+ * was muted, show the prompt line it swallowed. cngets() calls it (the
+ * geli and askname prompts) and so does the mountroot prompt. A no-op on
+ * an unmuted text boot. Thread context.
  */
 void	PE_enter_text_console(void);
 

@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 7 Nov 2026 13:03:44 -0600
+Subject: [PATCH] NextBSD: drop uprintf output to the console tty while muted
+
+cn_mute (patch 0062) drops kernel printf output to the console, but
+uprintf() and tprintf() write straight to a process's controlling tty
+through tty_putchar(), so anything the kernel tells a process whose
+controlling tty is /dev/console still lands on the quiet boot screen,
+and on the graphical splash with E19.
+
+Drop TOTTY output while the console is muted when the tty is in use as
+the console (TF_OPENED_CONS).  The message-buffer and log copies are
+unchanged.  Unmuted boots (-v, -s, serial) are byte-identical.
+
+Part of nextbsd/nextbsd#542 (nextbsd-kernel#371).
+---
+ sys/kern/subr_prf.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/sys/kern/subr_prf.c b/sys/kern/subr_prf.c
+index bbf81b7a4ffe6be54e7d71619016ca05b118bf6c..d7c23741a24d9df54dd75c91515f4bdbd57042d8 100644
+--- a/sys/kern/subr_prf.c
++++ b/sys/kern/subr_prf.c
+@@ -505,7 +505,13 @@ putchar(int c, void *arg)
+ 		return;
+ 	}
+ 
+-	if ((flags & TOTTY) && tp != NULL && !KERNEL_PANICKED())
++	/*
++	 * NextBSD: while the console is muted, uprintf()/tprintf() to the
++	 * console tty is dropped like console output, so it cannot draw
++	 * on a quiet or graphical boot screen.
++	 */
++	if ((flags & TOTTY) && tp != NULL && !KERNEL_PANICKED() &&
++	    !(cn_mute && (tp->t_flags & TF_OPENED_CONS) != 0))
+ 		tty_putchar(tp, c);
+ 
+ 	if ((flags & TOCONS) && cn_mute) {
+-- 
+2.54.0 (Apple Git-157)
+

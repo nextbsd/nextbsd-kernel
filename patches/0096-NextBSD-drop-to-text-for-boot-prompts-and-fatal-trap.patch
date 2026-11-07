@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 7 Nov 2026 13:03:35 -0600
+Subject: [PATCH] NextBSD: drop to text for boot prompts and fatal traps
+
+A normal NextBSD boot mutes the console from cninit (patch 0062) and,
+with E19, shows a graphical splash.  Two things must still reach the
+screen as text, the way xnu sends kPETextScreen:
+
+A prompt.  While muted, cngetc() returns -1, so cngets() spins forever
+behind a blank or splash screen: a bad root hangs at an invisible
+mountroot> prompt, and a geli passphrase prompt can never be answered.
+cngets() now calls PE_enter_text_console(), which clears cn_mute, hands
+the screen to text, and shows the prompt line the mute swallowed.  That
+covers geli and askname even when the prompt comes from a kext.  The
+mountroot prompt also calls it before printing its help, so the help is
+visible too.
+
+A crash.  A fatal trap prints its register dump before panic() lifts the
+mute, so the dump was lost.  trap_fatal() on amd64 and the fatal data
+abort and unhandled-abort paths on arm64 call PE_panic_console() first,
+and vpanic() calls it next to its own unmute.  It takes no locks.
+
+On an unmuted text boot (-v, -s, a serial console) both calls are
+no-ops, so verbose and serial boots are byte-identical.
+
+Part of nextbsd/nextbsd#542 (nextbsd-kernel#371).
+---
+ sys/amd64/amd64/trap.c   | 3 +++
+ sys/arm64/arm64/trap.c   | 4 ++++
+ sys/kern/kern_cons.c     | 6 ++++++
+ sys/kern/kern_shutdown.c | 3 +++
+ sys/kern/vfs_mountroot.c | 4 ++++
+ 5 files changed, 20 insertions(+)
+
+diff --git a/sys/amd64/amd64/trap.c b/sys/amd64/amd64/trap.c
+index 359b3dfe3609cd10265140791be9aae1cbeaa705..532b45269589e651928c6de6b86a96655ce7082e 100644
+--- a/sys/amd64/amd64/trap.c
++++ b/sys/amd64/amd64/trap.c
+@@ -51,6 +51,7 @@
+ #include <sys/asan.h>
+ #include <sys/bus.h>
+ #include <sys/systm.h>
++#include <sys/pexpert.h>
+ #include <sys/proc.h>
+ #include <sys/ptrace.h>
+ #include <sys/kdb.h>
+@@ -1012,6 +1013,8 @@ trap_fatal(struct trapframe *frame, vm_offset_t eva)
+ {
+ 	u_int type;
+ 
++	/* NextBSD: unmute and leave the splash for the dump (E19). */
++	PE_panic_console();
+ 	type = frame->tf_trapno;
+ 	trap_diag(frame, eva);
+ #ifdef KDB
+diff --git a/sys/arm64/arm64/trap.c b/sys/arm64/arm64/trap.c
+index 867e5c57f8e59199fa5308c6a0f8171beba0cdf3..32043b652d6567b341b6e99eaaa540e54880de22 100644
+--- a/sys/arm64/arm64/trap.c
++++ b/sys/arm64/arm64/trap.c
+@@ -35,6 +35,7 @@
+ #include <sys/lock.h>
+ #include <sys/msan.h>
+ #include <sys/mutex.h>
++#include <sys/pexpert.h>
+ #include <sys/proc.h>
+ #include <sys/ptrace.h>
+ #include <sys/syscall.h>
+@@ -392,6 +393,8 @@ data_abort(struct thread *td, struct trapframe *frame, uint64_t esr,
+ 				return;
+ 			}
+ 
++			/* NextBSD: unmute, leave the splash (E19). */
++			PE_panic_console();
+ 			printf("Fatal data abort:\n");
+ 			print_registers(frame);
+ 			print_gp_register("far", far);
+@@ -599,6 +602,7 @@ do_el1h_sync(struct thread *td, struct trapframe *frame)
+ 		    abort_handlers[dfsc] != NULL) {
+ 			abort_handlers[dfsc](td, frame, esr, far, 0);
+ 		} else {
++			PE_panic_console();
+ 			print_registers(frame);
+ 			print_gp_register("far", far);
+ 			printf(" esr: 0x%.16lx\n", esr);
+diff --git a/sys/kern/kern_cons.c b/sys/kern/kern_cons.c
+index cb2f73768aa86cb839dd8ad8b6ba04b0a71cbdbd..27686180325864b95a7a96fbc714897a354f2f71 100644
+--- a/sys/kern/kern_cons.c
++++ b/sys/kern/kern_cons.c
+@@ -496,6 +496,12 @@ cngets(char *cp, size_t size, int visible)
+ 	char *lp, *end;
+ 	int c;
+ 
++	/*
++	 * NextBSD: a prompt must be visible.  Unmute the console and
++	 * leave the boot splash (E19), even for a prompt printed by a
++	 * kext (geli).
++	 */
++	PE_enter_text_console();
+ 	cngrab();
+ 
+ 	lp = cp;
+diff --git a/sys/kern/kern_shutdown.c b/sys/kern/kern_shutdown.c
+index 8950043698584f3de605c8aa0dce2933356bbd79..4ddeae6494b015d0d412d695af24a17e5f80b8e2 100644
+--- a/sys/kern/kern_shutdown.c
++++ b/sys/kern/kern_shutdown.c
+@@ -64,6 +64,7 @@
+ #include <sys/mbuf.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
++#include <sys/pexpert.h>
+ #include <sys/proc.h>
+ #include <sys/reboot.h>
+ #include <sys/resourcevar.h>
+@@ -939,6 +940,8 @@ vpanic(const char *fmt, va_list ap)
+ 
+ 	/* Unmute when panic */
+ 	cn_mute = 0;
++	/* NextBSD: the boot splash yields to the panic text (E19). */
++	PE_panic_console();
+ 
+ 	if (newpanic) {
+ 		(void)vsnprintf(buf, sizeof(buf), fmt, ap);
+diff --git a/sys/kern/vfs_mountroot.c b/sys/kern/vfs_mountroot.c
+index e0d1cec5bd713f3ac5e3b4b4f1fc15938735499f..b8b27829c5e0ff4f69a25aaa2e660b7eafb7984a 100644
+--- a/sys/kern/vfs_mountroot.c
++++ b/sys/kern/vfs_mountroot.c
+@@ -52,6 +52,7 @@
+ #include <sys/mutex.h>
+ #include <sys/namei.h>
+ #include <sys/priv.h>
++#include <sys/pexpert.h>
+ #include <sys/proc.h>
+ #include <sys/filedesc.h>
+ #include <sys/reboot.h>
+@@ -524,6 +525,9 @@ parse_dir_ask(char **conf)
+ 
+ 	vfs_mountroot_wait();
+ 
++	/* NextBSD: the prompt and its help must be seen (E19). */
++	PE_enter_text_console();
++
+ 	printf("\nLoader variables:\n");
+ 	parse_dir_ask_printenv("vfs.root.mountfrom");
+ 	parse_dir_ask_printenv("vfs.root.mountfrom.options");
+-- 
+2.54.0 (Apple Git-157)
+

@@ -38,6 +38,7 @@
 #include <sys/eventhandler.h>
 #include <sys/fbio.h>
 #include <sys/linker.h>
+#include <sys/msgbuf.h>
 #include <sys/reboot.h>
 #include <sys/sysctl.h>
 #include <sys/iocatalogue.h>
@@ -254,13 +255,59 @@ PE_initialize_console_fb(struct fb_info *fb, int op)
 	return (PE_initialize_console(&v, op));
 }
 
+/*
+ * Print the message buffer's unfinished last line (a prompt such as geli's
+ * "Enter passphrase for ada0p4: ") on the console only. It was printed
+ * while the console was muted, so it reached the message buffer but not
+ * the screen. cnputsn() does not add it to the message buffer again.
+ */
+static void
+pe_replay_prompt(void)
+{
+	struct msgbuf *mbp;
+	char buf[160];
+	u_int seq, avail, take;
+	int n, r, start;
+
+	mbp = msgbufp;
+	if (mbp == NULL || mbp->msg_size == 0)
+		return;
+	avail = (mbp->msg_flags & MSGBUF_WRAP) != 0 ? mbp->msg_size :
+	    mbp->msg_wseq;
+	take = MIN(avail, sizeof(buf));
+	seq = MSGBUF_SEQSUB(mbp, mbp->msg_wseq, take);
+	for (n = 0; n < (int)take; n += r) {
+		r = msgbuf_peekbytes(mbp, buf + n, take - n, &seq);
+		if (r <= 0)
+			break;
+	}
+	for (start = n; start > 0 && buf[start - 1] != '\n'; start--)
+		;
+	/* No line start in sight: too long to be a prompt; skip it. */
+	if (start == 0 && n == (int)sizeof(buf))
+		return;
+	if (start < n)
+		cnputsn(buf + start, n - start);
+}
+
+/*
+ * A prompt must be seen (#371): the console may be muted (patch 0062,
+ * where cngetc() returns -1 and cngets() would spin forever) and, on a
+ * graphics boot, owned by the splash. Lift both, xnu's kPETextScreen.
+ * Called from cngets() and before the mountroot prompt. A no-op on an
+ * unmuted text boot (-v, -s, serial), which stays byte-identical.
+ */
 void
 PE_enter_text_console(void)
 {
-	if (pe_boot_display != GRAPHICS_MODE)
-		return;
+	int was_muted;
+
+	was_muted = cn_mute;
 	cn_mute = 0;
-	PE_initialize_console(NULL, kPETextScreen);
+	if (pe_boot_display == GRAPHICS_MODE)
+		PE_initialize_console(NULL, kPETextScreen);
+	if (was_muted)
+		pe_replay_prompt();
 }
 
 void
