@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 7 Nov 2026 13:29:23 -0600
+Subject: [PATCH] NextBSD: vt(4) moves the boot splash to a new backend without
+ clearing
+
+On a NextBSD graphics boot (E19) the platform expert owns the screen
+with the boot splash until getty or the display server takes it.  When
+a better framebuffer arrives ("Replacing efifb with drmfb", virtio_gpu,
+a GPU kext) vt(4) used to blank the new buffer in vd_init, let the
+modeset show that black buffer, and only then redraw.  xnu never shows
+that frame: IOFramebuffer paints the boot image into the new VRAM and
+only then swaps the console record, with the spinner paused around it.
+
+vt_replace_backend() now does the same while the splash owns the
+screen:
+
+  1. kPEDisableScreen: the spinner pauses;
+  2. the new backend's vd_init, which no longer blanks (vt_fb_init skips
+     its clear while the splash is up; drm-kmod's vt_drmfb_init gets the
+     same treatment in nextbsd-kernel-extensions-graphics);
+  3. kPEBaseAddressChange to the new framebuffer, and
+     kPERefreshBootGraphics, a full repaint of background, cube and
+     spinner from the kernel's own copy;
+  4. vd_postswitch: the modeset scans out a buffer that already holds
+     the splash;
+  5. kPEEnableScreen: the spinner resumes.
+
+vt_deallocate() sends kPEDisableScreen with the departing framebuffer
+before the driver frees it, so the spinner drops its pointer (and its
+flush) first: the same race patch 0058 closed for vt itself.  With
+nothing to fall back to (0058's no-backend window) the spinner stays
+paused until the next backend is on screen.
+
+Only framebuffer backends take part (a struct fb_info softc and
+vt_fb_ioctl: efifb, vbefb, simplefb, fbd(4) drivers, virtio_gpu,
+drmfb).  On a text boot (-v, -s, a serial console, no framebuffer)
+PE_graphics_console_active() is false and nothing here runs, so
+verbose and serial boots are byte-identical.
+
+Part of nextbsd/nextbsd#542 (nextbsd-kernel#409).
+---
+ sys/dev/vt/hw/fb/vt_fb.c |  7 +++-
+ sys/dev/vt/vt_core.c     | 82 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/sys/dev/vt/hw/fb/vt_fb.c b/sys/dev/vt/hw/fb/vt_fb.c
+index 9d4cd8400e421625c1bd822be63e70c5cc720754..b61277568d43feccccc0c745abe95fad5e1628ca 100644
+--- a/sys/dev/vt/hw/fb/vt_fb.c
++++ b/sys/dev/vt/hw/fb/vt_fb.c
+@@ -553,9 +553,12 @@ vt_fb_init(struct vt_device *vd)
+ 	/*
+ 	 * Clear the screen, unless this is the booter's framebuffer on a
+ 	 * NextBSD graphics boot: then the boot splash is painted instead
+-	 * and owns the screen (E19, kPEAcquireScreen).
++	 * and owns the screen (E19, kPEAcquireScreen).  Nor while the
++	 * splash owns the screen and this is a new backend taking over:
++	 * vt_replace_backend() has the platform expert paint the splash
++	 * into it before vd_postswitch shows it.
+ 	 */
+-	if (!PE_boot_console_fb(info))
++	if (!PE_boot_console_fb(info) && !PE_graphics_console_active())
+ 		vd->vd_driver->vd_blank(vd, c);
+ 
+ 	/* Wakeup screen. KMS need this. */
+diff --git a/sys/dev/vt/vt_core.c b/sys/dev/vt/vt_core.c
+index ba0cdbe4fd0738481423fcc3570ef82c4f2b1bf1..12ec38ed429e707ffc844d34f52d05538a5fb78d 100644
+--- a/sys/dev/vt/vt_core.c
++++ b/sys/dev/vt/vt_core.c
+@@ -58,6 +58,7 @@
+ 
+ #include <dev/kbd/kbdreg.h>
+ #include <dev/vt/vt.h>
++#include <dev/vt/hw/fb/vt_fb.h>
+ 
+ #if defined(__i386__) || defined(__amd64__)
+ #include <machine/psl.h>
+@@ -3318,13 +3319,71 @@ vt_resize(struct vt_device *vd)
+ 	}
+ }
+ 
++/*
++ * NextBSD (E19): vt(4) as the text backend under the platform expert.
++ *
++ * On a graphics boot the boot splash owns the screen, and a backend switch
++ * ("Replacing efifb with drmfb", virtio_gpu, a detach) moves the console
++ * the way IOFramebuffer moves it in xnu: kPEDisableScreen (pause the
++ * spinner), the new backend's vd_init without a blank, kPEBaseAddressChange
++ * to the new framebuffer and a full repaint of the boot graphics into it
++ * from the kernel's own copy, vd_postswitch (the modeset now scans out a
++ * buffer that already holds the splash), then kPEEnableScreen.  On a text
++ * boot none of this runs.
++ *
++ * vt_pe_fb() is the framebuffer a backend draws on: every NextBSD
++ * framebuffer backend (efifb, vbefb, simplefb, the fbd(4) drivers,
++ * virtio_gpu, drm-kmod's drmfb) has a struct fb_info softc and uses
++ * vt_fb_ioctl.  NULL for anything else (vt_vga).
++ *
++ * vt_pe_disables counts the Disables vt has sent; the next backend that
++ * comes up sends as many Enables.  It is only touched from vt_allocate()
++ * and vt_deallocate(), which newbus serialises.
++ */
++static u_int vt_pe_disables;
++
++static struct fb_info *
++vt_pe_fb(const struct vt_driver *drv, void *softc, int textmode)
++{
++	if (drv == NULL || softc == NULL || textmode ||
++	    drv->vd_fb_ioctl != vt_fb_ioctl)
++		return (NULL);
++	return (softc);
++}
++
++static void
++vt_pe_disable(struct fb_info *fb)
++{
++	if (!PE_graphics_console_active())
++		return;
++	vt_pe_disables++;
++	if (fb != NULL)
++		PE_initialize_console_fb(fb, kPEDisableScreen);
++	else
++		PE_initialize_console(NULL, kPEDisableScreen);
++}
++
++static void
++vt_pe_enable(void)
++{
++	for (; vt_pe_disables > 0; vt_pe_disables--)
++		PE_initialize_console(NULL, kPEEnableScreen);
++}
++
+ static void
+ vt_replace_backend(const struct vt_driver *drv, void *softc)
+ {
+ 	struct vt_device *vd;
++	struct fb_info *pe_fb;
++	bool pe;
+ 
+ 	vd = main_vd;
+ 
++	/* NextBSD (E19): pause the splash spinner across the switch. */
++	pe = PE_graphics_console_active() || vt_pe_disables > 0;
++	if (pe && vt_pe_disables == 0)
++		vt_pe_disable(NULL);
++
+ 	if (vd->vd_flags & VDF_ASYNC) {
+ 		/* Stop vt_flush periodic task. */
+ 		VT_LOCK(vd);
+@@ -3417,6 +3476,19 @@ vt_replace_backend(const struct vt_driver *drv, void *softc)
+ 
+ 	VT_UNLOCK(vd);
+ 
++	/*
++	 * NextBSD (E19): the console moves to the new framebuffer, which is
++	 * painted with the whole boot splash before vd_postswitch shows it.
++	 */
++	if (pe && PE_graphics_console_active()) {
++		pe_fb = vt_pe_fb(vd->vd_driver, vd->vd_softc,
++		    vd->vd_flags & VDF_TEXTMODE);
++		if (pe_fb != NULL) {
++			PE_initialize_console_fb(pe_fb, kPEBaseAddressChange);
++			PE_initialize_console_fb(pe_fb, kPERefreshBootGraphics);
++		}
++	}
++
+ 	/* Update windows sizes and initialize last items. */
+ 	vt_upgrade(vd);
+ 
+@@ -3432,6 +3504,9 @@ vt_replace_backend(const struct vt_driver *drv, void *softc)
+ 		vtterm_splash(vd);
+ #endif
+ 
++	/* NextBSD (E19): the new framebuffer is on screen; resume. */
++	vt_pe_enable();
++
+ 	if (vd->vd_flags & VDF_ASYNC) {
+ 		/* Allow to put chars now. */
+ 		terminal_mute(vd->vd_curwindow->vw_terminal, 0);
+@@ -3513,6 +3588,13 @@ vt_deallocate(const struct vt_driver *drv, void *softc)
+ 	printf("VT: Switching back from \"%s\" to \"%s\".\n",
+ 	    main_vd->vd_driver->vd_name, main_vd->vd_prev_driver->vd_name);
+ 
++	/*
++	 * NextBSD (E19): the splash spinner lets go of this framebuffer, and
++	 * of its flush, before the driver frees it (the patch 0058 race).
++	 * The spinner stays paused until the next backend is on screen.
++	 */
++	vt_pe_disable(vt_pe_fb(drv, softc, main_vd->vd_flags & VDF_TEXTMODE));
++
+ 	vt_replace_backend(NULL, NULL);
+ 
+ 	return (0);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 7 Nov 2026 13:29:23 -0600
+Subject: [PATCH] NextBSD: virtio_gpu starts as the boot splash and flushes the
+ spinner
+
+The base virtio_gpu(4) driver allocates its shadow framebuffer zeroed
+and points the scanout at it, so on a NextBSD graphics boot (E19) the
+first thing it shows is black.  Every pixel also has to be pushed to the
+host with a transfer and a flush, which the boot splash spinner, drawing
+from a callout, could not do.
+
+While the splash owns the screen:
+
+- the new buffer is painted with the splash (kPERefreshBootGraphics)
+  right after it is allocated, and transferred to the host resource
+  before the scanout is set, so the host never scans out a black
+  resource;
+- once attach has finished its own transfers, the driver registers a
+  PE_set_console_flush() hook that transfers and flushes the rectangle
+  the spinner drew.  It is polled and never sleeps.  vt(4) draws
+  nothing while the splash owns the screen, so the hook does not share
+  the control queue with the text paths;
+- detach makes sure the spinner has let go of the buffer and its flush
+  before freeing them, also when drmfb has already replaced
+  virtio_gpu as vt's backend.
+
+On a text boot (-v, -s, a serial console) none of this runs.
+
+Part of nextbsd/nextbsd#542 (nextbsd-kernel#409).
+---
+ sys/dev/virtio/gpu/virtio_gpu.c | 57 +++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/sys/dev/virtio/gpu/virtio_gpu.c b/sys/dev/virtio/gpu/virtio_gpu.c
+index d57ec9e1f5732128e10db5a94954e0989e015834..fa02a1b501492a77e228d1f9e83d091eb7a55cf5 100644
+--- a/sys/dev/virtio/gpu/virtio_gpu.c
++++ b/sys/dev/virtio/gpu/virtio_gpu.c
+@@ -37,6 +37,7 @@
+ #include <sys/kernel.h>
+ #include <sys/malloc.h>
+ #include <sys/module.h>
++#include <sys/pexpert.h>
+ #include <sys/sglist.h>
+ 
+ #include <machine/atomic.h>
+@@ -103,6 +104,7 @@ static vd_bitblt_bmp_t		vtgpu_fb_bitblt_bitmap;
+ static vd_drawrect_t		vtgpu_fb_drawrect;
+ static vd_setpixel_t		vtgpu_fb_setpixel;
+ static vd_bitblt_argb_t		vtgpu_fb_bitblt_argb;
++static pe_fb_flush_t		vtgpu_pe_flush;
+ 
+ static struct vt_driver vtgpu_fb_driver = {
+ 	.vd_name = "virtio_gpu",
+@@ -182,6 +184,23 @@ vtgpu_fb_bitblt_bitmap(struct vt_device *vd, const struct vt_window *vw,
+ 	vtgpu_resource_flush(sc, x, y, width, height);
+ }
+ 
++/*
++ * NextBSD (E19): the boot splash spinner draws into the shadow buffer from
++ * a callout; push what it drew to the host.  Polled, never sleeps.  Only
++ * registered on a graphics boot, where vt(4) draws nothing while the
++ * splash owns the screen, so it does not share the control queue with the
++ * text paths above.
++ */
++static void
++vtgpu_pe_flush(struct fb_info *info, u_int x, u_int y, u_int w, u_int h)
++{
++	struct vtgpu_softc *sc;
++
++	sc = (struct vtgpu_softc *)info;
++	if (vtgpu_transfer_to_host_2d(sc, x, y, w, h) == 0)
++		vtgpu_resource_flush(sc, x, y, w, h);
++}
++
+ static int
+ vtgpu_fb_bitblt_argb(struct vt_device *vd, const struct vt_window *vw,
+     const uint8_t *argb,
+@@ -287,9 +306,11 @@ static int
+ vtgpu_attach(device_t dev)
+ {
+ 	struct vtgpu_softc *sc;
++	bool prefilled;
+ 	int error;
+ 
+ 	sc = device_get_softc(dev);
++	prefilled = false;
+ 	sc->vtgpu_have_fb_info = false;
+ 	sc->vtgpu_dev = dev;
+ 	sc->vtgpu_next_fence = 1;
+@@ -325,6 +346,16 @@ vtgpu_attach(device_t dev)
+ 	    sc->vtgpu_fb_info.fb_size, M_DEVBUF, M_WAITOK|M_ZERO, 0, ~0, 4, 0);
+ 	sc->vtgpu_fb_info.fb_pbase = pmap_kextract(sc->vtgpu_fb_info.fb_vbase);
+ 
++	/*
++	 * NextBSD (E19): while the boot splash owns the screen, the new
++	 * buffer starts as the splash, not black (kPERefreshBootGraphics
++	 * paints into it without making it the console yet).
++	 */
++	prefilled = PE_graphics_console_active();
++	if (prefilled)
++		PE_initialize_console_fb(&sc->vtgpu_fb_info,
++		    kPERefreshBootGraphics);
++
+ 	/* Create the 2d resource */
+ 	error = vtgpu_create_2d(sc);
+ 	if (error != 0) {
+@@ -337,6 +368,14 @@ vtgpu_attach(device_t dev)
+ 		goto fail;
+ 	}
+ 
++	/* NextBSD (E19): the host resource holds the splash before scanout. */
++	if (prefilled) {
++		error = vtgpu_transfer_to_host_2d(sc, 0, 0,
++		    sc->vtgpu_fb_info.fb_width, sc->vtgpu_fb_info.fb_height);
++		if (error != 0)
++			goto fail;
++	}
++
+ 	/* Set the scanout to link the framebuffer to the display scanout */
+ 	error = vtgpu_set_scanout(sc, 0, 0, sc->vtgpu_fb_info.fb_width,
+ 	    sc->vtgpu_fb_info.fb_height);
+@@ -354,6 +393,14 @@ vtgpu_attach(device_t dev)
+ 	error = vtgpu_resource_flush(sc, 0, 0, sc->vtgpu_fb_info.fb_width,
+ 	    sc->vtgpu_fb_info.fb_height);
+ 
++	/*
++	 * NextBSD (E19): from here on the splash spinner pushes its frames
++	 * itself.  Registered after the attach's own transfers, so the two
++	 * never share the control queue.
++	 */
++	if (error == 0 && PE_boot_display() == GRAPHICS_MODE)
++		PE_set_console_flush(&sc->vtgpu_fb_info, vtgpu_pe_flush);
++
+ fail:
+ 	if (error != 0)
+ 		vtgpu_detach(dev);
+@@ -369,6 +416,16 @@ vtgpu_detach(device_t dev)
+ 	sc = device_get_softc(dev);
+ 	if (sc->vtgpu_have_fb_info)
+ 		vt_deallocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
++	/*
++	 * NextBSD (E19): the splash spinner must let go of the buffer and its
++	 * flush before both are freed below.  vt_deallocate() does that when
++	 * this is still vt's backend; a Disable/Enable pair covers the case
++	 * where another backend (drmfb) already replaced it.
++	 */
++	if (PE_boot_display() == GRAPHICS_MODE) {
++		PE_initialize_console_fb(&sc->vtgpu_fb_info, kPEDisableScreen);
++		PE_initialize_console(NULL, kPEEnableScreen);
++	}
+ 	if (sc->vtgpu_fb_info.fb_vbase != 0) {
+ 		MPASS(sc->vtgpu_fb_info.fb_size != 0);
+ 		free((void *)sc->vtgpu_fb_info.fb_vbase,
+-- 
+2.54.0 (Apple Git-157)
+
