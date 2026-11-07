@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 7 Nov 2026 12:59:29 -0600
+Subject: [PATCH] NextBSD: cninit decides graphics or text boot for the
+ platform expert
+
+E19 makes a normal boot graphical from the loader to getty or
+loginwindow, the Darwin way: one console record (PE_state.video) and one
+decision, made once, about whether the boot is graphical or text.  xnu
+takes that decision from boot.efi in PE_create_console(); NextBSD's
+loader plays boot.efi's role and the platform expert lives in the
+in-kernel IOKit (sys/dev/iokit/iokit_platform.c, src-overlay).
+
+Call PE_init_console() from cninit(), right after the mute decision of
+patch 0062 and before any console driver probes.  The boot is text for
+-v, -s and -a (the same exemptions as the mute) and for any serial
+console: RB_SERIAL, RB_MULTIPLE, or the boot_serial, boot_multicons and
+console=comconsole kenv the loader leaves.  The platform expert further
+downgrades to text when there is no framebuffer or the loader's boot
+video record says FB_TEXT_MODE.  Text mode changes nothing in vt(4), so
+verbose and serial boots stay byte-identical.
+
+Part of nextbsd/nextbsd#542 (nextbsd-kernel#407).
+---
+ sys/kern/kern_cons.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/sys/kern/kern_cons.c b/sys/kern/kern_cons.c
+index a8ee531eb06c69c3aa97bda6afc0ffcd02146638..cb2f73768aa86cb839dd8ad8b6ba04b0a71cbdbd 100644
+--- a/sys/kern/kern_cons.c
++++ b/sys/kern/kern_cons.c
+@@ -54,6 +54,7 @@
+ #include <sys/malloc.h>
+ #include <sys/msgbuf.h>
+ #include <sys/namei.h>
++#include <sys/pexpert.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/queue.h>
+@@ -174,6 +175,17 @@ cninit(void)
+ 	cn_mute = (boothowto & (RB_MUTE | RB_MUTEMSGS)) != 0 &&
+ 	    (boothowto & (RB_SINGLE | RB_VERBOSE | RB_ASKNAME)) == 0;
+ 
++	/*
++	 * NextBSD (E19): graphics or text boot, decided once, here, before
++	 * any console probes.  Text for verbose, single-user and askname
++	 * boots and for any serial console; the platform expert also
++	 * falls back to text with no framebuffer or when the loader says
++	 * text.  Text mode leaves vt(4) exactly as it was.
++	 */
++	PE_init_console((boothowto & (RB_SINGLE | RB_VERBOSE | RB_ASKNAME |
++	    RB_SERIAL | RB_MULTIPLE)) == 0 && !PE_serial_console_requested() ?
++	    GRAPHICS_MODE : FB_TEXT_MODE);
++
+ 	/*
+ 	 * Bring up the kbd layer just in time for cnprobe.  Console drivers
+ 	 * have a dependency on kbd being ready, so this fits nicely between the
+-- 
+2.54.0 (Apple Git-157)
+

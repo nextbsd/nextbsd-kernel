@@ -35,3 +35,10 @@ dev/iokit/iokit_powersource.c	optional acpi
 # sleep listener are guarded by DEV_ACPI inside, so configs without acpi
 # still publish the entry (IOSleepSupported false).
 dev/iokit/iokit_pmroot.c	standard
+# Platform expert console role and initialize_screen (E19, nextbsd-kernel#407):
+# PE_state.video built at cninit (patches/0094) from the loader's
+# MODINFOMD_NBSD_BOOT_VIDEO record or MODINFOMD_EFI_FB, the graphics/text boot
+# decision, and the pe_console_op / pe_drm_master eventhandlers drm.ko invokes
+# by name. `standard`: it must exist at cninit, before any kext loads.
+dev/iokit/iokit_platform.c	standard
+dev/iokit/video_console.c	standard
