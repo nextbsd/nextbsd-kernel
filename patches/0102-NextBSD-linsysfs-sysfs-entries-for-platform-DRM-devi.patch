@@ -1,0 +1,779 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Fri, 13 Nov 2026 21:03:19 -0600
+Subject: [PATCH] NextBSD: linsysfs: sysfs entries for platform DRM devices,
+ live
+
+Linux libdrm enumerates DRM devices only through sysfs:
+drmGetDevices2() and drmGetDevice2() read
+/sys/dev/char/226:<minor>/device/{subsystem,uevent,drm}, and Mesa 25
+needs them to pair a display-only KMS driver with a render GPU (kmsro)
+and to accept a render node at all. linsysfs_run_bus() creates those
+entries only for DRM devices under a PCI display device, and only once,
+when linsysfs is initialised, before kextd loads any DRM driver. On the
+Raspberry Pi 5 vc4 (card0) and v3d (card1, renderD128) are device-tree
+platform devices that attach long after that, so /sys/dev/char was
+empty, drmGetDevices2() found nothing, drmGetDevice2() returned -EINVAL,
+and Linux Mesa fell back to llvmpipe or failed eglInitialize().
+
+drm-kmod now invokes drm_minor_registered at the end of
+drm_minor_register() and drm_minor_unregistered at the start of
+drm_minor_unregister() (nextbsd-kernel-extensions-graphics
+drm-kmod-patches/0012). linsysfs subscribes and, for each minor of a
+device with no PCI ancestor, creates
+
+  /sys/devices/platform/<busid>/subsystem -> /sys/bus/platform
+  /sys/devices/platform/<busid>/uevent  DRIVER, OF_NAME, OF_FULLNAME,
+                                        OF_COMPATIBLE_<i>, _N, MODALIAS
+  /sys/devices/platform/<busid>/drm/<name>/
+  /sys/dev/char/226:<minor>/{device,uevent}
+  /sys/class/drm/<name>/{device,uevent}
+
+and removes them again when the minor goes. <busid> follows Linux's
+of_device_make_bus_id() ("2000000.v3d", "axi:gpu"); OF_FULLNAME is
+built by walking OF_parent(), since OF_package_to_path() is not
+implemented on FDT, and is unique per device, which is what libdrm uses
+to fold card1 and renderD128 into one v3d device. A device with no
+device-tree node gets MODALIAS=platform:<nameunit>.
+
+Every file a reader can see is formatted when the minor arrives and kept
+as a string under an sx lock, which the fillers take shared; nothing
+dereferences the device_t afterwards, so unloading a DRM kext cannot
+leave a node pointing at freed driver memory. The handlers are
+registered from a SYSINIT at SI_SUB_DRIVERS, before any driver can
+attach, and minors that arrive before linsysfs_init() are published by
+it.
+
+0073's linsysfs_create_drm_minor() is generalised to take the "device"
+link's and the uevent's fill functions and data, so that both paths
+share it; the PCI path passes what it passed before and is unchanged.
+
+The eventhandler signature is a contract with drm-kmod's drm_drv.c,
+which declares the same one; nothing links across the two.
+
+Fixes nextbsd/nextbsd-kernel#248
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linsysfs/linsysfs.c | 626 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 608 insertions(+), 18 deletions(-)
+
+diff --git a/sys/compat/linsysfs/linsysfs.c b/sys/compat/linsysfs/linsysfs.c
+index 36cbbe4..15e5dde 100644
+--- a/sys/compat/linsysfs/linsysfs.c
++++ b/sys/compat/linsysfs/linsysfs.c
+@@ -26,20 +26,30 @@
+  * SUCH DAMAGE.
+  */
+ 
++#include "opt_platform.h"
++
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/ctype.h>
++#include <sys/eventhandler.h>
+ #include <sys/kernel.h>
++#include <sys/lock.h>
+ #include <sys/malloc.h>
+ #include <sys/mount.h>
+ #include <sys/sbuf.h>
+ #include <sys/smp.h>
++#include <sys/sx.h>
+ #include <sys/bus.h>
+ #include <sys/pciio.h>
+ 
+ #include <dev/pci/pcivar.h>
+ #include <dev/pci/pcireg.h>
+ 
++#ifdef FDT
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_bus.h>
++#endif
++
+ #include <compat/linux/linux_util.h>
+ #include <fs/pseudofs/pseudofs.h>
+ 
+@@ -278,14 +288,21 @@ linsysfs_fill_vgapci(PFS_FILL_ARGS)
+ 
+ /*
+  * Create one DRM minor: /sys/dev/char/226:<minor> and /sys/class/drm/<name>,
+- * each with a "device" link to the PCI device directory and a "uevent", and
+- * an empty <name> entry in the PCI device's drm/ directory, which libdrm
++ * each with a "device" link to the device directory and a "uevent", and
++ * an empty <name> entry in the device's drm/ directory, which libdrm
+  * scans to map a minor to its /dev/dri node name.
++ *
++ * The link and the uevent are filled by the given functions from the given
++ * pn_data: the PCI path passes the PCI device's pfs directory and its
++ * device_t, the platform path (linsysfs_drm_minor_arrival) pre-formatted
++ * strings. If nodes is not NULL, the three nodes created (or NULL) are
++ * returned in it, so that the caller can pfs_destroy() them.
+  */
+ static void
+-linsysfs_create_drm_minor(device_t dev, struct pfs_node *pcidir,
+-    struct pfs_node *pcidrm, struct pfs_node *chardev, struct pfs_node *drm,
+-    pfs_fill_t uevent, int minor, const char *name)
++linsysfs_create_drm_minor(struct pfs_node *chardev, struct pfs_node *drm,
++    struct pfs_node *devdrm, int minor, const char *name, pfs_fill_t link,
++    void *linkdata, pfs_fill_t uevent, void *ueventdata,
++    struct pfs_node **nodes)
+ {
+ 	struct pfs_node *sub_dir, *cur_file;
+ 	struct pfs_node *parents[2];
+@@ -299,18 +316,25 @@ linsysfs_create_drm_minor(device_t dev, struct pfs_node *pcidir,
+ 	parents[1] = drm;
+ 	names[1] = name;
+ 	for (i = 0; i < nitems(parents); i++) {
++		if (nodes != NULL)
++			nodes[i] = NULL;
+ 		if (pfs_create_dir(parents[i], &sub_dir, names[i], NULL, NULL,
+ 		    NULL, 0) != 0)
+ 			continue;
+-		if (pfs_create_link(sub_dir, &cur_file, "device",
+-		    &linsysfs_fill_vgapci, NULL, NULL, NULL, PFS_RD) == 0)
+-			cur_file->pn_data = (void*)pcidir;
++		if (pfs_create_link(sub_dir, &cur_file, "device", link, NULL,
++		    NULL, NULL, PFS_RD) == 0)
++			cur_file->pn_data = linkdata;
+ 		if (pfs_create_file(sub_dir, &cur_file, "uevent", uevent, NULL,
+ 		    NULL, NULL, PFS_RD) == 0)
+-			cur_file->pn_data = (void*)dev;
++			cur_file->pn_data = ueventdata;
++		if (nodes != NULL)
++			nodes[i] = sub_dir;
+ 	}
+-	if (pcidrm != NULL)
+-		pfs_create_dir(pcidrm, NULL, name, NULL, NULL, NULL, 0);
++	sub_dir = NULL;
++	if (devdrm != NULL)
++		pfs_create_dir(devdrm, &sub_dir, name, NULL, NULL, NULL, 0);
++	if (nodes != NULL)
++		nodes[2] = sub_dir;
+ }
+ 
+ #undef PCI_DEV
+@@ -447,9 +471,9 @@ linsysfs_run_bus(device_t dev, struct pfs_node *dir, struct pfs_node *scsi,
+ 					pcidrm = NULL;
+ 				/* Primary node: 226:<unit>, card<unit>. */
+ 				sprintf(devname, "card%d", unit);
+-				linsysfs_create_drm_minor(dev, dir, pcidrm,
+-				    chardev, drm, &linsysfs_fill_uevent_drm,
+-				    unit, devname);
++				linsysfs_create_drm_minor(chardev, drm, pcidrm,
++				    unit, devname, &linsysfs_fill_vgapci, dir,
++				    &linsysfs_fill_uevent_drm, dev, NULL);
+ 				/*
+ 				 * NextBSD: render node: 226:(128+unit),
+ 				 * renderD(128+unit). Linux Mesa opens
+@@ -460,10 +484,9 @@ linsysfs_run_bus(device_t dev, struct pfs_node *dir, struct pfs_node *scsi,
+ 				 */
+ 				rminor = LINSYSFS_DRM_RENDER_MINOR_BASE + unit;
+ 				sprintf(devname, "renderD%d", rminor);
+-				linsysfs_create_drm_minor(dev, dir, pcidrm,
+-				    chardev, drm,
+-				    &linsysfs_fill_uevent_drm_render, rminor,
+-				    devname);
++				linsysfs_create_drm_minor(chardev, drm, pcidrm,
++				    rminor, devname, &linsysfs_fill_vgapci, dir,
++				    &linsysfs_fill_uevent_drm_render, dev, NULL);
+ 			}
+ 		}
+ 	}
+@@ -503,6 +526,566 @@ linsysfs_run_bus(device_t dev, struct pfs_node *dir, struct pfs_node *scsi,
+ 	return (error);
+ }
+ 
++/*
++ * NextBSD: DRM minors of platform GPUs (nextbsd/nextbsd-kernel#248).
++ *
++ * Linux libdrm enumerates DRM devices only through sysfs: drmGetDevices2()
++ * and drmGetDevice2() read /sys/dev/char/226:<minor>/device/{subsystem,
++ * uevent,drm}, and Mesa 25 needs them to pair a display-only KMS driver with
++ * a render GPU (kmsro) and to accept a render node at all. linsysfs_run_bus()
++ * creates those entries only for DRM devices under a PCI display device, and
++ * only once, when linsysfs is initialised -- before kextd loads any DRM
++ * driver. The Raspberry Pi 5's vc4 (card0) and v3d (card1, renderD128) are
++ * device-tree platform devices that attach long after that, so Linux
++ * programs found no GPU at all and Mesa fell back to llvmpipe.
++ *
++ * drm-kmod invokes drm_minor_registered at the end of drm_minor_register()
++ * and drm_minor_unregistered at the start of drm_minor_unregister()
++ * (nextbsd-kernel-extensions-graphics drm-kmod-patches/0012). Here they add
++ * and remove, for each non-PCI device:
++ *
++ *   /sys/devices/platform/<busid>/subsystem -> /sys/bus/platform
++ *   /sys/devices/platform/<busid>/uevent      DRIVER, OF_*, MODALIAS
++ *   /sys/devices/platform/<busid>/drm/<name>/
++ *   /sys/dev/char/226:<minor>/{device,uevent}
++ *   /sys/class/drm/<name>/{device,uevent}
++ *
++ * which is all libdrm and Mesa read. Devices with a PCI ancestor are left to
++ * linsysfs_run_bus(), unchanged.
++ *
++ * Everything a reader can see is formatted when the minor arrives and kept
++ * as strings; nothing dereferences the device_t afterwards, so unloading the
++ * driver cannot leave a node pointing into freed driver memory. The handlers
++ * are registered from a SYSINIT before any driver attaches, and minors that
++ * arrive before linsysfs_init() are recorded and published once it runs.
++ * linsysfs_drm_lock protects the records, the nodes' pn_data and the
++ * parents below; the fillers take it shared, so a minor's strings are never
++ * freed under a reader.
++ *
++ * The handler signature is a contract with drm-kmod's drm_drv.c, which
++ * declares the same one; keep the two identical:
++ *
++ *   dev    the newbus device the driver attached to (dev->dev->bsddev)
++ *   minor  the minor number, which is also the Linux minor (226:<minor>)
++ *   type   enum drm_minor_type (0 primary, 2 render; accel is not sent)
++ *   name   the minor's name, "card1" or "renderD128"
++ */
++typedef void (*drm_minor_registered_fn)(void *, device_t, int, int,
++    const char *);
++typedef void (*drm_minor_unregistered_fn)(void *, device_t, int, int,
++    const char *);
++EVENTHANDLER_DECLARE(drm_minor_registered, drm_minor_registered_fn);
++EVENTHANDLER_DECLARE(drm_minor_unregistered, drm_minor_unregistered_fn);
++
++#define	LINSYSFS_DRM_NAMELEN	32
++#define	LINSYSFS_DRM_OF_DEPTH	16
++
++struct linsysfs_drm_pdev;
++
++struct linsysfs_drm_minor {
++	TAILQ_ENTRY(linsysfs_drm_minor) dm_next;
++	struct linsysfs_drm_pdev *dm_pdev;
++	int		dm_minor;
++	char		dm_name[LINSYSFS_DRM_NAMELEN];
++	char		*dm_uevent;
++	/* 226:<minor>, class/drm/<name>, <device>/drm/<name> */
++	struct pfs_node	*dm_nodes[3];
++};
++
++struct linsysfs_drm_pdev {
++	TAILQ_ENTRY(linsysfs_drm_pdev) dp_next;
++	TAILQ_HEAD(, linsysfs_drm_minor) dp_minors;
++	char		*dp_key;	/* OF_FULLNAME, or the nameunit */
++	char		*dp_busid;	/* directory name, "2000000.v3d" */
++	char		*dp_link;	/* "../../../devices/platform/<busid>" */
++	char		*dp_uevent;
++	struct pfs_node	*dp_dir;	/* /sys/devices/platform/<busid> */
++	struct pfs_node	*dp_drmdir;	/* its drm/ */
++};
++
++static TAILQ_HEAD(, linsysfs_drm_pdev) linsysfs_drm_pdevs =
++    TAILQ_HEAD_INITIALIZER(linsysfs_drm_pdevs);
++static struct sx linsysfs_drm_lock;
++SX_SYSINIT(linsysfs_drm_lock, &linsysfs_drm_lock, "linsysfs drm");
++
++/* /sys/dev/char, /sys/class/drm, /sys/devices/platform; NULL until init. */
++static struct pfs_node *linsysfs_drm_chardev;
++static struct pfs_node *linsysfs_drm_class;
++static struct pfs_node *linsysfs_drm_platform;
++
++static eventhandler_tag linsysfs_drm_arrival_tag;
++static eventhandler_tag linsysfs_drm_departure_tag;
++
++static char linsysfs_drm_platform_bus[] = "/sys/bus/platform";
++
++/*
++ * Filler for the platform nodes' files and links: pn_data is a string that
++ * linsysfs_drm_lock keeps alive.
++ */
++static int
++linsysfs_fill_drm_string(PFS_FILL_ARGS)
++{
++
++	sx_slock(&linsysfs_drm_lock);
++	if (pn->pn_data != NULL)
++		sbuf_printf(sb, "%s", (const char *)pn->pn_data);
++	sx_sunlock(&linsysfs_drm_lock);
++	return (0);
++}
++
++static char *
++linsysfs_drm_strdup(struct sbuf *sb)
++{
++	char *s;
++
++	if (sbuf_finish(sb) != 0)
++		s = NULL;
++	else
++		s = strdup(sbuf_data(sb), M_LINSYSFS);
++	sbuf_delete(sb);
++	return (s);
++}
++
++/* True if dev sits below a PCI bus: linsysfs_run_bus() covers it. */
++static bool
++linsysfs_drm_on_pci(device_t dev)
++{
++	devclass_t dc;
++
++	for (dev = device_get_parent(dev); dev != NULL;
++	    dev = device_get_parent(dev)) {
++		dc = device_get_devclass(dev);
++		if (dc != NULL && strcmp(devclass_get_name(dc), PCI_DEV) == 0)
++			return (true);
++	}
++	return (false);
++}
++
++#ifdef FDT
++/* The node's name with any "@unit-address", or "" for the root. */
++static char *
++linsysfs_drm_of_name(phandle_t node)
++{
++	char *name;
++
++	if (OF_getprop_alloc(node, "name", (void **)&name) <= 0)
++		return (NULL);
++	return (name);
++}
++
++/*
++ * Describe a device-tree device the way Linux's of_device_uevent() and
++ * of_device_make_bus_id() do. OF_package_to_path() is not implemented on
++ * FDT, so OF_FULLNAME is built by walking up to the root. Returns false if
++ * dev has no node.
++ */
++static bool
++linsysfs_drm_describe_of(device_t dev, struct sbuf *key, struct sbuf *busid,
++    struct sbuf *ue)
++{
++	phandle_t path[LINSYSFS_DRM_OF_DEPTH];
++	phandle_t node, parent;
++	char *name, *pname, *compat, *type, *at, *p, *c;
++	ssize_t len;
++	int depth, i, n;
++
++	node = ofw_bus_get_node(dev);
++	if (node <= 0 || OF_parent(node) == 0)
++		return (false);
++	name = linsysfs_drm_of_name(node);
++	if (name == NULL)
++		return (false);
++
++	/* The key and OF_FULLNAME: /axi/v3d@2000000 */
++	depth = 0;
++	for (parent = node; parent != 0 && OF_parent(parent) != 0 &&
++	    depth < nitems(path); parent = OF_parent(parent))
++		path[depth++] = parent;
++	sbuf_printf(ue, "OF_NAME=");
++	for (c = name; *c != '\0' && *c != '@'; c++)
++		sbuf_putc(ue, *c);
++	sbuf_printf(ue, "\nOF_FULLNAME=");
++	for (i = depth - 1; i >= 0; i--) {
++		pname = linsysfs_drm_of_name(path[i]);
++		sbuf_printf(key, "/%s", pname != NULL ? pname : "");
++		sbuf_printf(ue, "/%s", pname != NULL ? pname : "");
++		OF_prop_free(pname);
++	}
++	sbuf_printf(ue, "\n");
++
++	/* Bus id: "<unit-address>.<name>", or "<parent>:<name>" without one */
++	at = strchr(name, '@');
++	if (at != NULL) {
++		*at = '\0';
++		sbuf_printf(busid, "%s.%s", at + 1, name);
++	} else {
++		pname = linsysfs_drm_of_name(OF_parent(node));
++		if (pname != NULL && pname[0] != '\0')
++			sbuf_printf(busid, "%s:%s", pname, name);
++		else
++			sbuf_printf(busid, "%s", name);
++		OF_prop_free(pname);
++	}
++
++	if (OF_getprop_alloc(node, "device_type", (void **)&type) <= 0)
++		type = NULL;
++	if (type != NULL)
++		sbuf_printf(ue, "OF_TYPE=%s\n", type);
++
++	/* OF_COMPATIBLE_<i>, OF_COMPATIBLE_N, and the same in MODALIAS */
++	len = OF_getprop_alloc(node, "compatible", (void **)&compat);
++	n = 0;
++	for (p = compat; len > 0 && p < compat + len; p += strlen(p) + 1) {
++		/* Stop at a string the property does not terminate. */
++		if (strnlen(p, compat + len - p) == (size_t)(compat + len - p))
++			break;
++		sbuf_printf(ue, "OF_COMPATIBLE_%d=%s\n", n++, p);
++	}
++	sbuf_printf(ue, "OF_COMPATIBLE_N=%d\n", n);
++	sbuf_printf(ue, "MODALIAS=of:N%sT%s", name,
++	    type != NULL ? type : "(null)");
++	for (i = 0, p = compat; i < n; i++, p += strlen(p) + 1) {
++		sbuf_putc(ue, 'C');
++		for (c = p; *c != '\0'; c++)
++			sbuf_putc(ue, *c == ' ' ? '_' : *c);
++	}
++	sbuf_printf(ue, "\n");
++
++	OF_prop_free(compat);
++	OF_prop_free(type);
++	OF_prop_free(name);
++	return (true);
++}
++#endif
++
++/*
++ * Format everything a platform device's nodes will show. Called without
++ * linsysfs_drm_lock, while dev is known to be attached.
++ */
++static struct linsysfs_drm_pdev *
++linsysfs_drm_pdev_alloc(device_t dev)
++{
++	struct linsysfs_drm_pdev *dp;
++	struct sbuf *key, *busid, *ue;
++	const char *drv;
++	bool of;
++
++	key = sbuf_new_auto();
++	busid = sbuf_new_auto();
++	ue = sbuf_new_auto();
++
++	drv = linux_driver_get_name_dev(dev);
++	if (drv == NULL)
++		drv = device_get_name(dev);
++	sbuf_printf(ue, "DRIVER=%s\n", drv != NULL ? drv : "unknown");
++	of = false;
++#ifdef FDT
++	of = linsysfs_drm_describe_of(dev, key, busid, ue);
++#endif
++	if (!of) {
++		/* No device-tree node: name it as a Linux platform device. */
++		sbuf_clear(key);
++		sbuf_clear(busid);
++		sbuf_printf(key, "%s", device_get_nameunit(dev));
++		sbuf_printf(busid, "%s.%d", device_get_name(dev),
++		    device_get_unit(dev));
++		sbuf_printf(ue, "MODALIAS=platform:%s\n",
++		    device_get_nameunit(dev));
++	}
++
++	dp = malloc(sizeof(*dp), M_LINSYSFS, M_WAITOK | M_ZERO);
++	TAILQ_INIT(&dp->dp_minors);
++	dp->dp_key = linsysfs_drm_strdup(key);
++	dp->dp_busid = linsysfs_drm_strdup(busid);
++	dp->dp_uevent = linsysfs_drm_strdup(ue);
++	return (dp);
++}
++
++static void
++linsysfs_drm_pdev_free(struct linsysfs_drm_pdev *dp)
++{
++
++	if (dp == NULL)
++		return;
++	free(dp->dp_key, M_LINSYSFS);
++	free(dp->dp_busid, M_LINSYSFS);
++	free(dp->dp_link, M_LINSYSFS);
++	free(dp->dp_uevent, M_LINSYSFS);
++	free(dp, M_LINSYSFS);
++}
++
++static void
++linsysfs_drm_minor_free(struct linsysfs_drm_minor *dm)
++{
++
++	if (dm == NULL)
++		return;
++	free(dm->dm_uevent, M_LINSYSFS);
++	free(dm, M_LINSYSFS);
++}
++
++static struct linsysfs_drm_minor *
++linsysfs_drm_find_minor(int minor)
++{
++	struct linsysfs_drm_pdev *dp;
++	struct linsysfs_drm_minor *dm;
++
++	sx_assert(&linsysfs_drm_lock, SA_LOCKED);
++	TAILQ_FOREACH(dp, &linsysfs_drm_pdevs, dp_next) {
++		TAILQ_FOREACH(dm, &dp->dp_minors, dm_next) {
++			if (dm->dm_minor == minor)
++				return (dm);
++		}
++	}
++	return (NULL);
++}
++
++/* Create the device's directory once linsysfs is up. */
++static void
++linsysfs_drm_pdev_publish(struct linsysfs_drm_pdev *dp)
++{
++	struct pfs_node *dir, *pn;
++
++	sx_assert(&linsysfs_drm_lock, SA_XLOCKED);
++	if (linsysfs_drm_platform == NULL || dp->dp_dir != NULL ||
++	    dp->dp_busid == NULL)
++		return;
++	if (pfs_create_dir(linsysfs_drm_platform, &dir, dp->dp_busid, NULL,
++	    NULL, NULL, 0) != 0)
++		return;
++	/* libdrm just checks that the link ends in "/platform" */
++	if (pfs_create_link(dir, &pn, "subsystem", &linsysfs_fill_drm_string,
++	    NULL, NULL, NULL, 0) == 0)
++		pn->pn_data = linsysfs_drm_platform_bus;
++	if (pfs_create_file(dir, &pn, "uevent", &linsysfs_fill_drm_string,
++	    NULL, NULL, NULL, PFS_RD) == 0)
++		pn->pn_data = dp->dp_uevent;
++	if (pfs_create_dir(dir, &dp->dp_drmdir, "drm", NULL, NULL, NULL,
++	    0) != 0)
++		dp->dp_drmdir = NULL;
++	dp->dp_dir = dir;
++}
++
++/* Create the minor's nodes once linsysfs is up. */
++static void
++linsysfs_drm_minor_publish(struct linsysfs_drm_minor *dm)
++{
++	struct linsysfs_drm_pdev *dp;
++
++	sx_assert(&linsysfs_drm_lock, SA_XLOCKED);
++	dp = dm->dm_pdev;
++	if (linsysfs_drm_chardev == NULL || linsysfs_drm_class == NULL ||
++	    dm->dm_nodes[0] != NULL || dm->dm_nodes[1] != NULL ||
++	    dm->dm_nodes[2] != NULL)
++		return;
++	linsysfs_create_drm_minor(linsysfs_drm_chardev, linsysfs_drm_class,
++	    dp->dp_drmdir, dm->dm_minor, dm->dm_name,
++	    &linsysfs_fill_drm_string, dp->dp_link, &linsysfs_fill_drm_string,
++	    dm->dm_uevent, dm->dm_nodes);
++}
++
++static void
++linsysfs_drm_minor_unpublish(struct linsysfs_drm_minor *dm)
++{
++	int i;
++
++	sx_assert(&linsysfs_drm_lock, SA_XLOCKED);
++	for (i = 0; i < nitems(dm->dm_nodes); i++) {
++		if (dm->dm_nodes[i] != NULL)
++			pfs_destroy(dm->dm_nodes[i]);
++		dm->dm_nodes[i] = NULL;
++	}
++}
++
++static void
++linsysfs_drm_minor_arrival(void *arg __unused, device_t dev, int minor,
++    int type __unused, const char *name)
++{
++	struct linsysfs_drm_pdev *dp, *ndp, *iter;
++	struct linsysfs_drm_minor *dm;
++	struct sbuf *sb;
++
++	if (dev == NULL || name == NULL || minor < 0 || name[0] == '\0' ||
++	    strlen(name) >= LINSYSFS_DRM_NAMELEN || strchr(name, '/') != NULL)
++		return;
++	if (linsysfs_drm_on_pci(dev))
++		return;
++
++	dm = malloc(sizeof(*dm), M_LINSYSFS, M_WAITOK | M_ZERO);
++	dm->dm_minor = minor;
++	strlcpy(dm->dm_name, name, sizeof(dm->dm_name));
++	sb = sbuf_new_auto();
++	sbuf_printf(sb, "MAJOR=%d\nMINOR=%d\nDEVNAME=dri/%s\nDEVTYPE=dri_minor\n",
++	    LINSYSFS_DRM_MAJOR, minor, name);
++	dm->dm_uevent = linsysfs_drm_strdup(sb);
++	ndp = linsysfs_drm_pdev_alloc(dev);
++	if (dm->dm_uevent == NULL || ndp->dp_key == NULL ||
++	    ndp->dp_busid == NULL || ndp->dp_uevent == NULL)
++		goto out;
++
++	sx_xlock(&linsysfs_drm_lock);
++	if (linsysfs_drm_find_minor(minor) != NULL) {
++		/* Already recorded; a duplicate event. */
++		sx_xunlock(&linsysfs_drm_lock);
++		goto out;
++	}
++	TAILQ_FOREACH(dp, &linsysfs_drm_pdevs, dp_next) {
++		if (strcmp(dp->dp_key, ndp->dp_key) == 0)
++			break;
++	}
++	if (dp == NULL) {
++		/* A new device. Keep its directory name unique. */
++		TAILQ_FOREACH(iter, &linsysfs_drm_pdevs, dp_next) {
++			if (strcmp(iter->dp_busid, ndp->dp_busid) == 0)
++				break;
++		}
++		if (iter != NULL) {
++			sb = sbuf_new_auto();
++			sbuf_printf(sb, "%s.%s", ndp->dp_busid,
++			    device_get_nameunit(dev));
++			free(ndp->dp_busid, M_LINSYSFS);
++			ndp->dp_busid = linsysfs_drm_strdup(sb);
++		}
++		if (ndp->dp_busid != NULL) {
++			sb = sbuf_new_auto();
++			sbuf_printf(sb, "../../../devices/platform/%s",
++			    ndp->dp_busid);
++			ndp->dp_link = linsysfs_drm_strdup(sb);
++		}
++		if (ndp->dp_link == NULL) {
++			sx_xunlock(&linsysfs_drm_lock);
++			goto out;
++		}
++		TAILQ_INSERT_TAIL(&linsysfs_drm_pdevs, ndp, dp_next);
++		dp = ndp;
++		ndp = NULL;
++	}
++	dm->dm_pdev = dp;
++	TAILQ_INSERT_TAIL(&dp->dp_minors, dm, dm_next);
++	linsysfs_drm_pdev_publish(dp);
++	linsysfs_drm_minor_publish(dm);
++	dm = NULL;
++	sx_xunlock(&linsysfs_drm_lock);
++out:
++	linsysfs_drm_minor_free(dm);
++	linsysfs_drm_pdev_free(ndp);
++}
++
++static void
++linsysfs_drm_minor_departure(void *arg __unused, device_t dev __unused,
++    int minor, int type __unused, const char *name __unused)
++{
++	struct linsysfs_drm_pdev *dp;
++	struct linsysfs_drm_minor *dm;
++
++	/* Matched by minor alone: dev is not dereferenced here. */
++	sx_xlock(&linsysfs_drm_lock);
++	dm = linsysfs_drm_find_minor(minor);
++	if (dm == NULL) {
++		sx_xunlock(&linsysfs_drm_lock);
++		return;
++	}
++	dp = dm->dm_pdev;
++	linsysfs_drm_minor_unpublish(dm);
++	TAILQ_REMOVE(&dp->dp_minors, dm, dm_next);
++	if (TAILQ_EMPTY(&dp->dp_minors)) {
++		if (dp->dp_dir != NULL)
++			pfs_destroy(dp->dp_dir);
++		TAILQ_REMOVE(&linsysfs_drm_pdevs, dp, dp_next);
++	} else
++		dp = NULL;
++	sx_xunlock(&linsysfs_drm_lock);
++	linsysfs_drm_minor_free(dm);
++	linsysfs_drm_pdev_free(dp);
++}
++
++/*
++ * Registered before any driver can attach, so that a DRM driver loaded with
++ * the kernel is not missed; its minors are published by linsysfs_drm_init().
++ */
++static void
++linsysfs_drm_register(void *arg __unused)
++{
++
++	linsysfs_drm_arrival_tag = EVENTHANDLER_REGISTER(drm_minor_registered,
++	    linsysfs_drm_minor_arrival, NULL, EVENTHANDLER_PRI_ANY);
++	linsysfs_drm_departure_tag = EVENTHANDLER_REGISTER(
++	    drm_minor_unregistered, linsysfs_drm_minor_departure, NULL,
++	    EVENTHANDLER_PRI_ANY);
++}
++SYSINIT(linsysfs_drm_register, SI_SUB_DRIVERS, SI_ORDER_FIRST,
++    linsysfs_drm_register, NULL);
++
++static void
++linsysfs_drm_deregister(void *arg __unused)
++{
++	struct linsysfs_drm_pdev *dp;
++	struct linsysfs_drm_minor *dm;
++
++	EVENTHANDLER_DEREGISTER(drm_minor_registered, linsysfs_drm_arrival_tag);
++	EVENTHANDLER_DEREGISTER(drm_minor_unregistered,
++	    linsysfs_drm_departure_tag);
++	/* The nodes went with the file system, in linsysfs_drm_uninit(). */
++	sx_xlock(&linsysfs_drm_lock);
++	while ((dp = TAILQ_FIRST(&linsysfs_drm_pdevs)) != NULL) {
++		while ((dm = TAILQ_FIRST(&dp->dp_minors)) != NULL) {
++			TAILQ_REMOVE(&dp->dp_minors, dm, dm_next);
++			linsysfs_drm_minor_free(dm);
++		}
++		TAILQ_REMOVE(&linsysfs_drm_pdevs, dp, dp_next);
++		linsysfs_drm_pdev_free(dp);
++	}
++	sx_xunlock(&linsysfs_drm_lock);
++}
++SYSUNINIT(linsysfs_drm_deregister, SI_SUB_DRIVERS, SI_ORDER_FIRST,
++    linsysfs_drm_deregister, NULL);
++
++/* linsysfs is up: publish what arrived before it. */
++static void
++linsysfs_drm_init(struct pfs_node *chardev, struct pfs_node *drm,
++    struct pfs_node *platform)
++{
++	struct linsysfs_drm_pdev *dp;
++	struct linsysfs_drm_minor *dm;
++
++	sx_xlock(&linsysfs_drm_lock);
++	linsysfs_drm_chardev = chardev;
++	linsysfs_drm_class = drm;
++	linsysfs_drm_platform = platform;
++	TAILQ_FOREACH(dp, &linsysfs_drm_pdevs, dp_next) {
++		linsysfs_drm_pdev_publish(dp);
++		TAILQ_FOREACH(dm, &dp->dp_minors, dm_next)
++			linsysfs_drm_minor_publish(dm);
++	}
++	sx_xunlock(&linsysfs_drm_lock);
++}
++
++/*
++ * pfs_uninit() has already destroyed the tree; forget the nodes, keep the
++ * records for a later linsysfs_drm_init().
++ */
++static void
++linsysfs_drm_uninit(void)
++{
++	struct linsysfs_drm_pdev *dp;
++	struct linsysfs_drm_minor *dm;
++	int i;
++
++	sx_xlock(&linsysfs_drm_lock);
++	linsysfs_drm_chardev = NULL;
++	linsysfs_drm_class = NULL;
++	linsysfs_drm_platform = NULL;
++	TAILQ_FOREACH(dp, &linsysfs_drm_pdevs, dp_next) {
++		dp->dp_dir = NULL;
++		dp->dp_drmdir = NULL;
++		TAILQ_FOREACH(dm, &dp->dp_minors, dm_next) {
++			for (i = 0; i < nitems(dm->dm_nodes); i++)
++				dm->dm_nodes[i] = NULL;
++		}
++	}
++	sx_xunlock(&linsysfs_drm_lock);
++}
++
+ /*
+  * Filler function for sys/devices/system/cpu/{online,possible,present}
+  */
+@@ -566,6 +1149,7 @@ linsysfs_init(PFS_INIT_ARGS)
+ 	struct pfs_node *scsi;
+ 	struct pfs_node *devdir, *chardev;
+ 	struct pfs_node *kernel;
++	struct pfs_node *platform;
+ 	devclass_t devclass;
+ 	device_t dev;
+ 
+@@ -592,6 +1176,11 @@ linsysfs_init(PFS_INIT_ARGS)
+ 	/* /sys/devices/... */
+ 	pfs_create_dir(root, &dir, "devices", NULL, NULL, NULL, 0);
+ 	pfs_create_dir(dir, &pci, "pci0000:00", NULL, NULL, NULL, 0);
++	/* /sys/devices/platform, for linsysfs_drm_minor_arrival() */
++	if (pfs_create_dir(dir, &platform, "platform", NULL, NULL, NULL,
++	    0) != 0)
++		platform = NULL;
++	linsysfs_drm_init(chardev, drm, platform);
+ 
+ 	devclass = devclass_find("root");
+ 	if (devclass == NULL) {
+@@ -646,6 +1235,7 @@ linsysfs_uninit(PFS_INIT_ARGS)
+ 	}
+ 
+ 	linsysfs_net_uninit();
++	linsysfs_drm_uninit();
+ 
+ 	return (0);
+ }
+-- 
+2.54.0 (Apple Git-157)
+
