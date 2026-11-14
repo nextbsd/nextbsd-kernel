@@ -92,3 +92,4 @@
 0099-NextBSD-virtio_gpu-starts-as-the-boot-splash-and-flu.patch
 0100-NextBSD-the-boot-splash-ends-at-getty-s-TIOCSCTTY-or.patch
 0101-NextBSD-bcm2835_fbd-hands-the-Pi-s-firmware-framebuf.patch
+0102-NextBSD-linsysfs-sysfs-entries-for-platform-DRM-devi.patch
