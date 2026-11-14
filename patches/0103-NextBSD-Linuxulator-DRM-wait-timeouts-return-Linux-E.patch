@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Sat, 14 Nov 2026 14:33:39 -0600
+Subject: [PATCH] NextBSD: Linuxulator: DRM wait timeouts return Linux ETIME,
+ not ETIMEDOUT
+
+Linux DRM drivers report a wait that timed out as -ETIME: v3d's
+WAIT_BO, drm_syncobj's WAIT and TIMELINE_WAIT, and the other GEM/BO and
+fence waits. Linux userland depends on it. Mesa and libdrm take ETIME to
+mean "still busy" and treat anything else as an error; Mesa's v3d
+v3d_bo_wait() aborts on it ("wait failed: -110").
+
+FreeBSD has no ETIME, so LinuxKPI defines ETIME as ETIMEDOUT and
+drm-kmod's -ETIME leaves sys_ioctl() as ETIMEDOUT. linux_ioctl_drm()
+passed that through, and linux_errtbl turned it into Linux ETIMEDOUT
+(110). Linux GL/EGL programs on the Raspberry Pi 5's v3d, and Linux
+Chromium's GPU process, aborted the first time they polled a busy buffer.
+
+linux_ioctl_drm() now returns Linux ETIME (62, LINUX_ENOTIME) when a
+DRM ioctl fails with ETIMEDOUT. No FreeBSD errno maps to it in
+linux_errtbl, so the handler puts the negative Linux errno in
+td_retval[0] and returns 0; every Linux sysvec copies td_retval[0] into
+the return register unchanged, which is how a Linux syscall reports an
+error. Only ioctls in the Linux DRM range ('d', 0x6400-0x64ff) from
+Linux processes go through here. Native callers keep getting ETIMEDOUT,
+which native Mesa defines ETIME as.
+
+Fixes nextbsd/nextbsd-kernel#424
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linux/linux_ioctl.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/sys/compat/linux/linux_ioctl.c b/sys/compat/linux/linux_ioctl.c
+index f6c239b..7a08c53 100644
+--- a/sys/compat/linux/linux_ioctl.c
++++ b/sys/compat/linux/linux_ioctl.c
+@@ -69,6 +69,7 @@
+ #endif
+ 
+ #include <compat/linux/linux_common.h>
++#include <compat/linux/linux_errno.h>
+ #include <compat/linux/linux_ioctl.h>
+ #include <compat/linux/linux_mib.h>
+ #include <compat/linux/linux_socket.h>
+@@ -2554,12 +2555,29 @@ linux_ioctl_private(struct thread *td, struct linux_ioctl_args *args)
+ 
+ /*
+  * DRM ioctl handler (sys/dev/drm)
++ *
++ * Linux DRM drivers report a wait that timed out (GEM/BO waits, syncobj and
++ * fence waits) as -ETIME, and Linux userland relies on that: Mesa and libdrm
++ * take ETIME to mean "still busy" and treat anything else as an error (Mesa's
++ * v3d aborts).  FreeBSD has no ETIME, so LinuxKPI defines it as ETIMEDOUT and
++ * the drivers' -ETIME arrives here as ETIMEDOUT, which linux_errtbl would turn
++ * into Linux ETIMEDOUT (110).  Return Linux ETIME (62, LINUX_ENOTIME) instead.
++ * No FreeBSD errno maps to it, so put the negative Linux errno in the return
++ * value, which is how a Linux syscall reports an error.  Native callers do not
++ * come through here and keep seeing ETIMEDOUT, which native Mesa expects.
+  */
+ static int
+ linux_ioctl_drm(struct thread *td, struct linux_ioctl_args *args)
+ {
++	int error;
++
+ 	args->cmd = SETDIR(args->cmd);
+-	return (sys_ioctl(td, (struct ioctl_args *)args));
++	error = sys_ioctl(td, (struct ioctl_args *)args);
++	if (error == ETIMEDOUT) {
++		td->td_retval[0] = -LINUX_ENOTIME;
++		error = 0;
++	}
++	return (error);
+ }
+ 
+ #ifdef COMPAT_LINUX32
+-- 
+2.54.0 (Apple Git-157)
+
