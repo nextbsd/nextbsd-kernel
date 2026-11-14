@@ -93,3 +93,4 @@
 0100-NextBSD-the-boot-splash-ends-at-getty-s-TIOCSCTTY-or.patch
 0101-NextBSD-bcm2835_fbd-hands-the-Pi-s-firmware-framebuf.patch
 0102-NextBSD-linsysfs-sysfs-entries-for-platform-DRM-devi.patch
+0103-NextBSD-Linuxulator-DRM-wait-timeouts-return-Linux-E.patch
