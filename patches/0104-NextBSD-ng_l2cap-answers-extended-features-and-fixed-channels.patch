@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Wed, 18 Nov 2026 21:41:52 -0600
+Subject: [PATCH] NextBSD: ng_l2cap answers the extended features and fixed
+ channels requests
+
+Every L2CAP since Bluetooth 2.1 answers Information Requests for the
+extended feature mask (0x0002) and the fixed channels (0x0003);
+ng_l2cap answered both "not supported". Apple's stack (seen with Beats
+Studio Pro headphones on a Dell XPS 9320) then configures only the
+first channel opened to it after it asks: for every later one it
+answers this side's Configuration Request but never sends its own, so
+SDP, RFCOMM (hands-free) and AVDTP (A2DP) channels stall in
+configuration until they time out, and the headphones stay paired but
+silent.
+
+Answer both: no extended features (no ERTM, streaming mode, FCS or
+EFS, none of which ng_l2cap does), and the signalling and
+connectionless fixed channels.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/netgraph/bluetooth/include/ng_l2cap.h    | 14 +++++++++++++-
+ sys/netgraph/bluetooth/l2cap/ng_l2cap_cmds.h |  8 ++++++++
+ sys/netgraph/bluetooth/l2cap/ng_l2cap_evnt.c | 19 +++++++++++++++++++
+ 3 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/sys/netgraph/bluetooth/include/ng_l2cap.h b/sys/netgraph/bluetooth/include/ng_l2cap.h
+index 416db51..7f33b27 100644
+--- a/sys/netgraph/bluetooth/include/ng_l2cap.h
++++ b/sys/netgraph/bluetooth/include/ng_l2cap.h
+@@ -144,7 +144,9 @@
+ 
+ /* L2CAP Information request type codes */
+ #define NG_L2CAP_CONNLESS_MTU		0x0001
+-/* 0x0002 - 0xffff - reserved for future use */
++#define NG_L2CAP_EXTENDED_FEATURES	0x0002
++#define NG_L2CAP_FIXED_CHANNELS		0x0003
++/* 0x0004 - 0xffff - reserved for future use */
+ 
+ /* L2CAP Information response codes */
+ #define NG_L2CAP_NOT_SUPPORTED		0x0001
+@@ -295,6 +297,8 @@ typedef struct {
+ /*	u_int8_t	info[]  -- info data (depends on type)
+  *
+  * NG_L2CAP_CONNLESS_MTU - 2 bytes connectionless MTU
++ * NG_L2CAP_EXTENDED_FEATURES - 4 bytes feature mask
++ * NG_L2CAP_FIXED_CHANNELS - 8 bytes channel mask
+  */
+ } __attribute__ ((packed)) ng_l2cap_info_rsp_cp;
+ typedef union {
+@@ -302,6 +306,14 @@ typedef union {
+ 	struct {
+ 		u_int16_t	mtu;
+ 	} __attribute__ ((packed)) mtu;
++	/* NG_L2CAP_EXTENDED_FEATURES */
++	struct {
++		u_int32_t	mask;
++	} __attribute__ ((packed)) features;
++	/* NG_L2CAP_FIXED_CHANNELS */
++	struct {
++		u_int64_t	mask;
++	} __attribute__ ((packed)) fixed;
+ } ng_l2cap_info_rsp_data_t;
+ typedef ng_l2cap_info_rsp_data_t *	ng_l2cap_info_rsp_data_p;
+ 
+diff --git a/sys/netgraph/bluetooth/l2cap/ng_l2cap_cmds.h b/sys/netgraph/bluetooth/l2cap/ng_l2cap_cmds.h
+index fbb7541..767d750 100644
+--- a/sys/netgraph/bluetooth/l2cap/ng_l2cap_cmds.h
++++ b/sys/netgraph/bluetooth/l2cap/ng_l2cap_cmds.h
+@@ -412,6 +412,14 @@ do {									\
+ 			c->data.mtu.mtu = htole16((_mtu));		\
+ 			c->hdr.length += sizeof((c->data.mtu.mtu));	\
+ 			break;						\
++		case NG_L2CAP_EXTENDED_FEATURES:			\
++			c->data.features.mask = htole32((_mtu));	\
++			c->hdr.length += sizeof((c->data.features.mask)); \
++			break;						\
++		case NG_L2CAP_FIXED_CHANNELS:				\
++			c->data.fixed.mask = htole64((_mtu));		\
++			c->hdr.length += sizeof((c->data.fixed.mask));	\
++			break;						\
+ 		}							\
+ 	}								\
+ 									\
+diff --git a/sys/netgraph/bluetooth/l2cap/ng_l2cap_evnt.c b/sys/netgraph/bluetooth/l2cap/ng_l2cap_evnt.c
+index 82bfaeb..2e96544 100644
+--- a/sys/netgraph/bluetooth/l2cap/ng_l2cap_evnt.c
++++ b/sys/netgraph/bluetooth/l2cap/ng_l2cap_evnt.c
+@@ -1190,6 +1190,25 @@ ng_l2cap_process_info_req(ng_l2cap_con_p con, u_int8_t ident)
+ 				NG_L2CAP_SUCCESS, NG_L2CAP_MTU_DEFAULT);
+ 		break;
+ 
++	/*
++	 * Every stack since Bluetooth 2.1 answers these two. Answered "not
++	 * supported", Apple's (Beats Studio Pro) configure the first channel
++	 * opened to them after asking, then never send their Configuration
++	 * Request for any later one: SDP, RFCOMM and AVDTP channels opened
++	 * by this side stall in configuration. No extended features (none
++	 * of ERTM, streaming mode, FCS, EFS); fixed channels: the
++	 * signalling channel and the connectionless one (bits 1 and 2).
++	 */
++	case NG_L2CAP_EXTENDED_FEATURES:
++		_ng_l2cap_info_rsp(cmd->aux, ident, NG_L2CAP_EXTENDED_FEATURES,
++				NG_L2CAP_SUCCESS, 0x00000000);
++		break;
++
++	case NG_L2CAP_FIXED_CHANNELS:
++		_ng_l2cap_info_rsp(cmd->aux, ident, NG_L2CAP_FIXED_CHANNELS,
++				NG_L2CAP_SUCCESS, 0x0000000000000006ULL);
++		break;
++
+ 	default:
+ 		_ng_l2cap_info_rsp(cmd->aux, ident, type,
+ 				NG_L2CAP_NOT_SUPPORTED, 0);
+-- 
+2.54.0 (Apple Git-157)
+
