@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christos Margiolis <christos@FreeBSD.org>
+Date: Wed, 30 Sep 2026 09:49:52 +0000
+Subject: [PATCH 2/2] cuse: Improve server cleanup
+
+Cherry-picked from FreeBSD main 40431ec4da1d (not in releng/15.1),
+without its cuse_kern_uninit() hunk, which depends on the module event
+rework (2fd8d2eb7bb9) and doesn't matter here: NEXTBSD compiles cuse into
+the kernel. Not our work -- authorship left with the upstream author.
+NextBSD: nextbsd/nextbsd#667. With this, a cuse server (virtual_oss)
+killed while clients hold its devices exits at once instead of waiting
+in pause("W") until every client closes.
+
+Move cuse_server_unref()'s device cleanup loop into a new
+cuse_server_free_devs_locked(), and call it from cuse_server_free()
+instead. The cdevpriv destructor now destroys the server's devices
+before dropping its reference, which closes the clients using them, so
+that the destructor is always the one that takes the last reference.
+
+By the time cuse_server_unref() frees the server, the device list should
+be empty, so assert this.
+
+Reviewed by:	kib
+Differential Revision:	https://reviews.freebsd.org/D59872
+---
+ sys/fs/cuse/cuse.c | 33 +++++++++++++++++++--------------
+ 1 file changed, 19 insertions(+), 14 deletions(-)
+
+diff --git a/sys/fs/cuse/cuse.c b/sys/fs/cuse/cuse.c
+index ef786d1..8e52dc6 100644
+--- a/sys/fs/cuse/cuse.c
++++ b/sys/fs/cuse/cuse.c
+@@ -696,9 +696,21 @@ cuse_server_free_dev(struct cuse_server_dev *pcsd)
+ }
+ 
+ static void
+-cuse_server_unref(struct cuse_server *pcs)
++cuse_server_free_devs_locked(struct cuse_server *pcs)
+ {
+ 	struct cuse_server_dev *pcsd;
++
++	while ((pcsd = TAILQ_FIRST(&pcs->hdev)) != NULL) {
++		TAILQ_REMOVE(&pcs->hdev, pcsd, entry);
++		cuse_server_unlock(pcs);
++		cuse_server_free_dev(pcsd);
++		cuse_server_lock(pcs);
++	}
++}
++
++static void
++cuse_server_unref(struct cuse_server *pcs)
++{
+ 	struct cuse_memory *mem;
+ 
+ 	cuse_server_lock(pcs);
+@@ -714,12 +726,8 @@ cuse_server_unref(struct cuse_server *pcs)
+ 	TAILQ_REMOVE(&cuse_server_head, pcs, entry);
+ 	cuse_global_unlock();
+ 
+-	while ((pcsd = TAILQ_FIRST(&pcs->hdev)) != NULL) {
+-		TAILQ_REMOVE(&pcs->hdev, pcsd, entry);
+-		cuse_server_unlock(pcs);
+-		cuse_server_free_dev(pcsd);
+-		cuse_server_lock(pcs);
+-	}
++	/* The cdevpriv destructor destroys the devices before unreffing. */
++	MPASS(TAILQ_EMPTY(&pcs->hdev));
+ 
+ 	cuse_free_unit_by_id_locked(pcs, -1);
+ 
+@@ -767,13 +775,10 @@ cuse_server_free(void *arg)
+ {
+ 	struct cuse_server *pcs = arg;
+ 
+-	/*
+-	 * The final server unref should be done by the server thread
+-	 * to prevent deadlock in the client cdevpriv destructor,
+-	 * which cannot destroy itself.
+-	 */
+-	while (cuse_server_do_close(pcs) != 1)
+-		pause("W", hz);
++	cuse_server_lock(pcs);
++	cuse_server_is_closing(pcs);
++	cuse_server_free_devs_locked(pcs);
++	cuse_server_unlock(pcs);
+ 
+ 	/* drop final refcount */
+ 	cuse_server_unref(pcs);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -39,6 +39,8 @@ the base branch moves &mdash; they are carried, not owned.
 | patch | origin | upstream status |
 |---|---|---|
 | `0010-virtio_console-*` | `networkextension/freebsd-src` @ `cf50f191e`, branch `apple-vz-virtio-console` | not submitted |
+| `0104-cuse-Fix-server-reference-leak-*` | FreeBSD main `d83e42234f76` | upstream; in `stable/15`, not `releng/15.1`: drop when the base has it |
+| `0105-cuse-Improve-server-cleanup` | FreeBSD main `40431ec4da1d`, minus its `cuse_kern_uninit()` hunk | upstream (main); drop when the base has it |
 
 `0010` is required on Apple's Virtualization.framework: VZ publishes no GOP and
 its ACPI carries no SPCR, so a virtio-console consdev is the only console a

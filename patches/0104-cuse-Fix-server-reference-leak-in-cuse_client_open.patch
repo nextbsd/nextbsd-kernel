@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: giacomo <delleceste@gmail.com>
+Date: Wed, 15 Jul 2026 12:10:54 +0000
+Subject: [PATCH 1/2] cuse: Fix server reference leak in cuse_client_open()
+
+Cherry-picked from FreeBSD main d83e42234f76 (in stable/15, not in
+releng/15.1). Not our work -- authorship left with the upstream author.
+NextBSD: nextbsd/nextbsd#667 (virtual_oss killed while /dev/dsp is open
+stays in "DE", wait channel "W", until reboot).
+
+If the server is closing (or the device node is going away), or if
+devfs_set_cdevpriv() fails, cuse_client_open() returns with the server
+reference taken at the top of the function still held and the newly
+allocated client still linked on pcs->hcli.  Since cuse_client_free()
+has not been registered as the cdevpriv destructor at that point,
+nothing ever undoes this work: every open() that races the is_closing
+window permanently leaks one server reference and one cuse_client.
+
+A leaked reference is fatal on server exit: cuse_server_free()
+busy-waits in an uninterruptible pause("W", hz) loop until pcs->refs
+drops to 1, which now never happens, so the exiting server process
+(e.g. virtual_oss(8)) is left wedged in state "D", immune to SIGKILL,
+cuse.ko is pinned (kldunload hangs too), and only a reboot recovers.
+
+Fix by calling cuse_client_free() directly on both error paths.  The
+client is fully constructed and linked on pcs->hcli at these points,
+which is exactly the state cuse_client_free() expects.
+
+PR:		296291
+Fixes:		634e578ac7b0 ("cuse: Fix cdevpriv bugs in cuse_client_open()")
+Reviewed by:	christos
+Pull-Request:	https://github.com/freebsd/freebsd-src/pull/2324
+---
+ sys/fs/cuse/cuse.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/sys/fs/cuse/cuse.c b/sys/fs/cuse/cuse.c
+index 8f67c4b..ef786d1 100644
+--- a/sys/fs/cuse/cuse.c
++++ b/sys/fs/cuse/cuse.c
+@@ -1546,11 +1546,19 @@ cuse_client_open(struct cdev *dev, int fflags, int devtype, struct thread *td)
+ 	}
+ 	cuse_server_unlock(pcs);
+ 
+-	if (error != 0)
++	/*
++	 * On error, free the client and unref the server, so that the
++	 * exiting server process does not become unkillable.
++	 */
++	if (error != 0) {
++		cuse_client_free(pcc);
+ 		return (error);
++	}
+ 
+-	if ((error = devfs_set_cdevpriv(pcc, &cuse_client_free)) != 0)
++	if ((error = devfs_set_cdevpriv(pcc, &cuse_client_free)) != 0) {
++		cuse_client_free(pcc);
+ 		return (error);
++	}
+ 
+ 	pccmd = &pcc->cmds[CUSE_CMD_OPEN];
+ 
+-- 
+2.54.0 (Apple Git-157)
+
