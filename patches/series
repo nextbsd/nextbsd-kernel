@@ -94,3 +94,5 @@
 0101-NextBSD-bcm2835_fbd-hands-the-Pi-s-firmware-framebuf.patch
 0102-NextBSD-linsysfs-sysfs-entries-for-platform-DRM-devi.patch
 0103-NextBSD-Linuxulator-DRM-wait-timeouts-return-Linux-E.patch
+0104-cuse-Fix-server-reference-leak-in-cuse_client_open.patch
+0105-cuse-Improve-server-cleanup.patch
