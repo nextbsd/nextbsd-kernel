@@ -1,7 +1,7 @@
-From 5bf74507ff275804d407aabd425014115ba0b4cd Mon Sep 17 00:00:00 2001
+From caf873da512e4db0a24571b9d9f4dc0f5584da22 Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
 Date: Wed, 28 Oct 2026 10:48:49 -0500
-Subject: [PATCH] NextBSD: compile DTrace into the kernel: add the missing
+Subject: [PATCH 1/2] NextBSD: compile DTrace into the kernel: add the missing
  sources and fasttrap
 
 Stock FreeBSD builds DTrace as modules, and its kernel-config support for
@@ -17,41 +17,26 @@ compiles DTrace in, as xnu does:
   `device fasttrap` with its module's flags, and let u8_textprep.c, which
   it calls, build for it as well as for zfs. FreeBSD has no arm64
   fasttrap.
-- sys/conf/files builds the ZFS SPL's spl_taskq.c for a compiled-in
-  DTrace, while sys/modules/dtrace/dtrace builds opensolaris_taskq.c.
-  spl_taskq.c gives each taskq thread a taskq_tsd_set init hook but only
-  creates the taskq_tsd key at SI_SUB_CONFIGURE. dtrace_load creates
-  dtrace_taskq at SI_SUB_DTRACE; an AP started at SI_SUB_SMP runs that
-  thread first, and osd_get(slot 0) faults at 0x7fffffff8. Build
-  opensolaris_taskq.c for dtrace as the module does, and spl_taskq.c for
-  zfs only.
+
+DTrace takes its taskqs from the ZFS SPL's spl_taskq.c, as stock
+sys/conf/files has it; patch 0107 makes that safe for dtrace_taskq,
+which starts before spl_taskq.c creates its TSD key. (This patch used to
+switch a compiled-in DTrace to opensolaris_taskq.c instead, which
+collides with spl_taskq.c once ZFS is compiled in too.)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- sys/conf/files       |  8 ++++++--
+ sys/conf/files       |  2 +-
  sys/conf/files.amd64 |  8 ++++++++
  sys/conf/files.arm64 |  2 ++
  sys/conf/kern.pre.mk | 11 ++++++++++-
- 4 files changed, 27 insertions(+), 3 deletions(-)
+ 4 files changed, 21 insertions(+), 2 deletions(-)
 
 diff --git a/sys/conf/files b/sys/conf/files
-index 7f925bfc3..ca216ab07 100644
+index 7f925bf..ca216ab 100644
 --- a/sys/conf/files
 +++ b/sys/conf/files
-@@ -137,7 +137,11 @@
- cddl/compat/opensolaris/kern/opensolaris_proc.c		optional zfs | dtrace compile-with "${CDDL_C}"
- contrib/openzfs/module/os/freebsd/spl/spl_misc.c		optional zfs | dtrace compile-with "${ZFS_C}"
- contrib/openzfs/module/os/freebsd/spl/spl_cmn_err.c		optional zfs | dtrace compile-with "${ZFS_C}"
--contrib/openzfs/module/os/freebsd/spl/spl_taskq.c		optional zfs | dtrace compile-with "${ZFS_C}"
-+contrib/openzfs/module/os/freebsd/spl/spl_taskq.c		optional zfs compile-with "${ZFS_C}"
-+# NextBSD: a compiled-in DTrace takes its taskqs from opensolaris_taskq.c, as
-+# sys/modules/dtrace/dtrace does. spl_taskq.c creates its TSD key only at
-+# SI_SUB_CONFIGURE, so dtrace_taskq panicked on an AP that ran it first.
-+cddl/compat/opensolaris/kern/opensolaris_taskq.c	optional dtrace compile-with "${DTRACE_C}"
- contrib/openzfs/module/os/freebsd/spl/spl_kmem.c		optional zfs | dtrace compile-with "${ZFS_C}"
- 
- #zfs solaris portability layer
-@@ -224,7 +228,7 @@ contrib/openzfs/module/os/freebsd/zfs/zio_crypt.c		optional zfs compile-with "${
+@@ -224,7 +224,7 @@ contrib/openzfs/module/os/freebsd/zfs/zio_crypt.c		optional zfs compile-with "${
  contrib/openzfs/module/os/freebsd/zfs/zvol_os.c		optional zfs compile-with "${ZFS_C}"
  
  #zfs unicode support
@@ -61,7 +46,7 @@ index 7f925bfc3..ca216ab07 100644
  #zfs checksums / zcommon
  contrib/openzfs/module/zcommon/cityhash.c		optional zfs compile-with "${ZFS_C}"
 diff --git a/sys/conf/files.amd64 b/sys/conf/files.amd64
-index 9837086af..c0c0fb3c7 100644
+index 9837086..c0c0fb3 100644
 --- a/sys/conf/files.amd64
 +++ b/sys/conf/files.amd64
 @@ -37,6 +37,13 @@ ia32_assym.h			standard				\
@@ -87,7 +72,7 @@ index 9837086af..c0c0fb3c7 100644
  crypto/aesni/aeskeys_amd64.S	optional aesni
  crypto/des/des_enc.c		optional	netsmb
 diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
-index 1f3a072fe..3762228df 100644
+index 1f3a072..3762228 100644
 --- a/sys/conf/files.arm64
 +++ b/sys/conf/files.arm64
 @@ -205,6 +205,8 @@ dev/acpi_support/acpi_wmi_if.m			optional acpi acpi_wmi
@@ -100,7 +85,7 @@ index 1f3a072fe..3762228df 100644
  cddl/dev/fbt/aarch64/fbt_isa.c			optional dtrace_fbt | dtraceall compile-with "${FBT_C}"
  
 diff --git a/sys/conf/kern.pre.mk b/sys/conf/kern.pre.mk
-index 025148624..6ebe2f09a 100644
+index 0251486..6ebe2f0 100644
 --- a/sys/conf/kern.pre.mk
 +++ b/sys/conf/kern.pre.mk
 @@ -250,15 +250,24 @@ DTRACE_ASM_CFLAGS=	-x assembler-with-cpp -DLOCORE ${DTRACE_CFLAGS}

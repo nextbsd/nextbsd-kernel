@@ -1,0 +1,66 @@
+From ea73502cbf78573f73614e04df77063f69f7294a Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 22 Nov 2026 19:03:28 -0600
+Subject: [PATCH 2/2] NextBSD: spl_taskq: no TSD for a taskq started before
+ system_taskq_init
+
+spl_taskq.c gives each taskq thread an init callback, taskq_tsd_set(),
+that stores the thread's taskq in TSD for taskq_of_curthread(). The TSD
+key is created by system_taskq_init() at SI_SUB_CONFIGURE. Stock FreeBSD
+loads DTrace and ZFS as modules, long after that, so the key always
+exists.
+
+NextBSD compiles both into the kernel. DTrace creates dtrace_taskq at
+SI_SUB_DTRACE, after the APs start (SI_SUB_SMP) and before
+SI_SUB_CONFIGURE. An AP runs its thread, taskq_tsd_set() calls
+tsd_get()/tsd_set() with key 0, and osd_get(slot 0) faults
+(0x7fffffff8). Patch 0070 used to avoid this by giving DTrace
+opensolaris_taskq.c, which duplicates every taskq symbol once ZFS is
+compiled in too.
+
+While the key is 0, leave the thread without the back pointer (still
+enabling kernel FPU use, as the first init does) and have
+taskq_of_curthread() return NULL. Taskqs created after
+system_taskq_init(), which is all of ZFS's, behave as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../openzfs/module/os/freebsd/spl/spl_taskq.c     | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/sys/contrib/openzfs/module/os/freebsd/spl/spl_taskq.c b/sys/contrib/openzfs/module/os/freebsd/spl/spl_taskq.c
+index f3b8867..52532f6 100644
+--- a/sys/contrib/openzfs/module/os/freebsd/spl/spl_taskq.c
++++ b/sys/contrib/openzfs/module/os/freebsd/spl/spl_taskq.c
+@@ -196,6 +196,19 @@ taskq_tsd_set(void *context)
+ {
+ 	taskq_t *tq = context;
+ 
++	/*
++	 * NextBSD: a taskq created before system_taskq_init() (SI_SUB_CONFIGURE)
++	 * has no TSD key yet: a compiled-in DTrace's dtrace_taskq, created at
++	 * SI_SUB_DTRACE, after the APs start. osd slot 0 faults, so leave such a
++	 * thread without the taskq_of_curthread() back pointer.
++	 */
++	if (taskq_tsd == 0) {
++#if defined(__amd64__) || defined(__aarch64__)
++		if (context != NULL)
++			fpu_kern_thread(FPU_KERN_NORMAL);
++#endif
++		return;
++	}
+ #if defined(__amd64__) || defined(__aarch64__) 
+ 	if (context != NULL && tsd_get(taskq_tsd) == NULL)
+ 		fpu_kern_thread(FPU_KERN_NORMAL);
+@@ -339,6 +352,8 @@ taskq_member(taskq_t *tq, kthread_t *thread)
+ taskq_t *
+ taskq_of_curthread(void)
+ {
++	if (taskq_tsd == 0)	/* NextBSD: before system_taskq_init() */
++		return (NULL);
+ 	return (tsd_get(taskq_tsd));
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
