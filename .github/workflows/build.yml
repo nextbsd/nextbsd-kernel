@@ -238,6 +238,19 @@ jobs:
           "$GITHUB_WORKSPACE/ci/verify-zfs.sh" arm64 "/usr/obj/$KO"
           mkdir -p /tmp/rpi5 && cp "/usr/obj/$KO/kernel.bin" /tmp/rpi5/kernel8.img
           echo "kernel8.img: $(wc -c < /tmp/rpi5/kernel8.img) bytes"
+          # The same kernel as an ELF, for the U-Boot -> loader.efi boot path
+          # (nextbsd/nextbsd#687): loader(8) loads /boot/<kernel>/kernel, an
+          # ELF, and cannot load kernel8.img. Check the ELF magic and that it
+          # is an AArch64 executable (e_machine 0xb7 at offset 18) rather than
+          # trusting the file name.
+          mkdir -p /tmp/rpi5-elf
+          cp "/usr/obj/$KO/kernel" /tmp/rpi5-elf/kernel
+          ELFMAG=$(od -An -tx1 -N4 /tmp/rpi5-elf/kernel | tr -d ' \n')
+          EMACH=$(od -An -tx1 -j18 -N2 /tmp/rpi5-elf/kernel | tr -d ' \n')
+          echo "kernel ELF magic: $ELFMAG, e_machine: $EMACH"
+          test "$ELFMAG" = "7f454c46" || { echo "NEXTBSD-RPI5 kernel is not an ELF" >&2; exit 1; }
+          test "$EMACH" = "b700" || { echo "NEXTBSD-RPI5 kernel is not AArch64" >&2; exit 1; }
+          echo "kernel (ELF): $(wc -c < /tmp/rpi5-elf/kernel) bytes"
 
       - name: Upload kernel8.img (arm64 booti image)
         if: matrix.target == 'arm64'
@@ -245,6 +258,13 @@ jobs:
         with:
           name: rpi5-kernel8-arm64
           path: /tmp/rpi5/kernel8.img
+
+      - name: Upload the NEXTBSD-RPI5 ELF kernel (for loader.efi)
+        if: matrix.target == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi5-kernel-elf-arm64
+          path: /tmp/rpi5-elf/kernel
 
       # Tar the obj tree IN-CONTAINER, where /usr/obj perms are intact. The
       # exec bit (bmake, cross-tools) survives inside the tar stream; a raw
