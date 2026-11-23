@@ -162,6 +162,29 @@ options 	NULLFS
 # assemble-image.sh:168 to delete, and no kld tooling is needed to load it.
 options 	FUSEFS
 
+# ZFS, compiled in. FreeBSD's own OpenZFS, the copy in this tree
+# (sys/contrib/openzfs), unmodified: no fork, no external OpenZFS, no patch to
+# its code. `options ZFS' is the stock static path; every source is gated
+# `optional zfs' in sys/conf/files and files.<arch> (blake3/sha2 asm, the
+# SIMD fletcher and raidz variants). The same module-only trap as FUSEFS:
+# upstream normally ships zfs.ko, and NextBSD has no .ko tree.
+#
+# What it pulls in is already here: GENERIC (and arm64's std.arm64/std.dev)
+# compiles in `device crypto', ZSTDIO (zfs_zstd.c is `optional zfs zstdio')
+# and the xdr/krpc code for NFS; the opensolaris compat and SPL shared with
+# DTrace (`optional zfs | dtrace') are already in for `device dtrace'.
+# kmod_core.c's MODULE_DEPENDs (xdr, acl_nfs4, crypto, zlib) are all in this
+# kernel.
+#
+# MI, so it reaches amd64, arm64 and NEXTBSD-RPI5 (`include NEXTBSD').
+# The build gate in .github/workflows/build.yml (ci/verify-zfs.sh) fails a
+# kernel that lacks it. The world already ships /sbin/zfs and /sbin/zpool
+# built from the same sys/contrib/openzfs, so userland and kernel agree.
+# Not root-on-ZFS and not swap on ZFS: root stays UFS
+# (ROOTDEVNAME above) and the swap-file and dump-file pagers (patches 0082,
+# 0084) stay UFS-only.
+options 	ZFS
+
 # fdescfs -- /dev/fd/N for N > 2 (nextbsd-kernel#60). devfs alone only supplies
 # /dev/fd/{0,1,2}; arbitrary descriptors need fdescfs, which upstream ships as a
 # module and GENERIC does not compile in -- the same module-only trap as FUSEFS
