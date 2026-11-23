@@ -91,6 +91,15 @@ releng/15.1 API and the toolchain triple stays `*-freebsd15.1`. Patch `0075`
 keeps `gone_in()` comparing against 15, so its "To be removed in FreeBSD N"
 notices and `debug.obsolete_panic` behave as on releng/15.1.
 
+Because 2700000 passes every FreeBSD "16 or newer" test, a `__FreeBSD_version`
+gate that picks an API can take a path releng/15.1 doesn't have. Each such
+gate is fixed with a source patch that keeps the releng/15.1 code (no
+build-time defines), as the world and drm-kmod do: `patches/0106` (OpenZFS's
+nvpair.c) is the kernel's. The Claude Code skill
+[`.claude/skills/freebsd-base-bump`](.claude/skills/freebsd-base-bump/SKILL.md)
+has the rule, the audit that finds these gates, every place the base is
+pinned, and the steps for moving to 15.2 or 16.0.
+
 The scheme:
 
 - `27` is the major release while NextBSD is based on releng/15.1; the next
