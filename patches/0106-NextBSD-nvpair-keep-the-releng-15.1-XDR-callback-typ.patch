@@ -1,0 +1,43 @@
+From 21cb61c4d936a849cc47fab8349ad594e3f6b220 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 31 Oct 2026 17:49:46 -0500
+Subject: [PATCH] NextBSD: nvpair: keep the releng/15.1 XDR callback types
+
+nvpair.c picks 2-argument xdrproc_t callbacks when
+__FreeBSD_version >= 1600010 ("FreeBSD 16"). NextBSD's world is the
+releng/15.1 tree, whose <rpc/xdr.h> still declares xdrproc_t as
+bool_t (*)(XDR *, ...). Once NextBSD sets __FreeBSD_version to 2700000,
+the 16.x branch is taken and buildworld fails with
+-Wincompatible-function-pointer-types.
+
+Drop the FreeBSD clause, so only the Linux kernel takes the 2-argument
+branch and NextBSD keeps the variadic releng/15.1 callbacks. At 1501000
+the clause is false, so nothing changes today.
+
+The kernel compiles the same nvpair.c once ZFS is built in (options ZFS),
+so it carries the same change as the world: this is
+nextbsd/nextbsd-freebsd-compat patches/0002, unchanged. Keep the two in
+step.
+
+Refs nextbsd/nextbsd-kernel#376. Carried out-of-tree for NextBSD.
+---
+ sys/contrib/openzfs/module/nvpair/nvpair.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/sys/contrib/openzfs/module/nvpair/nvpair.c b/sys/contrib/openzfs/module/nvpair/nvpair.c
+index 52678bb2b..7f392132f 100644
+--- a/sys/contrib/openzfs/module/nvpair/nvpair.c
++++ b/sys/contrib/openzfs/module/nvpair/nvpair.c
+@@ -3272,8 +3272,7 @@ nvs_xdr_nvl_fini(nvstream_t *nvs)
+  * xdrproc_t-compatible callbacks for xdr_array()
+  */
+ 
+-#if (defined(__FreeBSD_version) && __FreeBSD_version >= 1600010) || \
+-    defined(_KERNEL) && defined(__linux__) /* Linux kernel */
++#if defined(_KERNEL) && defined(__linux__) /* Linux kernel */
+ 
+ #define	NVS_BUILD_XDRPROC_T(type)		\
+ static bool_t					\
+-- 
+2.54.0 (Apple Git-157)
+

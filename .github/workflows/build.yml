@@ -146,6 +146,15 @@ jobs:
           fi
           echo "==> Linuxulator + FUSEFS compiled in (${{ matrix.target }})"
 
+      # Gate: ZFS (options ZFS, FreeBSD's in-tree OpenZFS) is COMPILED INTO the
+      # kernel. Same reasoning as the gate above: no zfs.ko exists anywhere, so
+      # a kernel that lost the option has no ZFS at all and still links. The
+      # NEXTBSD-RPI5 kernel is checked the same way in its own step below.
+      - name: Gate — ZFS is compiled into the kernel
+        run: |
+          "$GITHUB_WORKSPACE/ci/verify-zfs.sh" "${{ matrix.target }}" \
+            "/usr/obj/usr/src/${{ matrix.target }}.${{ matrix.target_arch }}/sys/NEXTBSD"
+
       # arm64 only: build the Pi 500+ bring-up kernel and wrap it in the arm64
       # Linux `Image` boot header, so the Raspberry Pi firmware can load it
       # directly -- no loader, no UEFI. This is the nextbsd-rpi500 native-boot
@@ -224,7 +233,11 @@ jobs:
           else
             echo "note: no nm ($NM) or no kernel ELF ($KELF); opt_global.h check stands alone"
           fi
+          # NEXTBSD-RPI5 includes NEXTBSD, so it carries options ZFS too;
+          # prove it in the kernel the Pi actually boots.
+          "$GITHUB_WORKSPACE/ci/verify-zfs.sh" arm64 "/usr/obj/$KO"
           mkdir -p /tmp/rpi5 && cp "/usr/obj/$KO/kernel.bin" /tmp/rpi5/kernel8.img
+          echo "kernel8.img: $(wc -c < /tmp/rpi5/kernel8.img) bytes"
 
       - name: Upload kernel8.img (arm64 booti image)
         if: matrix.target == 'arm64'
@@ -397,6 +410,12 @@ jobs:
           mkdir -p "$WORK/seed"
           tar -C "$WORK/seed" --strip-components=1 -xzf /tmp/overlays.tar.gz
           export SEED_ROOTFS="$WORK/seed/rootfs"
+          # The on-image ZFS check the smoke test runs (ci/zfs-smoke.sh),
+          # through the shared assembly's EXTRA_ROOTFS hook.
+          mkdir -p "$WORK/extra/usr/tests/nextbsd-kernel"
+          install -m 0755 "$GITHUB_WORKSPACE/ci/zfs-smoke.sh" \
+            "$WORK/extra/usr/tests/nextbsd-kernel/zfs-smoke.sh"
+          export EXTRA_ROOTFS="$WORK/extra"
           # The SHARED assembly (nextbsd-ci, pinned above) replaces this repo's
           # vendored ci/ copy (nextbsd#376): one recipe for every consumer.
           sh nextbsd-ci/scripts/assemble-image.sh
@@ -466,37 +485,53 @@ jobs:
           ref: v0.3.9
           path: nextbsd-ci
 
+      # ci/zfs-smoke.sh and ci/smoke-overlay.sh, from this PR's commit.
+      - name: Checkout nextbsd-kernel (smoke-test scripts)
+        uses: actions/checkout@v4
+        with:
+          path: kernel-src
+          sparse-checkout: ci
+
       # A KERNEL smoke-test gates on "does THIS kernel boot" (reached login), NOT
       # on the flaky post-login userland markers (#369; userland's own CI runs
-      # them non-gating for the same reason). NB_LOGIN_ONLY=1: the harness boots
-      # -> logs in -> confirms a clean end-state -> powers off, and runs NO on-image
-      # suite (the kernel image ships no sentinel suite). It also skips the marker
-      # absence check (the kernel image runs no suite), so a clean login+poweroff
-      # is exit 0. The harness writes its transcript to boot-test.log.
+      # them non-gating for the same reason), plus the one thing only a booted
+      # kernel can show: that the ZFS compiled into it works. The harness boots
+      # -> logs in -> runs ONE on-image suite, /usr/tests/nextbsd-kernel/
+      # zfs-smoke.sh (ci/zfs-smoke.sh, baked in by the assembly step's
+      # EXTRA_ROOTFS): a file-backed pool, a dataset, export/import, a scrub
+      # -> confirms a clean end-state -> powers off. ci/smoke-overlay.sh makes
+      # its ZFS-* markers the only must-pass ones (the userland suites' markers
+      # become warn: this image does not run them). The harness writes its
+      # transcript to boot-test.log.
       - name: Boot test (this kernel, self-assembled image)
         id: boottest
         continue-on-error: true
         env:
           ARCH: amd64
-          NB_LOGIN_ONLY: '1'
+          NB_SUITE: /usr/tests/nextbsd-kernel/zfs-smoke.sh
         run: |
           set +e
-          sh nextbsd-ci/harness/boot-test.sh disk.img
+          sh kernel-src/ci/smoke-overlay.sh nextbsd-ci "$PWD/smoke-overlay.tsv" || exit 1
+          NB_OVERLAY="$PWD/smoke-overlay.tsv" sh nextbsd-ci/harness/boot-test.sh disk.img
           rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
+      - name: ZFS runtime check (zfs-smoke.sh transcript)
+        if: always()
+        run: grep -aE 'zfs-smoke:|ZFS-[A-Z-]+-(OK|FAIL)|NEXTBSD-TEST-SUMMARY' boot-test.log | tr -d '\r' || echo "no zfs-smoke output in boot-test.log"
+
       # Gate on the harness exit class, not a hand-rolled serial grep. The harness's
       # own login detection (login.exp.inc) reaches the same "this kernel booted to
       # a console session" conclusion the old grep did, and it also catches the #428
       # class the grep could not (a login that holds for a moment, then the system
-      # resets: end-state lost, exit 2). Login-only runs no suite, so a non-zero rc
-      # is a real kernel regression (panic / never-reached-login / lost end-state),
-      # not a flaky post-login userland marker.
+      # resets: end-state lost, exit 2). The only suite is zfs-smoke.sh, so a
+      # non-zero rc is a real kernel regression (panic / never-reached-login /
+      # lost end-state / a ZFS-* failure), not a flaky post-login userland marker.
       - name: Gate — kernel booted clean (harness exit class)
         if: always() && steps.boottest.outputs.rc != '0'
         run: |
-          echo "BOOT-GATE-FAIL: this kernel did not boot clean (harness rc=${{ steps.boottest.outputs.rc }})." >&2
-          echo "  rc 2 = never reached login / end-state lost; rc 1 = a kernel panic." >&2
+          echo "BOOT-GATE-FAIL: this kernel did not boot clean, or its ZFS check failed (harness rc=${{ steps.boottest.outputs.rc }})." >&2
+          echo "  rc 2 = never reached login / suite hung / end-state lost; rc 1 = a kernel panic or a ZFS-* marker failed." >&2
           echo "  See the uploaded serial transcript (boot-test.log)." >&2
           exit 1
 
@@ -510,12 +545,12 @@ jobs:
 
   # arm64 counterpart of the job above. Same contract: boot the disk.img the
   # build job self-assembled from THIS kernel, gate on reaching the getty login
-  # prompt, never gate `publish`.
+  # prompt and on the ZFS suite (zfs-smoke.sh), never gate `publish`.
   #
   # On the shared nextbsd-ci harness @v0.3.6 (pinned tag) like the amd64 sibling
-  # above -- the T4 lockstep now covers BOTH arches. NB_LOGIN_ONLY=1: the kernel
-  # image ships no sentinel suite, so the harness boots -> logs in -> confirms a
-  # clean end-state -> powers off, and the gate is the harness exit class. The
+  # above -- the T4 lockstep now covers BOTH arches. The harness boots -> logs
+  # in -> runs zfs-smoke.sh -> confirms a clean end-state -> powers off, and
+  # the gate is the harness exit class. The
   # shared harness's login detection probes for a shell (NB-SHELL-READY), which
   # fixes the old self-contained expect's autologin->shell 30-min hang.
   #
@@ -548,9 +583,7 @@ jobs:
       # the firmware, the loader un-mute, the login/shell detection (with the
       # NB-SHELL-READY probe the old self-contained expect lacked -- the fix for
       # the autologin->shell 30-min hang), and the teardown all come from one
-      # place now. NB_LOGIN_ONLY: the kernel image ships no sentinel suite, so
-      # the harness boots -> logs in -> confirms a clean end-state -> powers off;
-      # the exit class is the gate. (The old self-contained expect's
+      # place now. The exit class is the gate. (The old self-contained expect's
       # VT/virtio-gpu->drmfb console-handover arm is dropped with it; it is a
       # nice-to-have, not the boot gate, and the shared harness lacks it.)
       - name: Checkout nextbsd-ci shared boot harness (pinned tag)
@@ -560,18 +593,31 @@ jobs:
           ref: v0.3.9
           path: nextbsd-ci
 
+      - name: Checkout nextbsd-kernel (smoke-test scripts)
+        uses: actions/checkout@v4
+        with:
+          path: kernel-src
+          sparse-checkout: ci
+
+      # Same suite as amd64: zfs-smoke.sh, with the ZFS-* markers the only
+      # must-pass ones (ci/smoke-overlay.sh).
       - name: Boot test (this kernel, self-assembled arm64 image)
         id: boottest
         continue-on-error: true
         env:
           ARCH: arm64
-          NB_LOGIN_ONLY: '1'
+          NB_SUITE: /usr/tests/nextbsd-kernel/zfs-smoke.sh
         run: |
           set +e
-          sh nextbsd-ci/harness/boot-test.sh disk.img
+          sh kernel-src/ci/smoke-overlay.sh nextbsd-ci "$PWD/smoke-overlay.tsv" || exit 1
+          NB_OVERLAY="$PWD/smoke-overlay.tsv" sh nextbsd-ci/harness/boot-test.sh disk.img
           rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
+
+      - name: ZFS runtime check (zfs-smoke.sh transcript)
+        if: always()
+        run: grep -aE 'zfs-smoke:|ZFS-[A-Z-]+-(OK|FAIL)|NEXTBSD-TEST-SUMMARY' boot-test.log | tr -d '\r' || echo "no zfs-smoke output in boot-test.log"
 
       # Gate on the harness exit class (same as the amd64 sibling): exit 0 =
       # reached login + clean end-state; exit 2 = never booted to login (the
@@ -580,8 +626,8 @@ jobs:
       - name: Gate — kernel booted clean (harness exit class)
         if: always() && steps.boottest.outputs.rc != '0'
         run: |
-          echo "BOOT-GATE-FAIL: this arm64 kernel did not boot clean (harness rc=${{ steps.boottest.outputs.rc }})." >&2
-          echo "  rc 2 = never reached login / end-state lost; rc 1 = a kernel panic." >&2
+          echo "BOOT-GATE-FAIL: this arm64 kernel did not boot clean, or its ZFS check failed (harness rc=${{ steps.boottest.outputs.rc }})." >&2
+          echo "  rc 2 = never reached login / suite hung / end-state lost; rc 1 = a kernel panic or a ZFS-* marker failed." >&2
           echo "  See the uploaded serial transcript (boot-test.log)." >&2
           exit 1
 

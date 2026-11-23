@@ -19,8 +19,25 @@ abi/
 ci/
   prepare-src.sh  # all source preparation (see below)
   package-sdk.sh  # the kernel SDK
+  verify-zfs.sh   # build gate: ZFS is compiled into the kernel
+  zfs-smoke.sh    # on-image ZFS check the PR smoke tests run
+  smoke-overlay.sh  # nextbsd-ci manifest overlay for that check
 .github/workflows/build.yml
 ```
+
+## ZFS
+
+ZFS is compiled into the kernel (`options ZFS` in `config/NEXTBSD`) on amd64,
+arm64 and NEXTBSD-RPI5. It is FreeBSD's own OpenZFS, the copy in the
+releng/15.1 tree this kernel builds (`sys/contrib/openzfs`), unmodified: no
+fork, no OpenZFS from elsewhere, no `zfs.ko` and no kext. The world's
+`/sbin/zfs` and `/sbin/zpool` come from the same source. Root stays UFS
+(`ROOTDEVNAME`), and the swap-file and dump-file pagers stay UFS-only.
+
+The build fails if ZFS is not in a kernel (`ci/verify-zfs.sh`: its objects,
+its symbols and its arch assembly, for NEXTBSD and NEXTBSD-RPI5). The PR smoke
+tests boot each arch and run `ci/zfs-smoke.sh` on the image: a file-backed
+pool, a dataset with a write and a snapshot, export, import, scrub.
 
 ## Source preparation
 
@@ -43,7 +60,8 @@ script, not in a workflow step.
   workflow: rebuilds and publishes the kernel on the `<arch>-latest` image. It
   does **not** rebuild the kexts; run the chain by hand when a merge should
   reach them.
-- `pull_request`: build and boot test only, never publishes or dispatches.
+- `pull_request`: build and boot test (with the ZFS check above) only, never
+  publishes or dispatches.
 - `workflow_dispatch`: manual; publishes but does not dispatch.
 
 A new push to a PR cancels that PR's previous run. Runs on `main` queue.
@@ -72,6 +90,15 @@ so a kext built at 1501000 refuses this kernel. The kext builds run
 releng/15.1 API and the toolchain triple stays `*-freebsd15.1`. Patch `0075`
 keeps `gone_in()` comparing against 15, so its "To be removed in FreeBSD N"
 notices and `debug.obsolete_panic` behave as on releng/15.1.
+
+Because 2700000 passes every FreeBSD "16 or newer" test, a `__FreeBSD_version`
+gate that picks an API can take a path releng/15.1 doesn't have. Each such
+gate is fixed with a source patch that keeps the releng/15.1 code (no
+build-time defines), as the world and drm-kmod do: `patches/0106` (OpenZFS's
+nvpair.c) is the kernel's. The Claude Code skill
+[`.claude/skills/freebsd-base-bump`](.claude/skills/freebsd-base-bump/SKILL.md)
+has the rule, the audit that finds these gates, every place the base is
+pinned, and the steps for moving to 15.2 or 16.0.
 
 The scheme:
 
