@@ -174,6 +174,12 @@ PE_init_console(int mode)
 	pe_requested_display = mode == GRAPHICS_MODE ? GRAPHICS_MODE :
 	    FB_TEXT_MODE;
 	loader = pe_video_from_loader(&PE_state.video);
+	printf("pe_diag: init_console mode %d loader %d bv %p base %#jx "
+	    "%lux%lu rowbytes %lu depth %lu serial %d howto %#x\n", mode,
+	    loader, PE_state.boot_video, (uintmax_t)PE_state.video.v_baseAddr,
+	    PE_state.video.v_width, PE_state.video.v_height,
+	    PE_state.video.v_rowBytes, PE_state.video.v_depth,
+	    PE_serial_console_requested(), boothowto);
 	if (loader != GRAPHICS_MODE)
 		mode = FB_TEXT_MODE;
 	if (mode != GRAPHICS_MODE)
@@ -264,6 +270,9 @@ PE_late_console_fb(struct fb_info *fb)
 {
 	PE_Video v;
 
+	printf("pe_diag: late_console_fb %s pbase %#jx\n",
+	    fb != NULL ? fb->fb_name : "-",
+	    fb != NULL ? (uintmax_t)fb->fb_pbase : 0);
 	if (!PE_state.initialized || fb == NULL ||
 	    pe_requested_display != GRAPHICS_MODE ||
 	    pe_boot_display == GRAPHICS_MODE ||

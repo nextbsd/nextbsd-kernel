@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Tue, 24 Nov 2026 05:36:27 -0600
+Subject: [PATCH] DIAG (not for merge): vt(4) logs its first text draws and fb
+ blanks
+
+Temporary diagnostic for nextbsd/nextbsd#542: on a Raspberry Pi 500+
+booted through U-Boot and loader.efi a text cursor shows where the boot
+splash should be. Log, to the message buffer, the first eight times
+vt_flush() draws text and every vt_fb_init() blank decision.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/dev/vt/hw/fb/vt_fb.c |  8 +++++++-
+ sys/dev/vt/vt_core.c     | 12 ++++++++++++
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/sys/dev/vt/hw/fb/vt_fb.c b/sys/dev/vt/hw/fb/vt_fb.c
+index b61277568..170fbb34a 100644
+--- a/sys/dev/vt/hw/fb/vt_fb.c
++++ b/sys/dev/vt/hw/fb/vt_fb.c
+@@ -558,8 +558,14 @@ vt_fb_init(struct vt_device *vd)
+ 	 * vt_replace_backend() has the platform expert paint the splash
+ 	 * into it before vd_postswitch shows it.
+ 	 */
+-	if (!PE_boot_console_fb(info) && !PE_graphics_console_active())
++	if (!PE_boot_console_fb(info) && !PE_graphics_console_active()) {
++		/* TEMPORARY #542 diagnostic, not for merge. */
++		printf("pe_diag: vt_fb_init blanks %s pbase %#jx\n",
++		    vd->vd_driver->vd_name, (uintmax_t)info->fb_pbase);
+ 		vd->vd_driver->vd_blank(vd, c);
++	} else
++		printf("pe_diag: vt_fb_init keeps %s pbase %#jx\n",
++		    vd->vd_driver->vd_name, (uintmax_t)info->fb_pbase);
+ 
+ 	/* Wakeup screen. KMS need this. */
+ 	vt_fb_postswitch(vd);
+diff --git a/sys/dev/vt/vt_core.c b/sys/dev/vt/vt_core.c
+index 5d6167e63..ca5f6db23 100644
+--- a/sys/dev/vt/vt_core.c
++++ b/sys/dev/vt/vt_core.c
+@@ -1540,6 +1540,18 @@ vt_flush(struct vt_device *vd)
+ 	if (vt_pe_graphics(vd))
+ 		return (0);
+ 
++	/* TEMPORARY #542 diagnostic: the first text draws, not for merge. */
++	{
++		static u_int pe_diag_draws;
++
++		if (pe_diag_draws < 8) {
++			pe_diag_draws++;
++			printf("pe_diag: vt_flush draws #%u on %s flags %#x\n",
++			    pe_diag_draws, vd->vd_driver->vd_name,
++			    vd->vd_flags);
++		}
++	}
++
+ 	vf = vw->vw_font;
+ 	if (((vd->vd_flags & VDF_TEXTMODE) == 0) && (vf == NULL))
+ 		return (0);
+-- 
+2.54.0 (Apple Git-157)
+

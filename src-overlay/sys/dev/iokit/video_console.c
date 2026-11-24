@@ -392,10 +392,18 @@ vc_paint_boot_graphics(struct fb_info *fb)
 	u_int step;
 
 	if (fb == NULL || vc_fmt_from_fb(fb, &f) != 0 ||
-	    (fb->fb_flags & FB_FLAG_NOWRITE) != 0 || vc_panicked)
+	    (fb->fb_flags & FB_FLAG_NOWRITE) != 0 || vc_panicked) {
+		printf("pe_diag: paint skipped fb %p\n", fb);
 		return;
+	}
 	vc_geometry(fb->fb_width, fb->fb_height, &g);
+	printf("pe_diag: paint %s pbase %#jx scale %u logo %u,%u %ux%u "
+	    "spinner %u,%u %u bg %#x\n", fb->fb_name,
+	    (uintmax_t)fb->fb_pbase, g.scale, g.lx, g.ly, g.lw, g.lh, g.sx,
+	    g.sy, g.sd, PE_state.bg_rgb);
 	vc_build_lut(&f, lut);
+	printf("pe_diag: lut0 %#x lut128 %#x lut255 %#x fg %#x\n", lut[0],
+	    lut[128], lut[255], PE_state.fg_rgb);
 	vc_fill(fb, &f, lut[0]);
 	vc_paint_logo(fb, &f, &g, PE_state.bg_rgb);
 	flush = NULL;
@@ -614,8 +622,24 @@ vc_set_fb(struct fb_info *fb)
 	struct vc_geom g;
 	uint32_t lut[256];
 
-	if (fb != NULL && vc_fmt_from_fb(fb, &f) != 0)
-		fb = NULL;
+	if (fb != NULL) {
+		int fe = vc_fmt_from_fb(fb, &f);
+
+		printf("pe_diag: set_fb %s pbase %#jx vbase %#jx %dx%d bpp %d "
+		    "depth %d stride %d rgboffs %d/%d/%d fmt %d", fb->fb_name,
+		    (uintmax_t)fb->fb_pbase, (uintmax_t)fb->fb_vbase,
+		    fb->fb_width, fb->fb_height, fb->fb_bpp, fb->fb_depth,
+		    fb->fb_stride, fb->fb_rgboffs.red, fb->fb_rgboffs.green,
+		    fb->fb_rgboffs.blue, fe);
+		if (fe == 0)
+			printf(" -> %uB r%u@%u g%u@%u b%u@%u\n", f.bytespp,
+			    f.rb, f.ro, f.gb, f.go, f.bb, f.bo);
+		else
+			printf("\n");
+		if (fe != 0)
+			fb = NULL;
+	} else
+		printf("pe_diag: set_fb NULL\n");
 	if (fb != NULL) {
 		vc_geometry(fb->fb_width, fb->fb_height, &g);
 		vc_build_lut(&f, lut);
@@ -633,6 +657,9 @@ vc_set_fb(struct fb_info *fb)
 void
 vc_console_fb(struct fb_info *fb, int op)
 {
+	printf("pe_diag: console_fb op %d %s pbase %#jx\n", op,
+	    fb != NULL ? fb->fb_name : "-",
+	    fb != NULL ? (uintmax_t)fb->fb_pbase : 0);
 	switch (op) {
 	case kPEBaseAddressChange:
 	case kPEEnableScreen:
@@ -656,6 +683,14 @@ vc_console_fb(struct fb_info *fb, int op)
 bool
 PE_boot_console_fb(struct fb_info *fb)
 {
+	printf("pe_diag: boot_console_fb %s pbase %#jx %dx%d; video base %#jx "
+	    "%lux%lu disp %d gboot %d desire_text %d acq %d rel %d vc_fb %p\n",
+	    fb != NULL ? fb->fb_name : "-",
+	    fb != NULL ? (uintmax_t)fb->fb_pbase : 0,
+	    fb != NULL ? fb->fb_width : 0, fb != NULL ? fb->fb_height : 0,
+	    (uintmax_t)PE_state.video.v_baseAddr, PE_state.video.v_width,
+	    PE_state.video.v_height, PE_boot_display(), gc_graphics_boot,
+	    gc_desire_text, gc_acquired, vc_released, vc_fb);
 	if (PE_boot_display() != GRAPHICS_MODE || !gc_graphics_boot ||
 	    gc_desire_text || gc_acquired || vc_released || vc_fb != NULL ||
 	    vc_panicked || fb == NULL)
@@ -698,6 +733,9 @@ initialize_screen(PE_Video *info, unsigned int op)
 	}
 
 	graphics_now = gc_graphics_boot && !gc_desire_text;
+	printf("pe_diag: op %u info %p gboot %d desire_text %d acq %d rel %d "
+	    "text_disabled %d\n", op, info, gc_graphics_boot, gc_desire_text,
+	    gc_acquired, vc_released, vc_text_disabled);
 	switch (op) {
 	case kPEGraphicsMode:
 		gc_graphics_boot = true;

@@ -45,3 +45,5 @@ dev/iokit/iokit_pmroot.c	standard
 # `standard`: it must exist at cninit, before any kext loads.
 dev/iokit/iokit_platform.c	standard
 dev/iokit/video_console.c	standard
+# TEMPORARY #542 diagnostics, not for merge.
+dev/iokit/pe_diag.c	standard
