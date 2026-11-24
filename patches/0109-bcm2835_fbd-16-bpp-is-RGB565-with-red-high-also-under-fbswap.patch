@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Tue, 24 Nov 2026 06:18:03 -0600
+Subject: [PATCH] bcm2835_fbd: 16 bpp is RGB565 with red high, also under
+ fbswap
+
+The 16 bpp case under fbswap put red in the low bits, by analogy with
+the 24 bpp case, and was marked unverified on hardware. On a Raspberry
+Pi 500+ the HVS scans this framebuffer out as HVS_PIXEL_FORMAT_RGB565
+with pixel order XRGB (DRM_FORMAT_RGB565, red in bits 15:11), and
+U-Boot's EFI GOP packs it the same way. With red low, everything the
+kernel drew there had red and blue swapped: the console's colours and
+NextBSD's boot splash, whose cube came out brown instead of blue-grey
+right after the loader had drawn it correctly.
+
+Part of nextbsd/nextbsd#542 (nextbsd-kernel#433).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/arm/broadcom/bcm2835/bcm2835_fbd.c | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_fbd.c b/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
+index dfcb587fc..6a7ab3188 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
+@@ -229,15 +229,14 @@ bcm_fb_setup_fbd(struct bcmsc_softc *sc)
+ 			/*
+ 			 * RGB565. Reached when the firmware would not restructure
+ 			 * the framebuffer and we fell back to the depth its
+-			 * stride implies. Channel order is the one the 24bpp case
+-			 * below uses -- red in the low bits under fbswap -- and is
+-			 * unverified on hardware: if red and blue come out
+-			 * swapped, exchange the two 0x1f entries. Geometry is
+-			 * correct either way, so the console is readable
+-			 * regardless.
++			 * stride implies. Red is in the high bits even under
++			 * fbswap: measured on a Raspberry Pi 500+, the HVS scans
++			 * this buffer out as HVS_PIXEL_FORMAT_RGB565 with pixel
++			 * order XRGB (DRM_FORMAT_RGB565), and U-Boot's GOP packs
++			 * it the same way.
+ 			 */
+ 			vt_config_cons_colors(&sc->info,
+-			    COLOR_FORMAT_RGB, 0x1f, 0, 0x3f, 5, 0x1f, 11);
++			    COLOR_FORMAT_RGB, 0x1f, 11, 0x3f, 5, 0x1f, 0);
+ 			sc->info.fb_cmsize = 16;
+ 			break;
+ 		case 24:
+-- 
+2.54.0 (Apple Git-157)
+
