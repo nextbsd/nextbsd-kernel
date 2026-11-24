@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Mon, 23 Nov 2026 22:05:20 -0600
+Subject: [PATCH] bcm2712_sdhci: attach the BCM2712 SD host controller
+
+The Pi 5 family's SD controllers (mmc@fff000, the microSD slot, and
+mmc@1100000, the SDIO Wi-Fi) are "brcm,bcm2712-sdhci", which nothing
+matched, so the kernel never saw a microSD card and could not boot from
+one (nextbsd-kernel#100, #213).
+
+The block is a standard SDHCI behind Broadcom's brcmstb wrapper, so this
+is a small subclass of sdhci_fdt, like the Rockchip and Xilinx ones. It
+adds what sdhci_fdt can't know:
+
+- card detect: the wrapper's cfg region (reg[1]) routes the native CD
+  input to the slot's pin, or forces "present" for a non-removable slot;
+- vmmc-supply is enabled and held, so regulator_shutdown() can't switch
+  the card's power off under it;
+- the base clock comes from the node's clock (200 MHz), not from the
+  capabilities register.
+
+No UHS: sdhci_fdt has no switch_vccq method, so cards run at 3.3 V high
+speed (50 MHz), the same speed the Pi firmware uses.
+---
+ sys/arm/broadcom/bcm2835/bcm2712_sdhci.c | 188 +++++++++++++++++++++++
+ sys/conf/files.arm64                     |   1 +
+ 2 files changed, 189 insertions(+)
+ create mode 100644 sys/arm/broadcom/bcm2835/bcm2712_sdhci.c
+
+diff --git a/sys/arm/broadcom/bcm2835/bcm2712_sdhci.c b/sys/arm/broadcom/bcm2835/bcm2712_sdhci.c
+new file mode 100644
+index 000000000..d3971c874
+--- /dev/null
++++ b/sys/arm/broadcom/bcm2835/bcm2712_sdhci.c
+@@ -0,0 +1,188 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * SD host controller of the BCM2712 (Raspberry Pi 5 family).
++ *
++ * The block is a standard SDHCI behind Broadcom's "brcmstb" wrapper. reg[0]
++ * ("host") is the SDHCI register file and reg[1] ("cfg") is the wrapper,
++ * which decides where the controller's card-detect input comes from. Only
++ * that one wrapper register needs touching; sdhci_fdt does everything else.
++ * This subclass adds the three things sdhci_fdt can't know:
++ *
++ *  - card detect: route the controller's native CD input to the slot's pin,
++ *    or force "present" for a non-removable slot (the SDIO Wi-Fi);
++ *  - the card's supply (vmmc-supply), enabled and held so regulator_shutdown()
++ *    can't switch it off under a mounted card;
++ *  - the real base clock, taken from the node's clock rather than from the
++ *    capabilities register.
++ *
++ * There is no 1.8 V signalling: sdhci_fdt has no switch_vccq method, so
++ * sdhci(4) never offers UHS and the card runs at 3.3 V high speed (50 MHz).
++ * UHS needs the vqmmc-supply GPIO regulator and tuning, which are not here.
++ *
++ * The wrapper's register layout is the one U-Boot's bcmstb_sdhci.c and
++ * Linux's sdhci-brcmstb.c program.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/module.h>
++#include <sys/mutex.h>
++#include <sys/resource.h>
++#include <sys/rman.h>
++#include <sys/taskqueue.h>
++
++#include <machine/bus.h>
++#include <machine/resource.h>
++
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++#include <dev/ofw/openfirm.h>
++
++#include <dev/clk/clk.h>
++#include <dev/phy/phy.h>
++#include <dev/regulator/regulator.h>
++#include <dev/syscon/syscon.h>
++
++#include <dev/mmc/bridge.h>
++
++#include <dev/sdhci/sdhci.h>
++#include <dev/sdhci/sdhci_fdt.h>
++
++#include "mmcbr_if.h"
++#include "sdhci_if.h"
++
++#define	SDIO_CFG_CTRL			0x00
++#define	 SDIO_CFG_CTRL_SDCD_N_TEST_EN	(1U << 31)
++#define	 SDIO_CFG_CTRL_SDCD_N_TEST_LEV	(1U << 30)
++#define	SDIO_CFG_SD_PIN_SEL		0x44
++#define	 SDIO_CFG_SD_PIN_SEL_MASK	0x3
++#define	 SDIO_CFG_SD_PIN_SEL_CARD	(1U << 1)
++
++struct bcm2712_sdhci_softc {
++	struct sdhci_fdt_softc	fdt;	/* must be first: sdhci_fdt's softc */
++	u_int			base_mhz;
++	regulator_t		vmmc;
++};
++
++static struct ofw_compat_data compat_data[] = {
++	{ "brcm,bcm2712-sdhci",	1 },
++	{ NULL,			0 }
++};
++
++static int
++bcm2712_sdhci_probe(device_t dev)
++{
++	struct sdhci_fdt_softc *sc = device_get_softc(dev);
++
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
++		return (ENXIO);
++
++	sc->quirks = 0;
++	device_set_desc(dev, "BCM2712 SDHCI controller");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static void
++bcm2712_sdhci_route_cd(device_t dev, phandle_t node)
++{
++	struct resource *cfg;
++	uint32_t reg;
++	int rid;
++
++	rid = 1;
++	cfg = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
++	if (cfg == NULL) {
++		device_printf(dev, "no cfg registers, card detect unchanged\n");
++		return;
++	}
++	if (OF_hasprop(node, "non-removable") ||
++	    OF_hasprop(node, "broken-cd")) {
++		/* Force presence: SDCD_N is active low. */
++		reg = bus_read_4(cfg, SDIO_CFG_CTRL);
++		reg &= ~SDIO_CFG_CTRL_SDCD_N_TEST_LEV;
++		reg |= SDIO_CFG_CTRL_SDCD_N_TEST_EN;
++		bus_write_4(cfg, SDIO_CFG_CTRL, reg);
++	} else {
++		/* Take card detect from the slot's CD pin. */
++		reg = bus_read_4(cfg, SDIO_CFG_SD_PIN_SEL);
++		reg &= ~SDIO_CFG_SD_PIN_SEL_MASK;
++		reg |= SDIO_CFG_SD_PIN_SEL_CARD;
++		bus_write_4(cfg, SDIO_CFG_SD_PIN_SEL, reg);
++	}
++	bus_release_resource(dev, SYS_RES_MEMORY, rid, cfg);
++}
++
++static int
++bcm2712_sdhci_attach(device_t dev)
++{
++	struct bcm2712_sdhci_softc *sc = device_get_softc(dev);
++	phandle_t node;
++	clk_t clk;
++	uint64_t freq;
++	int err;
++
++	node = ofw_bus_get_node(dev);
++
++	if (clk_get_by_ofw_index(dev, node, 0, &clk) == 0) {
++		if (clk_enable(clk) != 0)
++			device_printf(dev, "cannot enable clock\n");
++		if (clk_get_freq(clk, &freq) == 0)
++			sc->base_mhz = freq / 1000000;
++	}
++	if (sc->base_mhz == 0)
++		device_printf(dev, "no clock rate, trusting capabilities\n");
++
++	if (regulator_get_by_ofw_property(dev, node, "vmmc-supply",
++	    &sc->vmmc) == 0) {
++		err = regulator_enable(sc->vmmc);
++		if (err != 0)
++			device_printf(dev, "cannot enable vmmc-supply: %d\n",
++			    err);
++	}
++
++	bcm2712_sdhci_route_cd(dev, node);
++
++	return (sdhci_fdt_attach(dev));
++}
++
++static uint32_t
++bcm2712_sdhci_read_4(device_t dev, struct sdhci_slot *slot, bus_size_t off)
++{
++	struct bcm2712_sdhci_softc *sc = device_get_softc(dev);
++	uint32_t val, base;
++
++	val = bus_read_4(sc->fdt.mem_res[slot->num], off);
++	if (off == SDHCI_CAPABILITIES && sc->base_mhz != 0) {
++		base = (val & SDHCI_CLOCK_V3_BASE_MASK) >>
++		    SDHCI_CLOCK_BASE_SHIFT;
++		if (bootverbose && base != sc->base_mhz)
++			device_printf(dev, "base clock %u MHz, not %u\n",
++			    sc->base_mhz, base);
++		val &= ~SDHCI_CLOCK_V3_BASE_MASK;
++		val |= (sc->base_mhz << SDHCI_CLOCK_BASE_SHIFT) &
++		    SDHCI_CLOCK_V3_BASE_MASK;
++	}
++	return (val);
++}
++
++static device_method_t bcm2712_sdhci_methods[] = {
++	/* device_if */
++	DEVMETHOD(device_probe,		bcm2712_sdhci_probe),
++	DEVMETHOD(device_attach,	bcm2712_sdhci_attach),
++
++	/* SDHCI registers accessors */
++	DEVMETHOD(sdhci_read_4,		bcm2712_sdhci_read_4),
++
++	DEVMETHOD_END
++};
++extern driver_t sdhci_fdt_driver;
++
++DEFINE_CLASS_1(sdhci_bcm2712, bcm2712_sdhci_driver, bcm2712_sdhci_methods,
++    sizeof(struct bcm2712_sdhci_softc), sdhci_fdt_driver);
++DRIVER_MODULE(sdhci_bcm2712, simplebus, bcm2712_sdhci_driver, NULL, NULL);
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index 6f190a642..3b8e01742 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -600,6 +600,7 @@ arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci | \
+ 	soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/bcm2712_l2intc.c			optional soc_brcm_bcm2712 fdt
+ arm/broadcom/bcm2835/bcm2712_mip.c			optional soc_brcm_bcm2712 fdt pci
++arm/broadcom/bcm2835/bcm2712_sdhci.c			optional soc_brcm_bcm2712 sdhci fdt regulator clk
+ arm/broadcom/bcm2835/rp1.c				optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1_clk.c				optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1_gpio.c				optional soc_brcm_bcm2712 gpio fdt pci
+-- 
+2.54.0 (Apple Git-157)
+
