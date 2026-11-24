@@ -680,9 +680,12 @@ vc_console_fb(struct fb_info *fb, int op)
 	}
 }
 
+void	pe_diag_snap(const struct fb_info *fb);	/* TEMPORARY #542 */
+
 bool
 PE_boot_console_fb(struct fb_info *fb)
 {
+	pe_diag_snap(fb);	/* TEMPORARY #542: the loader's splash */
 	printf("pe_diag: boot_console_fb %s pbase %#jx %dx%d; video base %#jx "
 	    "%lux%lu disp %d gboot %d desire_text %d acq %d rel %d vc_fb %p\n",
 	    fb != NULL ? fb->fb_name : "-",
