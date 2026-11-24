@@ -22,17 +22,17 @@ adds what sdhci_fdt can't know:
 No UHS: sdhci_fdt has no switch_vccq method, so cards run at 3.3 V high
 speed (50 MHz), the same speed the Pi firmware uses.
 ---
- sys/arm/broadcom/bcm2835/bcm2712_sdhci.c | 186 +++++++++++++++++++++++
+ sys/arm/broadcom/bcm2835/bcm2712_sdhci.c | 188 +++++++++++++++++++++++
  sys/conf/files.arm64                     |   1 +
- 2 files changed, 187 insertions(+)
+ 2 files changed, 189 insertions(+)
  create mode 100644 sys/arm/broadcom/bcm2835/bcm2712_sdhci.c
 
 diff --git a/sys/arm/broadcom/bcm2835/bcm2712_sdhci.c b/sys/arm/broadcom/bcm2835/bcm2712_sdhci.c
 new file mode 100644
-index 000000000..83ebf330f
+index 000000000..d3971c874
 --- /dev/null
 +++ b/sys/arm/broadcom/bcm2835/bcm2712_sdhci.c
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,188 @@
 +/*-
 + * SPDX-License-Identifier: BSD-2-Clause
 + *
@@ -78,7 +78,9 @@ index 000000000..83ebf330f
 +#include <dev/ofw/openfirm.h>
 +
 +#include <dev/clk/clk.h>
++#include <dev/phy/phy.h>
 +#include <dev/regulator/regulator.h>
++#include <dev/syscon/syscon.h>
 +
 +#include <dev/mmc/bridge.h>
 +
