@@ -99,4 +99,5 @@
 0106-NextBSD-nvpair-keep-the-releng-15.1-XDR-callback-typ.patch
 0107-NextBSD-spl_taskq-no-TSD-for-a-taskq-started-before-.patch
 0108-bcm2712_sdhci-attach-the-BCM2712-SD-host-controller.patch
-0109-DIAG-vt-logs-text-draws-and-blanks.patch
+0109-bcm2835_fbd-16-bpp-is-RGB565-with-red-high-also-under-fbswap.patch
+0110-DIAG-vt-logs-text-draws-and-blanks.patch
