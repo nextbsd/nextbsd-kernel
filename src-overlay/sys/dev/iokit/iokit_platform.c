@@ -258,16 +258,29 @@ pe_video_from_fb(PE_Video *v, const struct fb_info *fb)
  * first vd_init on it then sends kPEAcquireScreen (PE_boot_console_fb()),
  * which paints the compiled-in splash and starts the spinner. The style
  * is the compiled-in kenv (config/rpi5.env), read at cninit.
+ *
+ * virtio_gpu(4) calls it too, for a virtio-gpu VM: the loader asked for
+ * graphics and painted the splash through the firmware's blit-only GOP, but
+ * had no linear framebuffer to hand over, so its record carries none.
  */
 void
 PE_late_console_fb(struct fb_info *fb)
 {
+	const struct nbsd_boot_video *bv;
 	PE_Video v;
 
+	/*
+	 * A loader boot video record is only no obstacle when it asked for
+	 * graphics and had no framebuffer to give (virtio-gpu: the firmware's
+	 * GOP is blit-only, or there is none); virtio_gpu(4) then brings the
+	 * framebuffer here, as bcm2835_fbd(4) does on a loader-less Pi.
+	 */
+	bv = PE_state.boot_video;
 	if (!PE_state.initialized || fb == NULL ||
 	    pe_requested_display != GRAPHICS_MODE ||
 	    pe_boot_display == GRAPHICS_MODE ||
-	    PE_state.boot_video != NULL || PE_state.video.v_baseAddr != 0)
+	    (bv != NULL && (bv->v_display != NBSD_BOOT_VIDEO_GRAPHICS ||
+	    bv->v_baseAddr != 0)) || PE_state.video.v_baseAddr != 0)
 		return;
 	if ((boothowto & (RB_SINGLE | RB_VERBOSE | RB_ASKNAME | RB_SERIAL |
 	    RB_MULTIPLE)) != 0 || PE_serial_console_requested())
