@@ -702,6 +702,13 @@ jobs:
           # has not yet moved to rpi5-kernel8-arm64.img keeps building. Delete
           # once nextbsd#414 and its follow-up have landed.
           cp out/rpi5-kernel8-arm64.img out/rpi500-kernel8-arm64.img
+          # The same NEXTBSD-RPI5 kernel as an ELF, for the U-Boot -> loader.efi
+          # path (nextbsd/nextbsd#687): the loader reads it from
+          # /boot/kernel.RPI5/kernel in the root file system, and nextbsd-pkg
+          # packages it there so pkg upgrade updates the kernel a Pi boots (#435).
+          find artifacts -path '*rpi5-kernel-elf-arm64/kernel' -exec cp {} out/rpi5-kernel-arm64.elf \;
+          [ "$(od -An -tx1 -N4 out/rpi5-kernel-arm64.elf | tr -d ' \n')" = 7f454c46 ] \
+            || { echo "FAIL: no NEXTBSD-RPI5 ELF kernel (rpi5-kernel-elf-arm64)" >&2; exit 1; }
           # The kernel version and the kext ABI version (#376), as their own
           # assets so a consumer can check them without downloading a tarball.
           # Both arches' SDKs must agree.
@@ -740,7 +747,9 @@ jobs:
           nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
           `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
           `rpi500-kernel8-arm64.img` is a transition alias for the same
-          file).
+          file). `rpi5-kernel-arm64.elf` is the same Pi kernel as an ELF, which
+          `loader.efi` boots from `/boot/kernel.RPI5/kernel`; nextbsd-pkg
+          packages it.
           EOF
           {
             echo
@@ -775,6 +784,7 @@ jobs:
             out/*.tar.gz
             out/rpi5-kernel8-arm64.img
             out/rpi500-kernel8-arm64.img
+            out/rpi5-kernel-arm64.elf
 
       # Cascade to modules only when this run is part of the chain
       # (repository_dispatch: an upstream freebsd-src change, or a manual
