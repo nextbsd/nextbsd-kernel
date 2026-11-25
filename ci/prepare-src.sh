@@ -163,6 +163,12 @@ fi
 # device the arch never declared, so it can't go in the shared config/NEXTBSD.
 if [ "$TARGET" = amd64 ]; then
 	printf 'device\tfasttrap\n' >> "$CONF"
+	# virtio_gpu(4) on amd64 too (arm64 has it from std.virt). A VM whose
+	# only display is virtio-gpu-pci (UTM, QEMU -vga none) has no EFI GOP
+	# framebuffer and nothing else drives it: without this the screen stays
+	# inactive for good, and the IOKit scan never offers the device to
+	# VirtIOGraphics, which it does for a vtgpu-held virtio-gpu (patch 0110).
+	printf 'device\tvirtio_gpu\n' >> "$CONF"
 fi
 
 # --------------------------------------------------------------- overlay ----

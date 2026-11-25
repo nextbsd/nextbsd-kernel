@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 25 Nov 2026 06:00:00 -0600
+Subject: [PATCH] NextBSD: virtio_gpu enters a graphics boot late, and leaves
+ another adapter's console alone
+
+On a VM whose display is virtio-gpu, the loader has no linear framebuffer
+to hand the kernel: the firmware's GOP for virtio-gpu is blit-only
+(AAVMF), or the firmware drives no virtio-gpu at all (OVMF with -vga
+none).  So at cninit there is no boot framebuffer, PE_init_console()
+falls back to text, and patch 0099's splash never runs: the screen shows
+vt(4)'s cursor until the DRM driver takes over.
+
+- When the loader's boot video record asked for graphics but carried no
+  framebuffer, this buffer becomes the boot framebuffer through
+  PE_late_console_fb(), as bcm2835_fbd(4) does on a loader-less Pi.
+  Patch 0099 then pre-fills it with the splash, and vt(4)'s first init
+  starts the spinner on it.
+- With a second adapter whose firmware (EFI GOP) framebuffer is the
+  console, QEMU's std VGA beside virtio-gpu-pci, the driver no longer
+  takes vt(4) to its own screen with its higher priority.  A GOP
+  framebuffer inside this function's memory BARs (virtio-vga) is its
+  own, and it still takes over there.  It stays attached either way, so
+  the IOKit scan offers the device to VirtIOGraphics.
+
+Part of nextbsd/nextbsd#542 (#437).
+---
+  sys/dev/virtio/gpu/virtio_gpu.c | 70 ++++++++++++++++++++++++++++++++++++++---
+  1 file changed, 65 insertions(+), 5 deletions(-)
+
+diff --git a/sys/dev/virtio/gpu/virtio_gpu.c b/sys/dev/virtio/gpu/virtio_gpu.c
+index fa02a1b..e53ce24 100644
+--- a/sys/dev/virtio/gpu/virtio_gpu.c
++++ b/sys/dev/virtio/gpu/virtio_gpu.c
+@@ -35,6 +35,7 @@
+ #include <sys/callout.h>
+ #include <sys/fbio.h>
+ #include <sys/kernel.h>
++#include <sys/linker.h>
+ #include <sys/malloc.h>
+ #include <sys/module.h>
+ #include <sys/pexpert.h>
+@@ -42,11 +43,13 @@
+ 
+ #include <machine/atomic.h>
+ #include <machine/bus.h>
++#include <machine/metadata.h>
+ #include <machine/resource.h>
+ 
+ #include <vm/vm.h>
+ #include <vm/pmap.h>
+ 
++#include <dev/pci/pcireg.h>
+ #include <dev/virtio/virtio.h>
+ #include <dev/virtio/virtqueue.h>
+ #include <dev/virtio/gpu/virtio_gpu.h>
+@@ -105,6 +108,7 @@ static vd_drawrect_t		vtgpu_fb_drawrect;
+ static vd_setpixel_t		vtgpu_fb_setpixel;
+ static vd_bitblt_argb_t		vtgpu_fb_bitblt_argb;
+ static pe_fb_flush_t		vtgpu_pe_flush;
++static bool			vtgpu_other_firmware_fb(device_t);
+ 
+ static struct vt_driver vtgpu_fb_driver = {
+ 	.vd_name = "virtio_gpu",
+@@ -306,10 +310,11 @@ static int
+ vtgpu_attach(device_t dev)
+ {
+ 	struct vtgpu_softc *sc;
+-	bool prefilled;
++	bool console, prefilled;
+ 	int error;
+ 
+ 	sc = device_get_softc(dev);
++	console = false;
+ 	prefilled = false;
+ 	sc->vtgpu_have_fb_info = false;
+ 	sc->vtgpu_dev = dev;
+@@ -346,12 +351,23 @@ vtgpu_attach(device_t dev)
+ 	    sc->vtgpu_fb_info.fb_size, M_DEVBUF, M_WAITOK|M_ZERO, 0, ~0, 4, 0);
+ 	sc->vtgpu_fb_info.fb_pbase = pmap_kextract(sc->vtgpu_fb_info.fb_vbase);
+ 
++	/*
++	 * NextBSD (E19): a graphics boot whose loader had no linear
++	 * framebuffer to hand over (virtio-gpu's firmware GOP is blit-only,
++	 * or the firmware drives no virtio-gpu at all) enters graphics mode
++	 * here, on this buffer, as bcm2835_fbd does on the Pi.  Not when
++	 * another adapter's firmware framebuffer is the console.
++	 */
++	console = !vtgpu_other_firmware_fb(dev);
++	if (console && !PE_graphics_console_active())
++		PE_late_console_fb(&sc->vtgpu_fb_info);
++
+ 	/*
+ 	 * NextBSD (E19): while the boot splash owns the screen, the new
+ 	 * buffer starts as the splash, not black (kPERefreshBootGraphics
+ 	 * paints into it without making it the console yet).
+ 	 */
+-	prefilled = PE_graphics_console_active();
++	prefilled = console && PE_graphics_console_active();
+ 	if (prefilled)
+ 		PE_initialize_console_fb(&sc->vtgpu_fb_info,
+ 		    kPERefreshBootGraphics);
+@@ -383,8 +399,17 @@ vtgpu_attach(device_t dev)
+ 		goto fail;
+ 	}
+ 
+-	vt_allocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
+-	sc->vtgpu_have_fb_info = true;
++	/*
++	 * NextBSD (E19): with a second adapter whose firmware framebuffer is
++	 * the console (QEMU's std VGA beside virtio-gpu), leave vt(4) there:
++	 * this driver's higher priority would otherwise move the console to
++	 * the other screen.  The device stays attached, so the IOKit scan
++	 * still offers it to VirtIOGraphics.
++	 */
++	if (console) {
++		vt_allocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
++		sc->vtgpu_have_fb_info = true;
++	}
+ 
+ 	error = vtgpu_transfer_to_host_2d(sc, 0, 0, sc->vtgpu_fb_info.fb_width,
+ 	    sc->vtgpu_fb_info.fb_height);
+@@ -398,7 +423,7 @@ vtgpu_attach(device_t dev)
+ 	 * itself.  Registered after the attach's own transfers, so the two
+ 	 * never share the control queue.
+ 	 */
+-	if (error == 0 && PE_boot_display() == GRAPHICS_MODE)
++	if (error == 0 && console && PE_boot_display() == GRAPHICS_MODE)
+ 		PE_set_console_flush(&sc->vtgpu_fb_info, vtgpu_pe_flush);
+ 
+ fail:
+@@ -408,6 +433,41 @@ fail:
+ 	return (error);
+ }
+ 
++/*
++ * NextBSD (E19): true when the loader handed the kernel a firmware (EFI GOP)
++ * framebuffer that is not this device's.  virtio-gpu-pci has no framebuffer
++ * BAR, so a GOP framebuffer outside this function's memory BARs belongs to
++ * another adapter; virtio-vga's own VGA framebuffer is inside them, and
++ * there this driver takes over (efifb's writes would never be flushed).
++ */
++static bool
++vtgpu_other_firmware_fb(device_t dev)
++{
++#if defined(__amd64__) || defined(__aarch64__)
++	const struct efi_fb *efifb;
++	device_t pcidev;
++	rman_res_t start, count;
++	int i;
++
++	if (preload_kmdp == NULL)
++		return (false);
++	efifb = (const struct efi_fb *)preload_search_info(preload_kmdp,
++	    MODINFO_METADATA | MODINFOMD_EFI_FB);
++	if (efifb == NULL || efifb->fb_addr == 0)
++		return (false);
++	pcidev = device_get_parent(dev);
++	for (i = 0; i <= PCIR_MAX_BAR_0; i++) {
++		if (bus_get_resource(pcidev, SYS_RES_MEMORY, PCIR_BAR(i),
++		    &start, &count) == 0 && efifb->fb_addr >= start &&
++		    efifb->fb_addr < start + count)
++			return (false);
++	}
++	return (true);
++#else
++	return (false);
++#endif
++}
++
+ static int
+ vtgpu_detach(device_t dev)
+ {
