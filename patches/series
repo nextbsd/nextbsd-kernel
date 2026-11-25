@@ -101,3 +101,5 @@
 0108-bcm2712_sdhci-attach-the-BCM2712-SD-host-controller.patch
 0109-bcm2835_fbd-16-bpp-is-RGB565-with-red-high-also-under-fbswap.patch
 0110-NextBSD-virtio_gpu-enters-a-graphics-boot-late-and-leaves.patch
+0111-NextBSD-virtio-pci-hands-a-running-device-to-the-next-driver.patch
+0112-NextBSD-virtio_gpu-hands-the-running-device-to-VirtIOGraphics.patch

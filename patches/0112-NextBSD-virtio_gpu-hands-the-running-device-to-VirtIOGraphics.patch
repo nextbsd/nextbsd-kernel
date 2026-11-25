@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 25 Nov 2026 12:00:00 -0600
+Subject: [PATCH] NextBSD: virtio_gpu hands the running device to
+ VirtIOGraphics
+
+VirtIOGraphics takes the device from this driver at boot (detach, then
+re-probe), and the detach resets it.  The reset drops the host's scanout,
+so the screen goes dark ("Display output is not active" in QEMU and UTM)
+from the moment the boot splash's driver lets go until the DRM driver has
+set its first mode.
+
+vtgpu_handoff(), which the takeover calls just before the detach, keeps
+the device running instead (virtio_handoff(), patch 0111): the DRM driver
+adopts the negotiated features and both virtqueues, and the host goes on
+showing this driver's framebuffer until the DRM driver's first mode
+replaces it.  For that, this driver now sets the device up as the DRM
+driver would:
+
+- it negotiates the DRM driver's features (indirect descriptors, VirGL,
+  EDID, resource UUIDs and blobs, context init), since features only
+  change across a reset; it uses none of them;
+- it allocates both queues, control and cursor, each with an interrupt
+  (a handler that does nothing: this driver polls, and the interrupts stay
+  disabled until the adopter enables them);
+- its resource ID is 0x40000001, far above the IDs the DRM driver hands
+  out from 1 up, so both can exist until the old one is dropped.
+
+The framebuffer is kept past the detach; the DRM driver unrefs the
+resource after its first mode and returns the memory with
+vtgpu_handoff_release().  Without a handoff, or where the transport can't
+keep the device (anything but modern virtio-pci), the detach resets it as
+before.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/dev/virtio/gpu/virtio_gpu.c | 121 +++++++++++++++++++++++++++++---
+ 1 file changed, 113 insertions(+), 8 deletions(-)
+
+diff --git a/sys/dev/virtio/gpu/virtio_gpu.c b/sys/dev/virtio/gpu/virtio_gpu.c
+index e53ce24..cf36f37 100644
+--- a/sys/dev/virtio/gpu/virtio_gpu.c
++++ b/sys/dev/virtio/gpu/virtio_gpu.c
+@@ -60,10 +60,24 @@
+ 
+ #include "fb_if.h"
+ 
+-#define VTGPU_FEATURES	0
++/*
++ * NextBSD: what VirtIOGraphics' DRM driver negotiates, so it can adopt the
++ * running device (vtgpu_handoff()) instead of resetting it: features can
++ * only change across a reset.  This driver uses none of them.
++ */
++#define VTGPU_FEATURES							\
++	(VIRTIO_RING_F_INDIRECT_DESC |					\
++	 (1ULL << VIRTIO_GPU_F_VIRGL) | (1ULL << VIRTIO_GPU_F_EDID) |	\
++	 (1ULL << VIRTIO_GPU_F_RESOURCE_UUID) |				\
++	 (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB) |				\
++	 (1ULL << VIRTIO_GPU_F_CONTEXT_INIT))
+ 
+-/* The guest can allocate resource IDs, we only need one */
+-#define	VTGPU_RESOURCE_ID	1
++/*
++ * The guest can allocate resource IDs, we only need one.  NextBSD: far
++ * above the IDs the DRM driver hands out from 1 up, so the resource can
++ * outlive this driver until the DRM driver's first mode replaces it.
++ */
++#define	VTGPU_RESOURCE_ID	0x40000001
+ 
+ struct vtgpu_softc {
+ 	/* Must be first so we can cast from info -> softc */
+@@ -74,18 +88,34 @@ struct vtgpu_softc {
+ 	uint64_t		 vtgpu_features;
+ 
+ 	struct virtqueue	*vtgpu_ctrl_vq;
++	struct virtqueue	*vtgpu_cursor_vq;	/* NextBSD: unused */
+ 
+ 	uint64_t		 vtgpu_next_fence;
+ 
+ 	bool			 vtgpu_have_fb_info;
++	bool			 vtgpu_handoff;
+ };
+ 
++/*
++ * NextBSD: the framebuffer a handoff left behind, still the host's scanout,
++ * until the adopting driver releases it (vtgpu_handoff_release()).
++ */
++static struct {
++	device_t	 dev;
++	vm_offset_t	 vbase;
++} vtgpu_handed_off;
++
+ static int	vtgpu_modevent(module_t, int, void *);
+ 
+ static int	vtgpu_probe(device_t);
+ static int	vtgpu_attach(device_t);
+ static int	vtgpu_detach(device_t);
+ 
++/* NextBSD: for VirtIOGraphics (see vtgpu_handoff()). */
++int		vtgpu_handoff(device_t);
++uint32_t	vtgpu_handoff_resource(device_t);
++void		vtgpu_handoff_release(device_t);
++
+ static int	vtgpu_negotiate_features(struct vtgpu_softc *);
+ static int	vtgpu_setup_features(struct vtgpu_softc *);
+ static void	vtgpu_read_config(struct vtgpu_softc *,
+@@ -486,7 +516,11 @@ vtgpu_detach(device_t dev)
+ 		PE_initialize_console_fb(&sc->vtgpu_fb_info, kPEDisableScreen);
+ 		PE_initialize_console(NULL, kPEEnableScreen);
+ 	}
+-	if (sc->vtgpu_fb_info.fb_vbase != 0) {
++	if (sc->vtgpu_handoff) {
++		/* NextBSD: the host still shows it; see vtgpu_handoff(). */
++		vtgpu_handed_off.dev = dev;
++		vtgpu_handed_off.vbase = sc->vtgpu_fb_info.fb_vbase;
++	} else if (sc->vtgpu_fb_info.fb_vbase != 0) {
+ 		MPASS(sc->vtgpu_fb_info.fb_size != 0);
+ 		free((void *)sc->vtgpu_fb_info.fb_vbase,
+ 		    M_DEVBUF);
+@@ -497,6 +531,60 @@ vtgpu_detach(device_t dev)
+ 	return (0);
+ }
+ 
++/*
++ * NextBSD: hand the running device to the driver that attaches next
++ * (VirtIOGraphics' DRM driver), called just before this one is detached.
++ * The device is not reset, so the host keeps showing this driver's
++ * framebuffer, the boot splash, until the new driver's first mode replaces
++ * it, and the screen never goes dark between them.  The new driver gets
++ * the same features and both virtqueues (virtio_handoff()), finds this
++ * driver's resource with vtgpu_handoff_resource(), and frees its memory
++ * with vtgpu_handoff_release() once the host has dropped it.  An error
++ * leaves the ordinary detach, which resets the device.
++ */
++int
++vtgpu_handoff(device_t dev)
++{
++	struct vtgpu_softc *sc;
++	int error;
++
++	if (strcmp(device_get_name(dev), "vtgpu") != 0 ||
++	    !device_is_attached(dev) || vtgpu_handed_off.dev != NULL)
++		return (EINVAL);
++	sc = device_get_softc(dev);
++	if (sc->vtgpu_cursor_vq == NULL || sc->vtgpu_fb_info.fb_vbase == 0)
++		return (EINVAL);
++	error = virtio_handoff(dev);
++	if (error == 0)
++		sc->vtgpu_handoff = true;
++
++	return (error);
++}
++
++/* NextBSD: the resource a handoff left on dev's scanout, or 0. */
++uint32_t
++vtgpu_handoff_resource(device_t dev)
++{
++
++	return (dev != NULL && vtgpu_handed_off.dev == dev ?
++	    VTGPU_RESOURCE_ID : 0);
++}
++
++/*
++ * NextBSD: the host no longer refers to the handed-off resource (its unref
++ * has completed), so its memory goes back.
++ */
++void
++vtgpu_handoff_release(device_t dev)
++{
++
++	if (dev == NULL || vtgpu_handed_off.dev != dev)
++		return;
++	free((void *)vtgpu_handed_off.vbase, M_DEVBUF);
++	vtgpu_handed_off.vbase = 0;
++	vtgpu_handed_off.dev = NULL;
++}
++
+ static int
+ vtgpu_negotiate_features(struct vtgpu_softc *sc)
+ {
+@@ -545,18 +633,35 @@ vtgpu_read_config(struct vtgpu_softc *sc,
+ #undef VTGPU_GET_CONFIG
+ }
+ 
++static void
++vtgpu_vq_intr(void *arg __unused)
++{
++}
++
+ static int
+ vtgpu_alloc_virtqueue(struct vtgpu_softc *sc)
+ {
+ 	device_t dev;
+ 	struct vq_alloc_info vq_info[2];
+-	int nvqs;
++	int indirect, nvqs;
+ 
+ 	dev = sc->vtgpu_dev;
+-	nvqs = 1;
+ 
+-	VQ_ALLOC_INFO_INIT(&vq_info[0], 0, NULL, sc, &sc->vtgpu_ctrl_vq,
+-	    "%s control", device_get_nameunit(dev));
++	/*
++	 * NextBSD: both of the device's queues, set up as VirtIOGraphics'
++	 * driver would (indirect descriptors, an interrupt each), so that
++	 * it can adopt them; see vtgpu_handoff().  This driver polls the
++	 * control queue and never uses the cursor queue, so their interrupts
++	 * stay disabled and their handler does nothing.
++	 */
++	nvqs = 2;
++	indirect = virtio_with_feature(dev, VIRTIO_RING_F_INDIRECT_DESC) ?
++	    VIRTIO_MAX_INDIRECT : 0;
++
++	VQ_ALLOC_INFO_INIT(&vq_info[0], indirect, vtgpu_vq_intr, sc,
++	    &sc->vtgpu_ctrl_vq, "%s control", device_get_nameunit(dev));
++	VQ_ALLOC_INFO_INIT(&vq_info[1], indirect, vtgpu_vq_intr, sc,
++	    &sc->vtgpu_cursor_vq, "%s cursor", device_get_nameunit(dev));
+ 
+ 	return (virtio_alloc_virtqueues(dev, nvqs, vq_info));
+ }
+-- 
+2.54.0 (Apple Git-157)
+

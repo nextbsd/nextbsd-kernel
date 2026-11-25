@@ -1,0 +1,307 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 25 Nov 2026 12:00:00 -0600
+Subject: [PATCH] NextBSD: virtio-pci hands a running device to the next driver
+
+A virtio child's detach resets the device and frees its virtqueues and
+interrupts, so a driver that takes a device over from another always
+starts from a reset.  For virtio-gpu that reset drops the host's
+scanout, and the screen goes dark until the new driver sets a mode.
+
+virtio_handoff(dev), a new virtio bus method, asks the transport to keep
+the device running across the child's next detach.  Modern virtio-pci
+then skips the reset and keeps the virtqueues and interrupts, and the
+next child adopts them:
+
+- virtio_negotiate_features() returns the features already negotiated
+  and writes nothing, and virtio_finalize_features() succeeds as is;
+- virtio_alloc_virtqueues() hands back the same virtqueues, which must
+  be as many and idle, with their interrupt handlers swapped for the new
+  driver's (virtqueue_set_intr());
+- virtio_setup_intr() keeps the interrupts already set up.
+
+A detach without a handoff, or a failed adoption, resets as before.
+Legacy virtio-pci and virtio-mmio return EOPNOTSUPP.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/dev/virtio/pci/virtio_pci.h        |  2 +
+ sys/dev/virtio/pci/virtio_pci_modern.c | 81 ++++++++++++++++++++++++++
+ sys/dev/virtio/virtio.c                | 19 ++++++
+ sys/dev/virtio/virtio.h                |  1 +
+ sys/dev/virtio/virtio_bus_if.m         | 14 +++++
+ sys/dev/virtio/virtqueue.c             |  9 +++
+ sys/dev/virtio/virtqueue.h             |  2 +
+ 7 files changed, 128 insertions(+)
+
+diff --git a/sys/dev/virtio/pci/virtio_pci.h b/sys/dev/virtio/pci/virtio_pci.h
+index 2449cfc..d542a37 100644
+--- a/sys/dev/virtio/pci/virtio_pci.h
++++ b/sys/dev/virtio/pci/virtio_pci.h
+@@ -52,6 +52,8 @@ struct vtpci_common {
+ #define VTPCI_FLAG_NO_MSI		0x0001
+ #define VTPCI_FLAG_NO_MSIX		0x0002
+ #define VTPCI_FLAG_MODERN		0x0004
++#define VTPCI_FLAG_HANDOFF		0x0008	/* NextBSD: see virtio_handoff() */
++#define VTPCI_FLAG_ADOPT		0x0010
+ #define VTPCI_FLAG_INTX			0x1000
+ #define VTPCI_FLAG_MSI			0x2000
+ #define VTPCI_FLAG_MSIX			0x4000
+diff --git a/sys/dev/virtio/pci/virtio_pci_modern.c b/sys/dev/virtio/pci/virtio_pci_modern.c
+index 108fd2b..f0b06b5 100644
+--- a/sys/dev/virtio/pci/virtio_pci_modern.c
++++ b/sys/dev/virtio/pci/virtio_pci_modern.c
+@@ -116,6 +116,7 @@ static int	vtpci_modern_alloc_virtqueues(device_t, int,
+ 		    struct vq_alloc_info *);
+ static int	vtpci_modern_setup_interrupts(device_t, enum intr_type);
+ static void	vtpci_modern_stop(device_t);
++static int	vtpci_modern_handoff(device_t);
+ static int	vtpci_modern_reinit(device_t, uint64_t);
+ static void	vtpci_modern_reinit_complete(device_t);
+ static void	vtpci_modern_notify_vq(device_t, uint16_t, bus_size_t);
+@@ -228,6 +229,7 @@ static device_method_t vtpci_modern_methods[] = {
+ 	DEVMETHOD(virtio_bus_alloc_virtqueues,	  vtpci_modern_alloc_virtqueues),
+ 	DEVMETHOD(virtio_bus_setup_intr,	  vtpci_modern_setup_interrupts),
+ 	DEVMETHOD(virtio_bus_stop,		  vtpci_modern_stop),
++	DEVMETHOD(virtio_bus_handoff,		  vtpci_modern_handoff),
+ 	DEVMETHOD(virtio_bus_reinit,		  vtpci_modern_reinit),
+ 	DEVMETHOD(virtio_bus_reinit_complete,	  vtpci_modern_reinit_complete),
+ 	DEVMETHOD(virtio_bus_notify_vq,		  vtpci_modern_notify_vq),
+@@ -374,6 +376,18 @@ vtpci_modern_child_detached(device_t dev, device_t child)
+ 
+ 	sc = device_get_softc(dev);
+ 
++	/*
++	 * NextBSD: a detach after virtio_handoff() leaves the device running,
++	 * its virtqueues and interrupts in place, for the next child to adopt.
++	 */
++	if (sc->vtpci_common.vtpci_flags & VTPCI_FLAG_HANDOFF) {
++		sc->vtpci_common.vtpci_flags &= ~VTPCI_FLAG_HANDOFF;
++		sc->vtpci_common.vtpci_flags |= VTPCI_FLAG_ADOPT;
++		sc->vtpci_common.vtpci_child_feat_desc = NULL;
++		return;
++	}
++	sc->vtpci_common.vtpci_flags &= ~VTPCI_FLAG_ADOPT;
++
+ 	vtpci_modern_reset(sc);
+ 	vtpci_child_detached(&sc->vtpci_common);
+ 
+@@ -433,6 +447,11 @@ vtpci_modern_negotiate_features(device_t dev, uint64_t child_features)
+ 	uint64_t host_features, features;
+ 
+ 	sc = device_get_softc(dev);
++
++	/* NextBSD: an adopted device keeps what its first driver negotiated. */
++	if (sc->vtpci_common.vtpci_flags & VTPCI_FLAG_ADOPT)
++		return (sc->vtpci_common.vtpci_features);
++
+ 	host_features = vtpci_modern_read_features(sc);
+ 
+ 	/*
+@@ -455,6 +474,8 @@ vtpci_modern_finalize_features(device_t dev)
+ 	uint8_t status;
+ 
+ 	sc = device_get_softc(dev);
++	if (sc->vtpci_common.vtpci_flags & VTPCI_FLAG_ADOPT)
++		return (0);
+ 
+ 	/*
+ 	 * Must re-read the status after setting it to verify the negotiated
+@@ -508,6 +529,39 @@ vtpci_modern_write_features(struct vtpci_modern_softc *sc, uint64_t features)
+ 	vtpci_modern_write_common_4(sc, VIRTIO_PCI_COMMON_GF, features1);
+ }
+ 
++/*
++ * NextBSD: the virtqueues the previous driver left running, for the driver
++ * that adopts the device.  They must be as many, idle, and have interrupts
++ * wherever the previous driver had them (the vectors are already set up).
++ */
++static int
++vtpci_modern_adopt_virtqueues(struct vtpci_common *cn, int nvqs,
++    struct vq_alloc_info *vq_info)
++{
++	struct vtpci_virtqueue *vqx;
++	int idx;
++
++	if (nvqs != cn->vtpci_nvqs) {
++		device_printf(cn->vtpci_dev, "cannot adopt %d virtqueues: "
++		    "the device runs %d\n", nvqs, cn->vtpci_nvqs);
++		return (EINVAL);
++	}
++	for (idx = 0; idx < nvqs; idx++) {
++		vqx = &cn->vtpci_vqs[idx];
++		if (!virtqueue_empty(vqx->vtv_vq) ||
++		    (vq_info[idx].vqai_intr == NULL && !vqx->vtv_no_intr))
++			return (EINVAL);
++	}
++	for (idx = 0; idx < nvqs; idx++) {
++		vqx = &cn->vtpci_vqs[idx];
++		virtqueue_set_intr(vqx->vtv_vq, vq_info[idx].vqai_intr,
++		    vq_info[idx].vqai_intr_arg);
++		*vq_info[idx].vqai_vq = vqx->vtv_vq;
++	}
++
++	return (0);
++}
++
+ static int
+ vtpci_modern_alloc_virtqueues(device_t dev, int nvqs,
+     struct vq_alloc_info *vq_info)
+@@ -519,6 +573,9 @@ vtpci_modern_alloc_virtqueues(device_t dev, int nvqs,
+ 	sc = device_get_softc(dev);
+ 	cn = &sc->vtpci_common;
+ 
++	if (cn->vtpci_flags & VTPCI_FLAG_ADOPT)
++		return (vtpci_modern_adopt_virtqueues(cn, nvqs, vq_info));
++
+ 	max_nvqs = vtpci_modern_read_common_2(sc, VIRTIO_PCI_COMMON_NUMQ);
+ 	if (nvqs > max_nvqs) {
+ 		device_printf(sc->vtpci_dev, "requested virtqueue count %d "
+@@ -537,6 +594,12 @@ vtpci_modern_setup_interrupts(device_t dev, enum intr_type type)
+ 
+ 	sc = device_get_softc(dev);
+ 
++	/* NextBSD: an adopted device's interrupts are already set up. */
++	if (sc->vtpci_common.vtpci_flags & VTPCI_FLAG_ADOPT) {
++		sc->vtpci_common.vtpci_flags &= ~VTPCI_FLAG_ADOPT;
++		return (0);
++	}
++
+ 	error = vtpci_setup_interrupts(&sc->vtpci_common, type);
+ 	if (error == 0)
+ 		vtpci_modern_enable_virtqueues(sc);
+@@ -550,6 +613,24 @@ vtpci_modern_stop(device_t dev)
+ 	vtpci_modern_reset(device_get_softc(dev));
+ }
+ 
++/*
++ * NextBSD: see virtio_handoff().  Only a device whose child has set up its
++ * virtqueues and interrupts, so the adopter can take both as they are.
++ */
++static int
++vtpci_modern_handoff(device_t dev)
++{
++	struct vtpci_common *cn;
++
++	cn = &((struct vtpci_modern_softc *)device_get_softc(dev))->vtpci_common;
++	if (cn->vtpci_nvqs == 0 ||
++	    (cn->vtpci_flags & VTPCI_FLAG_ITYPE_MASK) == 0)
++		return (EINVAL);
++	cn->vtpci_flags |= VTPCI_FLAG_HANDOFF;
++
++	return (0);
++}
++
+ static int
+ vtpci_modern_reinit(device_t dev, uint64_t features)
+ {
+diff --git a/sys/dev/virtio/virtio.c b/sys/dev/virtio/virtio.c
+index be5edca..f261c31 100644
+--- a/sys/dev/virtio/virtio.c
++++ b/sys/dev/virtio/virtio.c
+@@ -284,6 +284,25 @@ virtio_setup_intr(device_t dev, enum intr_type type)
+ 	return (VIRTIO_BUS_SETUP_INTR(device_get_parent(dev), type));
+ }
+ 
++/*
++ * NextBSD: hand the running device to the next driver.  The child's next
++ * detach then neither resets the device nor releases its virtqueues and
++ * interrupts; the driver attached after it gets the negotiated features
++ * from virtio_negotiate_features() and the same virtqueues from
++ * virtio_alloc_virtqueues() (their interrupt handlers swapped for its own),
++ * and virtio_setup_intr() keeps the interrupts already set up.  So a host
++ * that shows the device's scanout, as virtio-gpu's does, keeps showing it:
++ * a reset would blank it until the new driver set a mode.  The new driver
++ * must ask for the same number of virtqueues.  EOPNOTSUPP where the
++ * transport can't (only modern virtio-pci can).
++ */
++int
++virtio_handoff(device_t dev)
++{
++
++	return (VIRTIO_BUS_HANDOFF(device_get_parent(dev)));
++}
++
+ bool
+ virtio_with_feature(device_t dev, uint64_t feature)
+ {
+diff --git a/sys/dev/virtio/virtio.h b/sys/dev/virtio/virtio.h
+index 855dafd..ebb0b50 100644
+--- a/sys/dev/virtio/virtio.h
++++ b/sys/dev/virtio/virtio.h
+@@ -106,6 +106,7 @@ int	 virtio_finalize_features(device_t dev);
+ int	 virtio_alloc_virtqueues(device_t dev, int nvqs,
+ 	     struct vq_alloc_info *info);
+ int	 virtio_setup_intr(device_t dev, enum intr_type type);
++int	 virtio_handoff(device_t dev);
+ bool	 virtio_with_feature(device_t dev, uint64_t feature);
+ void	 virtio_stop(device_t dev);
+ int	 virtio_config_generation(device_t dev);
+diff --git a/sys/dev/virtio/virtio_bus_if.m b/sys/dev/virtio/virtio_bus_if.m
+index 4181b64..9536a5b 100644
+--- a/sys/dev/virtio/virtio_bus_if.m
++++ b/sys/dev/virtio/virtio_bus_if.m
+@@ -45,6 +45,12 @@
+ 	{
+ 		return (0);
+ 	}
++
++	static int
++	virtio_bus_default_handoff(device_t dev)
++	{
++		return (EOPNOTSUPP);
++	}
+ };
+ 
+ METHOD uint64_t negotiate_features {
+@@ -56,6 +62,14 @@
+ 	device_t	dev;
+ } DEFAULT virtio_bus_default_finalize_features;
+ 
++#
++# NextBSD: keep the device running across the child's next detach, for the
++# driver that attaches after it to adopt (see virtio_handoff()).
++#
++METHOD int handoff {
++	device_t	dev;
++} DEFAULT virtio_bus_default_handoff;
++
+ METHOD bool with_feature {
+ 	device_t	dev;
+ 	uint64_t	feature;
+diff --git a/sys/dev/virtio/virtqueue.c b/sys/dev/virtio/virtqueue.c
+index 41e0154..5a8dba4 100644
+--- a/sys/dev/virtio/virtqueue.c
++++ b/sys/dev/virtio/virtqueue.c
+@@ -468,6 +468,15 @@ virtqueue_intr_filter(struct virtqueue *vq)
+ 	return (1);
+ }
+ 
++/* NextBSD: a virtqueue adopted through virtio_handoff() changes hands. */
++void
++virtqueue_set_intr(struct virtqueue *vq, virtqueue_intr_t *intr, void *arg)
++{
++
++	vq->vq_intrhand = intr;
++	vq->vq_intrhand_arg = arg;
++}
++
+ void
+ virtqueue_intr(struct virtqueue *vq)
+ {
+diff --git a/sys/dev/virtio/virtqueue.h b/sys/dev/virtio/virtqueue.h
+index b5c60b0..11638fb 100644
+--- a/sys/dev/virtio/virtqueue.h
++++ b/sys/dev/virtio/virtqueue.h
+@@ -74,6 +74,8 @@ int	 virtqueue_reinit(struct virtqueue *vq, uint16_t size);
+ 
+ int	 virtqueue_intr_filter(struct virtqueue *vq);
+ void	 virtqueue_intr(struct virtqueue *vq);
++void	 virtqueue_set_intr(struct virtqueue *vq, virtqueue_intr_t *intr,
++	     void *arg);
+ int	 virtqueue_enable_intr(struct virtqueue *vq);
+ int	 virtqueue_postpone_intr(struct virtqueue *vq, vq_postpone_t hint);
+ void	 virtqueue_disable_intr(struct virtqueue *vq);
+-- 
+2.54.0 (Apple Git-157)
+
