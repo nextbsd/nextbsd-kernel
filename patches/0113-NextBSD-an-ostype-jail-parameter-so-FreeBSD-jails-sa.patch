@@ -1,0 +1,177 @@
+From 3c4d6cf0e5feb8963eccc87f1d128fcbf143dd7b Mon Sep 17 00:00:00 2001
+From: pkgdemon <pkgdemonteam@gmail.com>
+Date: Fri, 27 Nov 2026 20:51:54 -0600
+Subject: [PATCH] NextBSD: an ostype jail parameter, so FreeBSD jails say
+ FreeBSD
+
+kern.ostype is one global string, so uname -s says NextBSD inside every
+jail. FreeBSD userland in a jail then misreads the system it runs on: the
+pkg bootstrap and pkg take their ABI from it (NextBSD:15:aarch64, which
+FreeBSD's repositories don't have), the ports framework requires OPSYS to
+be FreeBSD, and configure checks and rc scripts that parse uname -s see
+the wrong value.
+
+osrelease and osreldate are already per-jail. ostype now works the same
+way:
+
+- struct prison gets pr_ostype, appended at the end so no member that a
+  kext built before this patch uses moves;
+- prison0 takes the global ostype ("NextBSD"), and a new jail inherits its
+  parent's value unless it is given one at creation;
+- jail_set(2) and jail_get(2) take an "ostype" parameter (1-31 bytes,
+  fixed at creation, like osrelease), and security.jail.param.ostype
+  describes it, so jail(8) and jls(8) know it with no userland change;
+- kern.ostype answers with the calling thread's prison's value.
+
+Nothing changes outside jails: prison0's value is the same string the
+sysctl returned before, __FreeBSD_version and the kernel ABI are
+untouched, and old-binary compatibility still keys off each program's own
+ELF note.
+
+Server.app's jails (E42) start with ostype=FreeBSD.
+nextbsd/nextbsd-kernel#440
+---
+ sys/kern/kern_jail.c | 39 ++++++++++++++++++++++++++++++++++++++-
+ sys/kern/kern_mib.c  | 19 +++++++++++++++++--
+ sys/sys/jail.h       |  3 +++
+ 3 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/sys/kern/kern_jail.c b/sys/kern/kern_jail.c
+index dd420f8..cb6167b 100644
+--- a/sys/kern/kern_jail.c
++++ b/sys/kern/kern_jail.c
+@@ -280,6 +280,7 @@ prison0_init(void)
+ 	prison0.pr_cpuset = cpuset_ref(thread0.td_cpuset);
+ 	prison0.pr_osreldate = osreldate;
+ 	strlcpy(prison0.pr_osrelease, osrelease, sizeof(prison0.pr_osrelease));
++	strlcpy(prison0.pr_ostype, ostype, sizeof(prison0.pr_ostype));
+ 
+ 	/* If we have a preloaded hostuuid, use it. */
+ 	file = preload_search_by_type(PRISON0_HOSTUUID_MODULE);
+@@ -1009,7 +1010,7 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
+ 	struct ucred *jdcred;
+ 	struct vnode *root;
+ 	char *domain, *errmsg, *host, *name, *namelc, *p, *path, *uuid;
+-	char *g_path, *osrelstr;
++	char *g_path, *osrelstr, *ostypestr;
+ 	struct bool_flags *bf;
+ 	struct jailsys_flags *jsf;
+ #if defined(INET) || defined(INET6)
+@@ -1432,6 +1433,31 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
+ 		}
+ 	}
+ 
++	error = vfs_getopt(opts, "ostype", (void **)&ostypestr, &len);
++	if (error == ENOENT)
++		ostypestr = NULL;
++	else if (error != 0)
++		goto done_free;
++	else {
++		if (flags & JAIL_UPDATE) {
++			error = EINVAL;
++			vfs_opterror(opts,
++			    "ostype cannot be changed after creation");
++			goto done_errmsg;
++		}
++		if (len == 0 || ostypestr[len - 1] != '\0') {
++			error = EINVAL;
++			goto done_free;
++		}
++		if (len >= OSTYPELEN) {
++			error = ENAMETOOLONG;
++			vfs_opterror(opts,
++			    "ostype string must be 1-%d bytes long",
++			    OSTYPELEN - 1);
++			goto done_errmsg;
++		}
++	}
++
+ 	error = vfs_copyopt(opts, "osreldate", &osreldt, sizeof(osreldt));
+ 	if (error == ENOENT)
+ 		osreldt = 0;
+@@ -1808,6 +1834,12 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
+ 		else
+ 			strlcpy(pr->pr_osrelease, osrelstr,
+ 			    sizeof(pr->pr_osrelease));
++		if (ostypestr == NULL)
++			strlcpy(pr->pr_ostype, ppr->pr_ostype,
++			    sizeof(pr->pr_ostype));
++		else
++			strlcpy(pr->pr_ostype, ostypestr,
++			    sizeof(pr->pr_ostype));
+ 
+ #ifdef VIMAGE
+ 		/*
+@@ -2774,6 +2806,9 @@ kern_jail_get(struct thread *td, struct uio *optuio, int flags)
+ 	if (error != 0 && error != ENOENT)
+ 		goto done;
+ 	error = vfs_setopts(opts, "osrelease", pr->pr_osrelease);
++	if (error != 0 && error != ENOENT)
++		goto done;
++	error = vfs_setopts(opts, "ostype", pr->pr_ostype);
+ 	if (error != 0 && error != ENOENT)
+ 		goto done;
+ 
+@@ -4981,6 +5016,8 @@ SYSCTL_JAIL_PARAM(, osreldate, CTLTYPE_INT | CTLFLAG_RDTUN, "I",
+     "Jail value for kern.osreldate and uname -K");
+ SYSCTL_JAIL_PARAM_STRING(, osrelease, CTLFLAG_RDTUN, OSRELEASELEN,
+     "Jail value for kern.osrelease and uname -r");
++SYSCTL_JAIL_PARAM_STRING(, ostype, CTLFLAG_RDTUN, OSTYPELEN,
++    "Jail value for kern.ostype and uname -s");
+ SYSCTL_JAIL_PARAM(, enforce_statfs, CTLTYPE_INT | CTLFLAG_RW,
+     "I", "Jail cannot see all mounted file systems");
+ SYSCTL_JAIL_PARAM(, devfs_ruleset, CTLTYPE_INT | CTLFLAG_RW,
+diff --git a/sys/kern/kern_mib.c b/sys/kern/kern_mib.c
+index ebee2e8..58ee097 100644
+--- a/sys/kern/kern_mib.c
++++ b/sys/kern/kern_mib.c
+@@ -106,8 +106,23 @@ SYSCTL_CONST_STRING(_kern, KERN_VERSION, version, CTLFLAG_RD,
+ SYSCTL_CONST_STRING(_kern, OID_AUTO, compiler_version, CTLFLAG_RD,
+     compiler_version, "Version of compiler used to compile kernel");
+ 
+-SYSCTL_CONST_STRING(_kern, KERN_OSTYPE, ostype, CTLFLAG_RD | CTLFLAG_CAPRD,
+-    ostype, "Operating system type");
++/*
++ * Like osrelease below: the ostype string is copied into prison0 and
++ * inherited by child jails unless one is given at creation, so a FreeBSD
++ * jail can say FreeBSD while the host says NextBSD.
++ */
++static int
++sysctl_ostype(SYSCTL_HANDLER_ARGS)
++{
++	struct prison *pr;
++
++	pr = req->td->td_ucred->cr_prison;
++	return (SYSCTL_OUT(req, pr->pr_ostype, strlen(pr->pr_ostype) + 1));
++}
++
++SYSCTL_PROC(_kern, KERN_OSTYPE, ostype,
++    CTLTYPE_STRING | CTLFLAG_CAPRD | CTLFLAG_RD | CTLFLAG_MPSAFE,
++    NULL, 0, sysctl_ostype, "A", "Operating system type");
+ 
+ SYSCTL_INT(_kern, KERN_MAXPROC, maxproc, CTLFLAG_RDTUN | CTLFLAG_NOFETCH,
+     &maxproc, 0, "Maximum number of processes");
+diff --git a/sys/sys/jail.h b/sys/sys/jail.h
+index e6a13e6..16d1330 100644
+--- a/sys/sys/jail.h
++++ b/sys/sys/jail.h
+@@ -146,6 +146,7 @@ MALLOC_DECLARE(M_PRISON);
+ #define	HOSTUUIDLEN	64
+ #define	DEFAULT_HOSTUUID	"00000000-0000-0000-0000-000000000000"
+ #define	OSRELEASELEN	32
++#define	OSTYPELEN	32
+ 
+ #define	JAIL_META_PRIVATE	"meta"
+ #define	JAIL_META_SHARED	"env"
+@@ -217,6 +218,8 @@ struct prison {
+ 	char		 pr_domainname[MAXHOSTNAMELEN];	/* (p) jail domainname */
+ 	char		 pr_hostuuid[HOSTUUIDLEN];	/* (p) jail hostuuid */
+ 	char		 pr_osrelease[OSRELEASELEN];	/* (c) kern.osrelease value */
++	/* Last, so no existing member moves for kexts built before it. */
++	char		 pr_ostype[OSTYPELEN];		/* (c) kern.ostype value */
+ };
+ 
+ struct prison_racct {
+-- 
+2.54.0 (Apple Git-157)
+
